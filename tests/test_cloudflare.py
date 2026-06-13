@@ -2,7 +2,8 @@
 
 Verifica che CloudflareModule:
 - should_run ritorni True solo se fp.cloudflare_fronted è True.
-- run produca POSTURE_CLOUDFLARE_FRONTED con passed=True e severity_if_failed MEDIUM.
+- run produca POSTURE_CLOUDFLARE_FRONTED con passed=True e severity_if_failed INFO
+  (peso 1, §17/§26: il check non può fallire in M0 e non deve gonfiare lo score).
 - Non produca Finding.
 - ORIGIN_BYPASSABLE sia un TODO M1: il modulo non emette quel check in M0.
 """
@@ -96,11 +97,14 @@ def test_fronted_check_passed_true():
     assert pc.passed is True
 
 
-def test_fronted_check_severity_medium():
+def test_fronted_check_severity_info():
+    """severity_if_failed=INFO (peso 1, §17): il check non può mai fallire in M0
+    (gira solo se cloudflare_fronted=True), quindi un peso alto gonfierebbe il
+    posture score (§26 'lo score non gonfia')."""
     ctx = _make_ctx(cloudflare_fronted=True)
     result = MODULE.run(ctx)
     pc = _find_check(result, "POSTURE_CLOUDFLARE_FRONTED")
-    assert pc.severity_if_failed == Severity.MEDIUM
+    assert pc.severity_if_failed == Severity.INFO
 
 
 def test_fronted_check_target():

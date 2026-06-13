@@ -4,9 +4,13 @@ Produce esclusivamente PostureCheck (nessun Finding). Gira solo se il RECON
 ha rilevato che il target è protetto da Cloudflare (fp.cloudflare_fronted=True).
 
 Check implementati in M0:
-  - POSTURE_CLOUDFLARE_FRONTED  (MEDIUM): il target è frontato da Cloudflare.
+  - POSTURE_CLOUDFLARE_FRONTED  (INFO): il target è frontato da Cloudflare.
     Se il RECON lo ha rilevato, il check è trivialmente passed=True — conferma
-    che la protezione CDN/WAF è attiva.
+    che la protezione CDN/WAF è attiva. severity_if_failed=INFO (peso 1, §17)
+    perché il modulo gira solo quando cloudflare_fronted=True (should_run):
+    il check non può mai fallire, quindi non deve gonfiare il posture score
+    (§26 "lo score non gonfia"). Il lato fallibile arriva con
+    POSTURE_ORIGIN_BYPASSABLE (M1).
 
 Check rimandati a M1:
   - POSTURE_ORIGIN_BYPASSABLE: verifica se l'IP di origine è raggiungibile
@@ -64,11 +68,15 @@ class CloudflareModule(Module):
         # cloudflare_fronted=True (see should_run). Lo emettiamo come check
         # esplicito perché il posture score (§17) deve poter contare la
         # protezione CDN/WAF come punto positivo.
+        # severity_if_failed=INFO (peso 1, §17): essendo un check che non può
+        # mai fallire in M0, un peso alto (MEDIUM=3) gonfierebbe il posture
+        # score (§26 "lo score non gonfia"). Lo teniamo a INFO finché
+        # POSTURE_ORIGIN_BYPASSABLE (M1) non introdurrà il lato fallibile.
         checks.append(PostureCheck(
             check_id="POSTURE_CLOUDFLARE_FRONTED",
             title="Target frontato da Cloudflare (CDN/WAF attivo)",
             passed=True,
-            severity_if_failed=Severity.MEDIUM,
+            severity_if_failed=Severity.INFO,
             target=target,
             detail=(
                 "Cloudflare rilevato dal RECON (header CF-RAY o Server: cloudflare). "

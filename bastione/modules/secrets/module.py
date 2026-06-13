@@ -75,10 +75,16 @@ def _redact(value: str) -> str:
 
 # ─── helper: finding_id stabile (§16) ────────────────────────────────────────
 
-def _finding_id(module: str, rule_id: str, target: str, location: Location) -> str:
-    """Hash stabile per dedup/drift (§16). Non include il valore del segreto
-    (che è redatto) né timestamp — solo coordinate stabili del finding."""
-    raw = f"{module}:{rule_id}:{target}:{location.canonical()}"
+def _finding_id(module: str, rule_id: str, location: Location) -> str:
+    """finding_id stabile (§16, formula LOCKED):
+
+        sha256(f"{module}:{rule_id}:{location.canonical()}").hexdigest()[:16]
+
+    NON include `target` (allineato a bastione/baseline/diff.py:finding_id e
+    bastione/modules/supabase/module.py:_finding_id) né il valore del segreto
+    (che è redatto) né timestamp — solo coordinate stabili del finding. Si appoggia
+    a `Location.canonical()`, che normalizza i content-hash dei bundle (§5.2)."""
+    raw = f"{module}:{rule_id}:{location.canonical()}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
@@ -118,12 +124,21 @@ class SecretsModule(Module):
         findings: list[Finding] = []
         asset_urls: list[str] = list(ctx.fingerprint.resolved_urls)
 
-        # Raccolta bundle JS same-host da ogni pagina
+        # Cache {url: TextAsset} per evitare il doppio fetch (§4.7): la pagina
+        # viene scaricata UNA sola volta — la response serve sia per estrarre i
+        # <script src> sia per la scansione successiva, senza un secondo GET.
+        assets: dict[str, TextAsset] = {}
+
+        # Raccolta bundle JS same-host da ogni pagina (singolo fetch per pagina)
         for page_url in list(asset_urls):
             resp = _fetch(page_url)
             if resp is None:
                 log.warning("secrets: pagina non raggiungibile, saltata: %s", page_url)
                 continue
+
+            # Riuso della response: costruiamo subito il TextAsset della pagina,
+            # così la scansione non rifarà un secondo GET sullo stesso URL.
+            assets[page_url] = TextAsset(source=page_url, content=resp.text)
 
             page_host = urlparse(str(resp.url)).netloc
             srcs = extract_script_srcs(resp.text, str(resp.url))
@@ -139,12 +154,15 @@ class SecretsModule(Module):
 
         # Scansione di ogni asset
         for url in asset_urls:
-            resp = _fetch(url)
-            if resp is None:
-                log.warning("secrets: asset non scaricabile, saltato: %s", url)
-                continue
-
-            asset = TextAsset(source=url, content=resp.text)
+            asset = assets.get(url)
+            if asset is None:
+                # Solo i bundle non ancora scaricati richiedono un fetch: le pagine
+                # sono già nella cache (un solo GET per pagina, vedi sopra).
+                resp = _fetch(url)
+                if resp is None:
+                    log.warning("secrets: asset non scaricabile, saltato: %s", url)
+                    continue
+                asset = TextAsset(source=url, content=resp.text)
 
             for detector in DETECTORS:
                 try:
@@ -159,8 +177,7 @@ class SecretsModule(Module):
                 for raw in raw_secrets:
                     loc = Location(file=url)
                     evidence = _redact(raw.value)
-                    fid = _finding_id("secrets", detector.detector_id,
-                                      ctx.target_cfg.name, loc)
+                    fid = _finding_id("secrets", detector.detector_id, loc)
                     findings.append(Finding(
                         finding_id=fid,
                         module="secrets",

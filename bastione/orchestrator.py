@@ -182,12 +182,44 @@ class Orchestrator:
 
     def _rehydrate(self, phase: Phase, state: RunState, run_dir: Path) -> None:
         """Al resume, una fase già vista non viene rieseguita; ma le fasi
-        successive presuppongono dei valori in memoria (cfg, fingerprint). Li
-        riacquisiamo qui in modo idempotente, come LOAD ri-carica la config."""
+        successive presuppongono dei valori in memoria (cfg, fingerprint, piano,
+        finding/posture). Li riacquisiamo qui in modo idempotente, come LOAD
+        ri-carica la config.
+
+        LOAD/RECON sono side-effect-free e ricaricano cfg/fingerprint dal disco.
+        PLAN/SCAN/NORMALIZE, invece, ripopolano self._plan/_raw_findings/
+        _raw_posture che BASELINE (§16) presuppone: senza, un crash DOPO NORMALIZE
+        lascerebbe self._raw_findings=[] e BASELINE marcherebbe FIXED ogni finding
+        già in baseline (counts corrotti, falsi FIXED — viola P7 "solo delta", §16).
+        Le ri-eseguiamo in memoria (read-only: il SCAN è solo GET) **una volta
+        sola**, e solo finché BASELINE non è ancora stata vista — è idempotente e
+        non ri-salva lo stato delle fasi già contate (run() non le riconta)."""
         if phase is Phase.LOAD and self._cfg is None:
             self._load()
         elif phase is Phase.RECON and self._fp is None:
             self._fp = self._load_fingerprint(run_dir)
+        elif phase in (Phase.PLAN, Phase.SCAN, Phase.NORMALIZE):
+            self._rehydrate_scan_chain(state)
+
+    def _rehydrate_scan_chain(self, state: RunState) -> None:
+        """Ricostruisce in memoria la catena PLAN→SCAN→NORMALIZE al --resume (§24),
+        così BASELINE gira sulla scansione reale e non su liste vuote (§16).
+
+        Idempotente e a costo zero se BASELINE è già stata vista (run completata
+        ripresa: niente da ricostruire) o se la catena è già stata ricostruita in
+        questo resume (le fasi PLAN/SCAN/NORMALIZE chiamano tutte qui). Presuppone
+        cfg e fingerprint già reidratati da LOAD/RECON, che precedono PLAN (§6)."""
+        # Se BASELINE è già stata vista, le fasi a valle non rieseguono: nessuna
+        # ricostruzione necessaria (resume di una run completata).
+        seen = set(state.phases_completed) | set(state.phases_skipped)
+        if Phase.BASELINE.name in seen:
+            return
+        # Ricostruisci una volta sola: i raw_findings popolati segnalano fatto.
+        if self._plan or self._raw_findings or self._raw_posture:
+            return
+        self._plan_phase()
+        self._scan(state)
+        self._normalize()
 
     # ── precondizioni (§6) ────────────────────────────────────────────────
 
@@ -223,7 +255,7 @@ class Orchestrator:
         elif phase is Phase.PLAN:
             self._plan_phase()
         elif phase is Phase.SCAN:
-            self._scan()
+            self._scan(state)
         elif phase is Phase.NORMALIZE:
             self._normalize()
         elif phase is Phase.BASELINE:
@@ -318,7 +350,7 @@ class Orchestrator:
 
     # ── SCAN (§6/§9) ───────────────────────────────────────────────────────
 
-    def _scan(self) -> None:
+    def _scan(self, state: RunState) -> None:
         """Esegue i moduli del piano in PARALLELO (ThreadPoolExecutor, O04 —
         read-only). Ogni module.run gira in try/except: un'eccezione NON propaga,
         viene loggata e tradotta in un meta-finding MODULE_ERROR (INFO, §6). Così
@@ -334,15 +366,16 @@ class Orchestrator:
             log.info("SCAN: piano vuoto, nessun modulo da eseguire")
             return
 
+        # ownership_verified riflette lo stato corrente della run, preso da state
+        # (§7.1): in M0 read-only OWNERSHIP non gira e resta False; dopo un
+        # challenge superato (PROBE/MUTATING, M1/M2) i moduli vedono il valore vero.
         ctx = RunContext(
             target_cfg=self._cfg,
             fingerprint=self._fp,
             max_intrusion=self._max_intrusion,
             run_dir=self._run_dir,
-            ownership_verified=False,  # sovrascritto sotto se OWNERSHIP è girata
+            ownership_verified=state.ownership_verified,
         )
-        # ownership_verified riflette lo stato corrente della run (read-only in M0).
-        # In M0 resta False; lasciato esplicito per quando PROBE/MUTATING gireranno.
 
         with ThreadPoolExecutor(max_workers=max(1, len(self._plan))) as pool:
             futures = {pool.submit(self._run_module, module, ctx): module
@@ -378,7 +411,7 @@ class Orchestrator:
         evidence = str(err)[:_MODULE_ERROR_EVIDENCE_MAX]
         location = Location()
         finding = Finding(
-            finding_id="",  # valorizzato in NORMALIZE via finding_id()
+            finding_id="",  # calcolato sotto con la formula LOCKED §16 (finding_id())
             module=name,
             rule_id="MODULE_ERROR",
             title=f"Modulo '{name}' fallito durante la scansione",
@@ -394,6 +427,9 @@ class Orchestrator:
             ),
             intrusion_used=IntrusionLevel.READ_ONLY,
         )
+        # finding_id stabile con la formula LOCKED §16
+        # (sha256(module:rule_id:location.canonical())[:16]). BASELINE lo ricalcola
+        # in modo identico (apply_baseline), quindi resta coerente lungo la pipeline.
         finding.finding_id = finding_id(finding)
         return finding
 

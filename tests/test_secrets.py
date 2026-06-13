@@ -440,3 +440,132 @@ def test_run_degrades_gracefully_when_fetch_unavailable(monkeypatch):
     from bastione.modules.secrets.module import SecretsModule
     result = SecretsModule().run(ctx)
     assert result.findings == []
+
+
+# ─── (5) Singolo fetch della pagina (no doppio download) ─────────────────────
+
+def test_run_fetches_each_page_once(monkeypatch):
+    """CLEANUP: la pagina deve essere scaricata UNA SOLA volta (§4.7).
+
+    Prima del fix ogni pagina in resolved_urls veniva fetchata due volte: una
+    per estrarre i <script src> e una per scansionarla. Riusando la response, il
+    conteggio delle chiamate a _fetch per la pagina deve essere esattamente 1.
+    Il bundle JS (non in resolved_urls) va invece fetchato (1 volta)."""
+    import bastione.modules.secrets.module as mod_module
+    import bastione.modules.secrets.detectors  # noqa: F401
+
+    token = make_jwt("service_role")
+    base = "https://staging.example.com/"
+    bundle = "https://staging.example.com/assets/app.js"
+    pages = {
+        base: fake_resp(url=base, text='<script src="/assets/app.js"></script>'),
+        bundle: fake_resp(url=bundle, text=f'const S="{token}";'),
+    }
+    call_count: dict[str, int] = {}
+
+    def counting_fetch(url: str):
+        call_count[url] = call_count.get(url, 0) + 1
+        return pages.get(url)
+
+    monkeypatch.setattr(mod_module, "_fetch", counting_fetch)
+
+    ctx = _make_ctx(resolved_urls=[base])
+    from bastione.modules.secrets.module import SecretsModule
+    result = SecretsModule().run(ctx)
+
+    # La pagina è scaricata esattamente una volta (riuso della response).
+    assert call_count[base] == 1
+    # Il bundle (non in cache) è scaricato una volta.
+    assert call_count[bundle] == 1
+    # E il segreto nel bundle è comunque rilevato (la pipeline funziona).
+    assert any(f.rule_id == "SECRET_SERVICE_ROLE" for f in result.findings)
+
+
+def test_run_still_scans_page_content_with_single_fetch(monkeypatch):
+    """Il singolo fetch non deve perdere segreti presenti nella pagina stessa:
+    la pagina viene scaricata una volta E scansionata (cache riusata)."""
+    import bastione.modules.secrets.module as mod_module
+    import bastione.modules.secrets.detectors  # noqa: F401
+
+    token = make_jwt("service_role")
+    base = "https://staging.example.com/"
+    pages = {base: fake_resp(url=base, text=f'const KEY="{token}";')}
+    call_count: dict[str, int] = {}
+
+    def counting_fetch(url: str):
+        call_count[url] = call_count.get(url, 0) + 1
+        return pages.get(url)
+
+    monkeypatch.setattr(mod_module, "_fetch", counting_fetch)
+
+    ctx = _make_ctx(resolved_urls=[base])
+    from bastione.modules.secrets.module import SecretsModule
+    result = SecretsModule().run(ctx)
+
+    assert call_count[base] == 1
+    assert any(f.rule_id == "SECRET_SERVICE_ROLE" for f in result.findings)
+
+
+# ─── (6) finding_id allineato alla formula LOCKED §16 ────────────────────────
+
+def test_finding_id_excludes_target_locked_formula():
+    """CLEANUP: _finding_id deve seguire la formula LOCKED §16 SENZA `target`:
+
+        sha256(f"{module}:{rule_id}:{location.canonical()}").hexdigest()[:16]
+
+    (allineato a baseline/diff.py e supabase/module.py)."""
+    from bastione.modules.secrets.module import _finding_id
+    from bastione.models import Location
+
+    loc = Location(file="https://staging.example.com/assets/app.js")
+    expected = hashlib.sha256(
+        f"secrets:SECRET_SERVICE_ROLE:{loc.canonical()}".encode()
+    ).hexdigest()[:16]
+
+    assert _finding_id("secrets", "SECRET_SERVICE_ROLE", loc) == expected
+
+
+def test_finding_id_matches_baseline_diff_formula(monkeypatch):
+    """Il finding_id del modulo secrets deve coincidere con quello calcolato da
+    bastione.baseline.diff.finding_id sullo stesso Finding (drift/dedup §16):
+    la formula è unica e LOCKED in tutto il progetto."""
+    import bastione.modules.secrets.module as mod_module
+    import bastione.modules.secrets.detectors  # noqa: F401
+    from bastione.baseline.diff import finding_id as baseline_finding_id
+
+    token = make_jwt("service_role")
+    base = "https://staging.example.com/"
+    pages = {base: fake_resp(url=base, text=f'S="{token}"')}
+    monkeypatch.setattr(mod_module, "_fetch", lambda url: pages.get(url))
+
+    ctx = _make_ctx(resolved_urls=[base])
+    from bastione.modules.secrets.module import SecretsModule
+    result = SecretsModule().run(ctx)
+
+    assert len(result.findings) >= 1
+    f = result.findings[0]
+    # L'id emesso dal modulo deve essere esattamente quello ricalcolato dalla
+    # baseline (stessa formula LOCKED, target escluso).
+    assert f.finding_id == baseline_finding_id(f)
+
+
+def test_finding_id_independent_of_target(monkeypatch):
+    """Due target diversi con lo stesso segreto nella stessa location producono
+    lo STESSO finding_id (target escluso dalla formula LOCKED §16)."""
+    import bastione.modules.secrets.module as mod_module
+    import bastione.modules.secrets.detectors  # noqa: F401
+
+    token = make_jwt("service_role")
+    base = "https://staging.example.com/"
+    pages = {base: fake_resp(url=base, text=f'S="{token}"')}
+    monkeypatch.setattr(mod_module, "_fetch", lambda url: pages.get(url))
+
+    from bastione.modules.secrets.module import SecretsModule
+
+    ctx_a = _make_ctx(resolved_urls=[base], cfg=_make_cfg(name="target-a"))
+    ctx_b = _make_ctx(resolved_urls=[base], cfg=_make_cfg(name="target-b"))
+    fa = SecretsModule().run(ctx_a).findings[0]
+    fb = SecretsModule().run(ctx_b).findings[0]
+
+    assert fa.target != fb.target
+    assert fa.finding_id == fb.finding_id

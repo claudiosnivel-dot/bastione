@@ -224,6 +224,61 @@ def test_resume_with_findings_does_not_crash_on_conditional_phases(tmp_path: Pat
     assert "PERSIST" in state.phases_completed
 
 
+def test_resume_after_normalize_rebuilds_findings_for_baseline(tmp_path: Path, monkeypatch):
+    # Regressione (§6/§16/§24): un crash DOPO NORMALIZE lascia su disco
+    # phases_completed=[...,SCAN,NORMALIZE] ma NON BASELINE. Al --resume successivo
+    # le fasi PLAN/SCAN/NORMALIZE non vengono rieseguite: senza reidratazione,
+    # self._raw_findings resta [] e BASELINE marcherebbe FIXED ogni finding già in
+    # baseline (counts corrotti: known=0, fixed=1) violando P7 ("solo delta").
+    # Con la reidratazione, BASELINE deve girare sulla scansione ricostruita e
+    # vedere il finding RLS_DISABLED come KNOWN (known=1, fixed=0).
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    stub = _StubModule("supabase", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    baselines = tmp_path / "baselines"
+    targets = _targets(tmp_path, STAGING)
+
+    # Baseline preesistente: il finding è già KNOWN (§16). finding_id stabile
+    # = sha256(module:rule_id:location.canonical())[:16].
+    from bastione.baseline.diff import finding_id as _fid
+    fid = _fid(finding)
+    (baselines).mkdir(parents=True, exist_ok=True)
+    (baselines / "g.baseline.json").write_text(json.dumps({
+        "target": "g",
+        "updated_at": None,
+        "findings": {fid: {"status": "known", "first_seen": "2026-01-01T00:00:00+00:00",
+                           "rule_id": "RLS_DISABLED", "module": "supabase"}},
+        "posture": {},
+    }), encoding="utf-8")
+
+    # Stato parziale: crash DOPO NORMALIZE (BASELINE non ancora fatta).
+    run_dir = runs / "g" / "20260613T000000_000000Z"
+    run_dir.mkdir(parents=True)
+    # il RECON precedente ha scritto fingerprint.json: lo simuliamo col fake.
+    orch_mod.fingerprint("https://staging.example", run_dir)
+    RunState(
+        target="g", max_intrusion="read-only",
+        phases_completed=["LOAD", "RECON", "PLAN", "SCAN", "NORMALIZE"],
+        phases_skipped=["OWNERSHIP"],
+    ).save(run_dir)
+
+    orch = Orchestrator(targets_dir=targets, runs_root=runs, baselines_root=baselines)
+    state = orch.run("g", resume=True)
+
+    # Il finding già in baseline è KNOWN, non un falso FIXED.
+    assert state.counts["known"] == 1, f"known errato: {state.counts}"
+    assert state.counts["fixed"] == 0, f"falso FIXED: {state.counts}"
+    assert state.counts["new"] == 0, f"new errato: {state.counts}"
+    assert "BASELINE" in state.phases_completed
+    assert "PERSIST" in state.phases_completed
+
+    # Il report cita il finding (non un report vuoto che sovrascrive l'artefatto).
+    report = (run_dir / "report.md").read_text(encoding="utf-8")
+    assert "RLS_DISABLED" in report
+
+
 def test_fresh_run_with_findings_runs_conditional_phases(tmp_path: Path, monkeypatch):
     # Regressione (§6): su una run FRESCA (non resume) le precondizioni di
     # REMEDIATE/NOTIFY vanno valutate sui counts appena calcolati in BASELINE
