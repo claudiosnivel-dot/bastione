@@ -1,7 +1,7 @@
 # BASTIONE — SESSION-STATE
 
-> **Codename:** BAS · **Traccia blueprint:** v2.1 · **Milestone attiva:** **M0** · **Aggiornato:** 2026-06-13
-> **Stato (una riga):** step **1–6 di M0** implementati e testati in TDD (scaffold + enums/models + config + gate + state/orchestrator shell + **recon/fingerprint read-only**), 77 test verdi; fermo al **checkpoint di fine step 6** in attesa di revisione. Prossimo: step 7 (MODULE BASE — `modules/base.py`: `Module` ABC + `REGISTRY` + `should_run`, §9).
+> **Codename:** BAS · **Traccia blueprint:** v2.1 · **Milestone attiva:** **M0 (code-complete)** · **Aggiornato:** 2026-06-14
+> **Stato (una riga):** **M0 code-complete** — step **1–15 + wiring orchestratore** implementati e testati in TDD via dynamic workflow (builder/blind-review/fixer), **264 test verdi**, tutto offline/read-only. Pipeline completo `scan` cablato (recon → moduli secrets/supabase/headers/cloudflare → baseline/posture → SARIF+report.md+state.json) con smoke E2E offline. **Resta solo lo step 16: E2E su staging reale** — richiede `targets/gestionale.local.toml` + autorizzazione owned-only (NON automatizzabile, lo lancia Claudio).
 >
 > **⚠️ Due "stati" diversi — non confonderli:**
 > - **Questo file** (`SESSION-STATE.md`) = stato di *sviluppo del progetto*, handoff tra sessioni di coding. È ciò che Claude Code legge in testa a ogni sessione per sapere dove siamo.
@@ -26,9 +26,9 @@ Se stai aprendo Bastione ora e non c'è ancora codice:
 | Dimensione | Stato |
 |---|---|
 | Blueprint | **v2.1**, completo, decisioni bloccate. 31 sezioni (§0–§29 + §18-bis). |
-| Codice | **Step 1–6 di M0 fatti** (scaffold, enums/models, config, gate, state/orchestrator shell, recon/fingerprint); 77 test verdi. |
-| Milestone attiva | **M0** — vista read-only dell'attaccante. |
-| Focus immediato | Step 7 del build order: `modules/base.py` — `Module` ABC + `REGISTRY` (decoratore `register`) + `should_run` (§9). |
+| Codice | **Step 1–15 + wiring orchestratore fatti** (scaffold, enums/models, config, gate, state, recon, modules/base, secrets, supabase, headers/cloudflare, sarif, report, baseline, posture, orchestrator cablato, cli); **264 test verdi**. |
+| Milestone attiva | **M0 (code-complete)** — vista read-only dell'attaccante. Resta solo l'E2E su staging reale (step 16). |
+| Focus immediato | Step 16 (E2E M0): `bastione scan --target gestionale --max-intrusion read-only` su staging reale → primo report. **Richiede** `targets/gestionale.local.toml` + ok owned-only di Claudio (non automatizzabile). |
 | Target di collaudo | Staging del **Gestionale Officina** (Supabase + Cloudflare). |
 | Decisioni OPEN | O01–O05 (§5 di questo file) — **nessuna blocca M0**. |
 | Tool esterni | Da verificare con `bastione doctor` una volta che la CLI esiste. M0 dipende solo da: `httpx`/`katana`/`whatweb` (degradano se assenti). |
@@ -46,16 +46,17 @@ Se stai aprendo Bastione ora e non c'è ancora codice:
 [x]  4. GATE 🔒           gate.py: assert_preconditions + authorize + verify_ownership (§7, §7.1) — DEVE esistere PRIMA di ogni modulo
 [x]  5. STATE+ORCH        state.py (§24) + orchestrator.py: macchina a stati shell con le 12 fasi (§6), per ora fasi non implementate = pass
 [x]  6. RECON             recon/fingerprint.py: read-only, httpx/whatweb/katana + estrazione anon key dal bundle (§8) → Fingerprint
-[ ]  7. MODULE BASE       modules/base.py: Module ABC + REGISTRY + should_run (§9)
-[ ]  8. SECRETS (det.)    modules/secrets/: Detector ABC + REGISTRY + **1 detector reale** SECRET_SERVICE_ROLE — solo detection, no liveness (§10)
-[ ]  9. SUPABASE 💎        modules/supabase/module.py §11.1: OpenAPI surface map + **RLS read test** (la gemma). §11.2 = stub NotImplementedError("M2")
-[ ] 10. HEADERS/CF        modules/headers/ + modules/cloudflare/: security headers + TLS minimo + origin reachability → PostureCheck (§12)
-[ ] 11. SARIF            normalize/sarif.py: Finding[] → SARIF 2.1.0 + partialFingerprints.findingId (§23)
-[ ] 12. REPORT MD        report/markdown.py: sommario + NEW/KNOWN/FIXED + checklist posture (§23)
-[ ] 13. BASELINE (min.)  baseline/diff.py: finding_id stabile (§16) + status NEW/KNOWN + first/last_seen. Drift completo → M1
-[ ] 14. POSTURE SCORE    posture/checks.py: aggregazione PostureCheck + score 0–100 pesato (§17)
-[ ] 15. CLI             cli.py (typer): cabla `scan` (read-only) + `doctor` + `list-modules`/`list-detectors` (§25)
-[ ] 16. E2E M0 ▶         run end-to-end su staging Gestionale → primo report SARIF+MD. → vedi Definition of Done (§3)
+[x]  7. MODULE BASE       modules/base.py: Module ABC + REGISTRY + should_run (§9)
+[x]  8. SECRETS (det.)    modules/secrets/: Detector ABC + REGISTRY + **1 detector reale** SECRET_SERVICE_ROLE — solo detection, no liveness (§10)
+[x]  9. SUPABASE 💎        modules/supabase/module.py §11.1: OpenAPI surface map + **RLS read test** (la gemma). §11.2 = stub NotImplementedError("M2")
+[x] 10. HEADERS/CF        modules/headers/ + modules/cloudflare/: security headers → PostureCheck (§12). [TLS minimo + origin reachability = M1, vedi log]
+[x] 11. SARIF            normalize/sarif.py: Finding[] → SARIF 2.1.0 + partialFingerprints.findingId (§23)
+[x] 12. REPORT MD        report/markdown.py: sommario + NEW/KNOWN/FIXED + checklist posture (§23)
+[x] 13. BASELINE (min.)  baseline/diff.py: finding_id stabile (§16) + status NEW/KNOWN/FIXED + DRIFT + first/last_seen
+[x] 14. POSTURE SCORE    posture/checks.py: aggregazione PostureCheck + score 0–100 pesato (§17)
+[x] 15. CLI             cli.py (typer): cabla `scan` (read-only) + `doctor` + `list-modules`/`list-detectors` (§25)
+[~] 16. E2E M0 ▶         **smoke E2E offline ✓** (pipeline vero via CLI, solo rete mockata → SARIF+MD+state). **Run su staging reale = PENDING**: richiede targets/gestionale.local.toml + ok owned-only (§3)
+  +   WIRING ORCH       orchestrator.py: fasi RECON→PERSIST cablate (PLAN should_run · SCAN ThreadPoolExecutor read-only + MODULE_ERROR · NORMALIZE dedup + POSTURE_SERVICE_ROLE_HIDDEN · BASELINE · POSTURE · REPORT) (§6)
 ```
 
 **Note di sequenza (perché quest'ordine):**
@@ -70,19 +71,20 @@ Se stai aprendo Bastione ora e non c'è ancora codice:
 
 ## 3 · Definition of Done — M0
 
-M0 è "fatto" quando **tutte** queste sono vere:
-- [ ] `bastione scan --target gestionale --max-intrusion read-only` gira **end-to-end** sullo staging senza crash.
-- [ ] Il recon produce un `Fingerprint` con `is_supabase=True` e la `anon_key` estratta dal bundle.
-- [ ] Il detector `SECRET_SERVICE_ROLE` gira su tutti i `TextAsset` (anche se non trova nulla: nessun falso crash).
-- [ ] La sonda Supabase §11.1 mappa la superficie PostgREST e esegue l'**RLS read test** su ogni tabella scoperta, emettendo `Finding` (RLS aperta) o `PostureCheck` (RLS ok).
-- [ ] I moduli headers/cloudflare emettono PostureCheck per gli header di sicurezza.
-- [ ] Output su disco in `runs/gestionale/<ts>/`: **`bastione.sarif`** valido + **`report.md`** leggibile + **`state.json`**.
-- [ ] Il report mostra il **posture score** e separa NEW da KNOWN.
-- [ ] **Tutto read-only**: nessuna scrittura, nessun ownership challenge richiesto (M0 legge solo ciò che è pubblico).
-- [ ] Tool esterni assenti → `SKIPPED` con warning, **mai** crash (`bastione doctor` lo riflette).
-- [ ] Le evidenze dei segreti nel report sono **redatte** (P8).
+Legenda: `[x]` = fatto e verificato (codice + test offline); `[~]` = codice pronto, **manca la conferma sul target live** (step 16).
 
-Quando tutte spuntate → aggiorna questo file (milestone → M1) e logga la sessione (§7).
+- [~] `bastione scan --target gestionale --max-intrusion read-only` gira **end-to-end** sullo staging senza crash. → **smoke E2E offline ✓** (pipeline vero via CLI, solo rete mockata); **run su staging reale PENDING** (richiede `targets/gestionale.local.toml` + ok owned-only).
+- [x] Il recon produce un `Fingerprint` con `is_supabase=True` e la `anon_key` estratta dal bundle. *(codice+test; valori reali alla run live)*
+- [x] Il detector `SECRET_SERVICE_ROLE` gira su tutti i `TextAsset` (anche se non trova nulla: nessun falso crash).
+- [x] La sonda Supabase §11.1 mappa la superficie PostgREST e esegue l'**RLS read test** su ogni tabella scoperta, emettendo `Finding` (RLS aperta) o `PostureCheck` (RLS ok).
+- [x] I moduli headers/cloudflare emettono PostureCheck per gli header di sicurezza.
+- [x] Output su disco in `runs/<target>/<ts>/`: **`bastione.sarif`** valido + **`report.md`** leggibile + **`state.json`** *(verificato dallo smoke E2E offline)*.
+- [x] Il report mostra il **posture score** e separa NEW da KNOWN.
+- [x] **Tutto read-only**: nessuna scrittura, nessun ownership challenge richiesto (M0 legge solo ciò che è pubblico).
+- [x] Tool esterni assenti → `SKIPPED`/degradano, **mai** crash (`bastione doctor` lo riflette).
+- [x] Le evidenze dei segreti nel report sono **redatte** (P8) *(verificato dallo smoke E2E)*.
+
+**M0 è code-complete.** L'unico gate residuo per chiudere M0 → M1 è la **run live su staging reale** (step 16): fornisci `targets/gestionale.local.toml` + l'ok owned-only, poi si lancia, si verifica la DoD sui dati reali, si aggiorna milestone → M1 e si logga (§7).
 
 ---
 
@@ -124,14 +126,18 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
   "schema": "bastione-devstate/1",
   "project": "Bastione (BAS)",
   "blueprint_version": "2.1",
-  "updated": "2026-06-13",
+  "updated": "2026-06-14",
   "current_milestone": "M0",
+  "m0_code_complete": true,
   "code_started": true,
+  "tests_green": 264,
   "build_steps_m0": {
     "total": 16,
-    "done": 6,
-    "next": "7. MODULE BASE"
+    "done": 15,
+    "next": "16. E2E M0 (run su staging reale — PENDING)"
   },
+  "m0_blocking": ["16. E2E live: richiede targets/gestionale.local.toml + autorizzazione owned-only di Claudio (non automatizzabile)"],
+  "dev_workflow": "dynamic workflow (builder Sonnet/Opus + verifier/fixer Opus); orchestratore=main loop fa commit/push",
   "decisions_locked": 13,
   "open_decisions": ["O01","O02","O03","O04","O05"],
   "open_blocking_m0": [],
@@ -146,6 +152,7 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
 
 > Una riga per sessione: cosa è cambiato, cosa è stato deciso, dove riprendere.
 
+- **2026-06-14 — Sessione 4 (M0 code-complete via dynamic workflow).** Nuovo flusso di lavoro adottato (regola permanente di Claudio): ogni milestone in task atomici, chiusi via **dynamic workflow** — builder (Sonnet 4.6 o Opus 4.8 per complessità) → **blind-author review (Opus)** → **fixer (Opus)**; l'orchestratore (main loop, Opus 4.8) decompone, fa ground-truth coi test e committa/pusha. Commit/push automatici ai checkpoint. Decomposti ed eseguiti step **6→15 + wiring orchestratore** in 6 fasi: F1 `modules/base.py` (§9); F2 (parallela) `secrets`+`SECRET_SERVICE_ROLE` (§10) · `supabase` surface map+RLS read test (la gemma, §11.1, Opus) · `headers`/`cloudflare` (§12) · `baseline/diff` finding_id+NEW/KNOWN/FIXED/DRIFT (§16, Opus) · `posture/checks` score pesato (§17); F3 `normalize/sarif` SARIF 2.1.0 (§23) · `report/markdown` (§23); F4 **wiring orchestratore** RECON→PERSIST (§6: PLAN should_run · SCAN ThreadPoolExecutor read-only + MODULE_ERROR resiliente · NORMALIZE dedup + cross-check POSTURE_SERVICE_ROLE_HIDDEN §11.1.6 · BASELINE · POSTURE · REPORT, Opus); F5 `cli.py` typer scan/doctor/list-modules/list-detectors (§25, Opus); F6 capstone (cleanup + smoke E2E offline + review integrata). **Bug reali trovati dalle blind-review e corretti dai fixer (tutti con test di regressione):** (T-wire) REMEDIATE/NOTIFY saltati su run fresca perché `state.counts` letto prima di PERSIST → ora da `self._result.counts`; (CLI) exit-code non conformi §22 → `PreconditionDenied` (produzione→exit 2, ownership→exit 3) + CI gate su NEW≥soglia OPPURE drift (non più su KNOWN/ACCEPTED) con `new_by_severity`; (capstone) **resumability rotta dopo SCAN** → `_rehydrate_scan_chain` ricostruisce in memoria PLAN→SCAN→NORMALIZE prima di BASELINE. Cleanup: secrets niente doppio-fetch + `finding_id` allineato alla formula LOCKED §16 (rimosso `target`); cloudflare-fronted check → severity INFO (no inflazione score, §26); RunContext `ownership_verified` cablato. Scope M0 confermato (golden rule P5): supabase = solo surface map + RLS read test (storage/RPC/auth posture §11.1.3-6 → M1); headers TLS minimo + cloudflare origin-reachability → M1. **264 test verdi**, tutto offline/read-only, **nessun target live puntato**, tutto committato+pushato (8 commit). **M0 code-complete.** Resta lo **step 16 (E2E su staging reale)**: non automatizzabile (owned-only) — serve `targets/gestionale.local.toml` + ok di Claudio; poi si verifica la DoD sui dati reali e milestone → M1.
 - **2026-06-13 — Sessione 3 (step 6: recon / fingerprint read-only).** Implementato in TDD `recon/fingerprint.py` (§8). Funzioni pure (la *gemma*, testate con input reali, niente mock): `extract_script_srcs` (fallback bundle **obbligatorio senza katana**), `extract_supabase_url`, `extract_anon_key` (JWT `role:anon` — **ignora di proposito la service_role**, §8/§10), `detect_cloudflare`, `is_wordpress`. Orchestratore `fingerprint()` con confini I/O monkeypatchabili (`_fetch`/`_run_whatweb`/`_run_katana`, degrado grazioso L06) + scrittura `fingerprint.json`. Scelta M0 (flaggata a Claudio): passo 1 con httpx-**lib**, non il binario projectdiscovery (ridondante; la lib copre URL finale/header/redirect/Cloudflare per un singolo base_url). Revisione adversariale multi-agente (3 dimensioni: correctness · sicurezza/guardrail · robustezza/contratto; ogni finding ri-verificato/refutato): **4 fix applicati** — **(F1)** `is_supabase` legato all'URL PostgREST, non più OR con `anon_key` (eliminato lo stato incoerente `True`+`supabase_url=None` che avrebbe fatto partire il modulo supabase senza URL, §9/§11.1); **(F4)** **filtro same-host** sui bundle (owned-only §7: niente GET verso CDN di terzi non dichiarati); **(F3)** test del bundle `None` in mezzo a più bundle (path DoD-critico); **(F2)** `_parse_whatweb` tollerante per-riga (una riga malformata non scarta le valide). Confermati corretti e già testati: distinzione anon/service_role, no command-injection nei subprocess (argv-list), test 100% offline. Segnalato come **hardening futuro** (non M0-blocking — `runs/` è gitignored, artifact solo locale): redazione `Set-Cookie` in `fingerprint.json`. **77 test verdi**, tutto offline/read-only, nessun target puntato. Step 5 (state+orchestrator) committato+pushato a inizio sessione; da questa sessione commit/push automatici (regola di Claudio). Prossimo: **step 7** — `modules/base.py` (Module ABC + REGISTRY + should_run, §9). Nessuna OPEN blocca M0.
 - **2026-06-13 — Sessione 2 (step 5: state + orchestrator shell).** Implementati in TDD `state.py` (§24: `RunState` schema `bastione-state/1`, save/load, `next_phase` per `--resume`) e `orchestrator.py` (§6: macchina a stati shell con le 12 fasi — `LOAD`+`OWNERSHIP`+`PERSIST` cablate, `RECON…NOTIFY` stub no-op; **gate cablato in LOAD** → produzione aborta senza scrivere su disco; condizionali registrate in `phases_skipped` non omesse; logica `--resume`). Shell verificato end-to-end su `_example` → `state.json` valido. Revisione adversariale multi-agente (3 dimensioni, ogni finding ri-verificato): **1 bug major trovato e corretto** — `REMEDIATE`/`NOTIFY` avevano la precondizione cablata ma nessun handler no-op, così al `--resume` con `counts` non nulli la fase sollevava `RuntimeError` abortendo la run (resumability rotta, §6/§24); aggiunti a `_SHELL_STUB` + **test di regressione**. **56 test verdi.** Tutto offline/read-only, nessun target puntato, nessuna scrittura. Prossimo passo: **step 6** — `recon/fingerprint.py` read-only → `Fingerprint` (§8). Nessuna OPEN blocca M0.
 - **2026-06-13 — Sessione 1 (primo codice).** Eseguiti gli **step 1–4** del build order M0 in **TDD** (RED→GREEN per ogni modulo): scaffold (pyproject `uv` + dev-deps in `[dependency-groups]`, `.gitignore` che ignora `runs/`+`targets/*.local.toml` ma **non** `baselines/`, README, `baselines/.gitkeep`); `enums.py` (§5.1) + `models.py` (§5.2–5.6, incl. `Location.canonical()` con normalizzazione content-hash); `config.py` (precedenza `.local.toml`, flatten TOML→`TargetConfig`, **separato dal gate**) + `targets/_example.toml` (§29); `gate.py` (§7/§7.1: `assert_preconditions`+`authorize`+`verify_ownership`, con httpx/dnspython **lazy** e degrado grazioso L06). **43 test verdi.** Revisione adversariale multi-agente (5 dimensioni + adversario anti-bypass sul gate, ogni finding ri-verificato): **0 difetti reali sul gate** (un dubbio sollevato e respinto in verifica); **1 incoerenza minore** README↔pyproject (fallback `pip install -e ".[dev]"` non installa i `[dependency-groups]`) → **corretta**. **Stop al checkpoint gate** (PROMPT-00 §5) per revisione di Claudio. **Nessuna scrittura, tutto read-only; nessun target puntato.** Prossimo passo: **step 5** — `state.py` (§24) + `orchestrator.py` shell con le 12 fasi (§6), fasi non implementate = `pass`. Nessuna OPEN blocca M0.
