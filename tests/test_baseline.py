@@ -281,6 +281,12 @@ def test_counts_shape_and_values():
     assert c["by_severity"]["high"] == 0
     assert c["by_severity"]["low"] == 0
     assert c["by_severity"]["info"] == 0
+    # new_by_severity conta i SOLI finding NEW (gate CI §22): f_known NON entra.
+    assert c["new_by_severity"]["critical"] == 1   # f_new
+    assert c["new_by_severity"]["medium"] == 0     # f_known escluso
+    assert c["new_by_severity"]["high"] == 0
+    assert c["new_by_severity"]["low"] == 0
+    assert c["new_by_severity"]["info"] == 0
 
 
 def test_counts_accepted_does_not_count_as_known():

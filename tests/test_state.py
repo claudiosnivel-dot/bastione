@@ -56,4 +56,6 @@ def test_counts_default_shape():
     s = RunState(target="g")
     assert s.counts["new"] == 0
     assert s.counts["by_severity"]["critical"] == 0
+    # new_by_severity: specchio NEW-only del breakdown, per il gate CI (§22).
+    assert s.counts["new_by_severity"]["critical"] == 0
     assert s.posture_score is None

@@ -34,15 +34,26 @@ class IntrusionDenied(Exception):
     """Azione non ammessa dal gate. Backstop: non si negozia, si aborta."""
 
 
+class PreconditionDenied(IntrusionDenied):
+    """Precondizione di LOAD non soddisfatta (§6/§7): produzione bloccata o
+    ownership non *dichiarata* in config. Distinta dall'`IntrusionDenied` generico
+    (es. ownership *challenge* fallito, §7.1) perché la tabella exit-code LOCKED
+    (§22) le tiene separate: precondizione → exit 2, challenge → exit 3. Resta
+    sottoclasse di `IntrusionDenied` così chi cattura il backstop generico (gate,
+    orchestratore) continua a intercettarla."""
+
+
 def assert_preconditions(cfg: TargetConfig) -> None:
     """Eseguito in LOAD (§6) — hard block. Produzione e target non dichiarati
-    posseduti fanno abortire la run prima di qualsiasi azione."""
+    posseduti fanno abortire la run prima di qualsiasi azione. Solleva
+    `PreconditionDenied` (sottotipo di `IntrusionDenied`): per §22 è exit 2
+    (errore config/precondizione), non il 3 dell'ownership challenge."""
     if cfg.environment == "production":
-        raise IntrusionDenied(
+        raise PreconditionDenied(
             "Bastione non opera su 'production'. Punta lo staging. "
             "(P1/P2 — produzione è sempre bloccata.)")
     if cfg.ownership not in ("owned", "authorized-written"):
-        raise IntrusionDenied(
+        raise PreconditionDenied(
             "Manca dichiarazione di proprietà/autorizzazione. "
             "Imposta ownership='owned' o 'authorized-written'.")
 

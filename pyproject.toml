@@ -22,10 +22,9 @@ dependencies = [
     "tomli>=2; python_version < '3.11'",  # TOML su <3.11; ≥3.11 usa tomllib (stdlib)
 ]
 
-# La CLI `bastione` viene cablata allo step 15 (§25), quando esiste bastione/cli.py.
-# Tenuta commentata per non lasciare un entrypoint che punta a un modulo ancora assente.
-# [project.scripts]
-# bastione = "bastione.cli:app"
+# La CLI `bastione` è cablata allo step 15 (§25): l'entrypoint ora esiste (bastione/cli.py).
+[project.scripts]
+bastione = "bastione.cli:app"
 
 [dependency-groups]
 dev = [

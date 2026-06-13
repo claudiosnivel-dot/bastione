@@ -1,0 +1,338 @@
+"""CLI di Bastione (§25) — il guscio `typer` sopra l'orchestratore (step 15).
+
+La CLI **non** orchestra né bypassa nulla: cabla soltanto i comandi dell'utente
+sull'`Orchestrator` (§6) e ne presenta i risultati con `rich`. Le regole di
+sicurezza restano dove devono stare: il gate (§7, fase LOAD) è l'autorità — la CLI
+non declassa e non aggira (GUARDRAIL LOCKED). In M0 il default è **READ_ONLY**.
+
+Comandi M0 (§25):
+  - `scan`          : esegue una run sull'orchestratore e stampa il sommario;
+  - `doctor`        : verifica quali tool esterni / lib opzionali sono presenti;
+  - `list-modules`  : elenca i moduli registrati (§9);
+  - `list-detectors`: elenca i detector di segreti registrati (§10).
+
+Vincoli M0 (LOCKED):
+  - `--unsafe-show-secrets` è INCOMPATIBILE con `--ci` (un CI non deve mai stampare
+    segreti in chiaro): combinazione → errore, exit ≠ 0 (P8/§25);
+  - i flag M1/M2 (`--no-fix` remediation, `--i-own-this-its-staging`) sono
+    ACCETTATI ma in M0 read-only sono **no-op** con una nota (nessuna scrittura);
+  - `--fail-on` / `--ci`: dopo la run, se ≥1 finding emesso ha severity ≥ soglia →
+    exit 1 (gate CI minimale §22); altrimenti 0.
+
+Gestione errori (§25): un `IntrusionDenied` dal gate produce un messaggio chiaro e
+un exit code ≠ 0 — MAI uno stacktrace in faccia all'utente.
+"""
+
+from __future__ import annotations
+
+import logging
+import shutil
+from enum import Enum
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from bastione.enums import IntrusionLevel, Severity
+from bastione.gate import IntrusionDenied, PreconditionDenied
+from bastione.orchestrator import (
+    REPORT_FILENAME,
+    SARIF_FILENAME,
+    Orchestrator,
+    _ensure_modules_loaded,
+)
+from bastione.state import RunState
+
+log = logging.getLogger("bastione.cli")
+
+app = typer.Typer(
+    add_completion=False,
+    help="Bastione (BAS) — orchestratore di security testing difensivo (§25).",
+)
+
+console = Console()
+err_console = Console(stderr=True)
+
+# Tool esterni opzionali sondati da `doctor` (§24): l'assenza degrada il recon
+# (§8), non è un errore — è proprio lo scopo del comando rilevarla.
+_EXTERNAL_TOOLS = ["whatweb", "katana", "testssl.sh", "nuclei", "zap"]
+
+
+class IntrusionChoice(str, Enum):
+    """Valori ammessi da `--max-intrusion` (§25). Stringhe stabili in CLI,
+    mappate a `IntrusionLevel` (enum di dominio, §5.1) prima della run."""
+
+    READ_ONLY = "read-only"
+    PROBE = "probe"
+    MUTATING = "mutating"
+
+
+class FailOnChoice(str, Enum):
+    """Soglia di `--fail-on` (§22/§25): nome di severità (case CLI)."""
+
+    INFO = "info"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+# Mapping stringa CLI → enum di dominio (§5.1). Tenuto esplicito: la CLI parla
+# stringhe, il dominio parla enum ordinabili.
+_CLI_TO_INTRUSION = {
+    IntrusionChoice.READ_ONLY: IntrusionLevel.READ_ONLY,
+    IntrusionChoice.PROBE: IntrusionLevel.PROBE,
+    IntrusionChoice.MUTATING: IntrusionLevel.MUTATING,
+}
+
+_CLI_TO_SEVERITY = {
+    FailOnChoice.INFO: Severity.INFO,
+    FailOnChoice.LOW: Severity.LOW,
+    FailOnChoice.MEDIUM: Severity.MEDIUM,
+    FailOnChoice.HIGH: Severity.HIGH,
+    FailOnChoice.CRITICAL: Severity.CRITICAL,
+}
+
+# Soglia di default per `--ci` quando `--fail-on` non è specificato (§22): un CI
+# senza soglia esplicita fallisce su HIGH/CRITICAL.
+_CI_DEFAULT_THRESHOLD = Severity.HIGH
+
+
+# ─── scan (§25) ──────────────────────────────────────────────────────────────
+
+@app.command()
+def scan(
+    target: str = typer.Option(..., "--target", help="Nome del target (config in targets/)."),
+    max_intrusion: IntrusionChoice = typer.Option(
+        IntrusionChoice.READ_ONLY, "--max-intrusion",
+        help="Tetto di intrusione della run (§7). M0 default: read-only."),
+    resume: bool = typer.Option(
+        False, "--resume", help="Riprende l'ultima run del target (§24)."),
+    accept_baseline: bool = typer.Option(
+        False, "--accept-baseline", help="Promuove i finding NEW a KNOWN (§16)."),
+    fail_on: FailOnChoice | None = typer.Option(
+        None, "--fail-on",
+        help="Exit 1 se ≥1 finding ha severity ≥ soglia (gate CI §22)."),
+    ci: bool = typer.Option(
+        False, "--ci",
+        help="Modalità CI: attiva il gate exit-code (§22). Incompatibile con --unsafe-show-secrets."),
+    unsafe_show_secrets: bool = typer.Option(
+        False, "--unsafe-show-secrets",
+        help="Mostra i segreti in chiaro (P8). INCOMPATIBILE con --ci."),
+    no_fix: bool = typer.Option(
+        False, "--no-fix", help="[M1] Disabilita la remediation. In M0 è no-op."),
+    i_own_this_its_staging: bool = typer.Option(
+        False, "--i-own-this-its-staging",
+        help="[M2] Conferma ownership per scritture su staging. In M0 è no-op."),
+) -> None:
+    """Esegue una scansione difensiva del target e ne stampa il sommario (§6/§25).
+
+    In M0 la run è interamente READ_ONLY: nessuna scrittura sul target. Il gate
+    (§7) resta l'autorità: una config di produzione/non-posseduta fa abortire la
+    run con un messaggio chiaro (gestito sotto come `IntrusionDenied`)."""
+    # Vincolo LOCKED (P8/§25): un CI non deve MAI stampare segreti in chiaro.
+    if unsafe_show_secrets and ci:
+        err_console.print(
+            "[bold red]Errore:[/] --unsafe-show-secrets è incompatibile con --ci: "
+            "un'esecuzione CI non deve mai stampare segreti in chiaro (P8/§25).")
+        raise typer.Exit(code=2)
+
+    # Flag M1/M2: accettati ma no-op in M0 (read-only). Nota esplicita, non azione.
+    if no_fix:
+        console.print("[dim]nota:[/] --no-fix è un no-op in M0 (remediation arriva a M1).")
+    if i_own_this_its_staging:
+        console.print(
+            "[dim]nota:[/] --i-own-this-its-staging è un no-op in M0 "
+            "(le scritture canary arrivano a M2).")
+    if unsafe_show_secrets:
+        console.print(
+            "[dim]nota:[/] --unsafe-show-secrets: la de-redazione dell'evidence è "
+            "M1; in M0 i segreti restano redatti nei file (P8).")
+
+    level = _CLI_TO_INTRUSION[max_intrusion]
+
+    orch = Orchestrator()
+    try:
+        state = orch.run(
+            target,
+            max_intrusion=level,
+            resume=resume,
+            accept_baseline=accept_baseline,
+        )
+    except PreconditionDenied as exc:
+        # Precondizione di LOAD non soddisfatta (produzione bloccata o ownership
+        # non dichiarata): per §22 (LOCKED) è exit 2 (errore config/precondizione),
+        # NON il 3 dell'ownership challenge. In M0 read-only è l'unico ramo del gate
+        # raggiungibile. Catturato PRIMA di IntrusionDenied (ne è sottoclasse).
+        err_console.print(f"[bold red]Precondizione negata dal gate (§7):[/] {exc}")
+        raise typer.Exit(code=2)
+    except IntrusionDenied as exc:
+        # Ownership challenge fallito (§7.1) o altra negazione del gate runtime:
+        # per §22 (LOCKED) è exit 3. Messaggio chiaro, niente stacktrace (§25).
+        err_console.print(f"[bold red]Run negata dal gate (§7):[/] {exc}")
+        raise typer.Exit(code=3)
+    except FileNotFoundError as exc:
+        # Config target assente (§6 LOAD): errore chiaro, non uno stacktrace.
+        err_console.print(f"[bold red]Config target non trovata:[/] {exc}")
+        raise typer.Exit(code=4)
+
+    _print_summary(state, orch._run_dir)
+
+    # Gate CI (§22, LOCKED): se --fail-on o --ci, exit 1 quando ≥1 finding NEW ≥
+    # soglia OPPURE ≥1 DRIFT. KNOWN/ACCEPTED ≥ soglia NON fanno fallire il gate
+    # (in CI la baseline è committata: i noti sono lo scenario normale, §24).
+    threshold = _resolve_threshold(fail_on, ci)
+    if threshold is not None and _ci_gate_failed(state, threshold):
+        console.print(
+            f"[bold red]CI gate:[/] rilevato ≥1 finding NEW con severity ≥ "
+            f"{threshold.name} oppure ≥1 DRIFT → exit 1 (§22).")
+        raise typer.Exit(code=1)
+
+
+def _resolve_threshold(fail_on: FailOnChoice | None, ci: bool) -> Severity | None:
+    """Determina la soglia effettiva del gate CI (§22). `--fail-on` ha la
+    precedenza; `--ci` senza `--fail-on` usa il default HIGH. Senza nessuno dei
+    due il gate è disattivo (None → exit 0 a prescindere dai finding)."""
+    if fail_on is not None:
+        return _CLI_TO_SEVERITY[fail_on]
+    if ci:
+        return _CI_DEFAULT_THRESHOLD
+    return None
+
+
+def _ci_gate_failed(state: RunState, threshold: Severity) -> bool:
+    """True se il gate CI (§22, LOCKED) deve fallire: ≥1 finding NEW ≥ soglia
+    OPPURE ≥1 DRIFT.
+
+    Due deviazioni rispetto al "qualsiasi finding emesso ≥ soglia":
+    - la soglia guarda i SOLI NEW (`counts.new_by_severity`), non tutti gli emessi:
+      KNOWN/ACCEPTED ≥ soglia sono lo scenario normale in CI (baseline committata,
+      §24) e non devono bloccare il deploy;
+    - il DRIFT (regressione di posture, `counts.drift`) fa fallire il gate da solo,
+      anche senza alcun NEW ≥ soglia (§22 riga 884)."""
+    counts = state.counts
+    if counts.get("drift", 0) > 0:
+        return True
+    new_by_sev = counts.get("new_by_severity", {})
+    for sev in Severity:
+        if sev >= threshold and new_by_sev.get(sev.name.lower(), 0) > 0:
+            return True
+    return False
+
+
+def _print_summary(state: RunState, run_dir: Path) -> None:
+    """Stampa il sommario di una run (§23/§25): posture score, counts per stato e
+    per severità, e i path degli artefatti (run_dir + SARIF + report)."""
+    score = state.posture_score if state.posture_score is not None else 0.0
+    console.print()
+    console.print(f"[bold]Bastione[/] — sommario run su [cyan]{state.target}[/]")
+    console.print(f"Posture score: [bold]{score:.1f}[/] / 100  "
+                  f"(intrusione: {state.max_intrusion})")
+
+    counts = state.counts
+    status_table = Table(title="Finding per stato", show_header=True, header_style="bold")
+    status_table.add_column("stato")
+    status_table.add_column("conteggio", justify="right")
+    for key in ("new", "known", "fixed", "drift"):
+        status_table.add_row(key, str(counts.get(key, 0)))
+    console.print(status_table)
+
+    by_sev = counts.get("by_severity", {})
+    sev_table = Table(title="Finding per severità", show_header=True, header_style="bold")
+    sev_table.add_column("severità")
+    sev_table.add_column("conteggio", justify="right")
+    for sev in ("critical", "high", "medium", "low", "info"):
+        sev_table.add_row(sev, str(by_sev.get(sev, 0)))
+    console.print(sev_table)
+
+    console.print(f"Artefatti in: [cyan]{run_dir}[/]")
+    console.print(f"  • SARIF : {run_dir / SARIF_FILENAME}")
+    console.print(f"  • Report: {run_dir / REPORT_FILENAME}")
+
+
+# ─── doctor (§24) ────────────────────────────────────────────────────────────
+
+@app.command()
+def doctor() -> None:
+    """Verifica quali tool esterni e librerie opzionali sono presenti (§24).
+
+    Best-effort: nessun crash se qualcosa manca — è esattamente ciò che il comando
+    deve rilevare. L'assenza di un tool degrada il recon (§8), non lo interrompe."""
+    table = Table(title="Bastione doctor — dipendenze opzionali (§24)",
+                  show_header=True, header_style="bold")
+    table.add_column("componente")
+    table.add_column("tipo")
+    table.add_column("stato")
+
+    for tool in _EXTERNAL_TOOLS:
+        presente = shutil.which(tool) is not None
+        table.add_row(tool, "tool esterno", _ok(presente))
+
+    table.add_row("httpx", "libreria python", _ok(_lib_present("httpx")))
+
+    console.print(table)
+
+
+def _lib_present(module_name: str) -> bool:
+    """True se la libreria `module_name` è importabile. Nessun crash se assente."""
+    import importlib.util
+    return importlib.util.find_spec(module_name) is not None
+
+
+def _ok(presente: bool) -> str:
+    return "[green]installato[/]" if presente else "[yellow]assente[/]"
+
+
+# ─── list-modules (§9) ───────────────────────────────────────────────────────
+
+@app.command("list-modules")
+def list_modules() -> None:
+    """Elenca i moduli di scansione registrati (§9): name e tetto di intrusione."""
+    from bastione.modules.base import REGISTRY
+
+    _ensure_modules_loaded()
+    table = Table(title="Moduli registrati (§9)", show_header=True, header_style="bold")
+    table.add_column("name")
+    table.add_column("max_intrusion")
+    for name in sorted(REGISTRY):
+        module = REGISTRY[name]
+        table.add_row(name, module.max_intrusion.name.lower())
+    console.print(table)
+
+
+# ─── list-detectors (§10) ────────────────────────────────────────────────────
+
+@app.command("list-detectors")
+def list_detectors() -> None:
+    """Elenca i detector di segreti registrati (§10): detector_id e severità."""
+    # L'import del package popola DETECTORS via @register_detector (§10).
+    import bastione.modules.secrets.detectors  # noqa: F401
+    from bastione.modules.secrets.detectors.base import DETECTORS
+
+    table = Table(title="Detector di segreti (§10)", show_header=True, header_style="bold")
+    table.add_column("detector_id")
+    table.add_column("severity")
+    for detector in DETECTORS:
+        table.add_row(detector.detector_id, detector.severity.name.lower())
+    console.print(table)
+
+
+# ─── comandi §25 non ancora in M0 (stub espliciti) ───────────────────────────
+
+@app.command()
+def verify() -> None:
+    """[M1] Verifica un finding specifico — non disponibile in M0."""
+    err_console.print("[yellow]verify[/]: disponibile a M1 (non implementato in M0).")
+    raise typer.Exit(code=1)
+
+
+@app.command()
+def fix() -> None:
+    """[M1] Applica una remediation — non disponibile in M0."""
+    err_console.print("[yellow]fix[/]: disponibile a M1 (non implementato in M0).")
+    raise typer.Exit(code=1)
+
+
+if __name__ == "__main__":   # pragma: no cover
+    app()

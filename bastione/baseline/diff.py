@@ -196,7 +196,8 @@ def apply_baseline(
             if inherited is Status.KNOWN:
                 counts["known"] += 1
 
-        _bump_severity(counts, finding)
+        # by_severity per OGNI emesso; new_by_severity solo per i NEW (gate CI §22).
+        _bump_severity(counts, finding, new_only=finding.status is Status.NEW)
         result.findings.append(finding)
 
     # ── finding in baseline ma non più nella run → FIXED (§16) ──────────────
@@ -258,9 +259,15 @@ def _make_fixed_finding(fid: str, prior: dict, baseline: dict, now: datetime) ->
     )
 
 
-def _bump_severity(counts: dict, finding: Finding) -> None:
-    """Incrementa `by_severity` per un finding *emesso* (§24). Conta i finding,
-    non i posture check; i FIXED non passano di qui."""
+def _bump_severity(counts: dict, finding: Finding, *, new_only: bool = False) -> None:
+    """Incrementa il breakdown per severità di un finding *emesso* (§24). Conta i
+    finding, non i posture check; i FIXED non passano di qui.
+
+    `by_severity` raccoglie TUTTI gli emessi (NEW/KNOWN/ACCEPTED); con
+    `new_only=True` aggiorna anche `new_by_severity`, lo specchio dei soli NEW su
+    cui scatta il gate CI (§22)."""
     key = finding.severity.name.lower()
     if key in counts["by_severity"]:
         counts["by_severity"][key] += 1
+    if new_only and key in counts["new_by_severity"]:
+        counts["new_by_severity"][key] += 1

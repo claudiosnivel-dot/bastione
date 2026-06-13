@@ -37,10 +37,16 @@ def intrusion_to_cli(level: IntrusionLevel) -> str:
 
 
 def empty_counts() -> dict:
-    """Shape di `counts` (§24): by_severity conta i finding, non i posture check."""
+    """Shape di `counts` (§24): by_severity conta i finding, non i posture check.
+
+    `new_by_severity` è lo specchio NEW-only di `by_severity`: il gate CI (§22)
+    fallisce SOLO sui finding NEW ≥ soglia (i KNOWN/ACCEPTED sono lo scenario
+    normale in CI, con baseline committata), quindi serve il breakdown dei soli
+    NEW separato dal totale degli emessi."""
     return {
         "new": 0, "known": 0, "fixed": 0, "drift": 0,
         "by_severity": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
+        "new_by_severity": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
     }
 
 
