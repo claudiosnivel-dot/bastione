@@ -1,7 +1,7 @@
 # BASTIONE — SESSION-STATE
 
 > **Codename:** BAS · **Traccia blueprint:** v2.1 · **Milestone attiva:** **M0** · **Aggiornato:** 2026-06-13
-> **Stato (una riga):** step **1–5 di M0** implementati e testati in TDD (scaffold + enums/models + config + gate + **state/orchestrator shell**), 56 test verdi; fermo al **checkpoint di fine step 5** in attesa di revisione. Prossimo: step 6 (RECON / fingerprint read-only → Fingerprint).
+> **Stato (una riga):** step **1–6 di M0** implementati e testati in TDD (scaffold + enums/models + config + gate + state/orchestrator shell + **recon/fingerprint read-only**), 77 test verdi; fermo al **checkpoint di fine step 6** in attesa di revisione. Prossimo: step 7 (MODULE BASE — `modules/base.py`: `Module` ABC + `REGISTRY` + `should_run`, §9).
 >
 > **⚠️ Due "stati" diversi — non confonderli:**
 > - **Questo file** (`SESSION-STATE.md`) = stato di *sviluppo del progetto*, handoff tra sessioni di coding. È ciò che Claude Code legge in testa a ogni sessione per sapere dove siamo.
@@ -26,9 +26,9 @@ Se stai aprendo Bastione ora e non c'è ancora codice:
 | Dimensione | Stato |
 |---|---|
 | Blueprint | **v2.1**, completo, decisioni bloccate. 31 sezioni (§0–§29 + §18-bis). |
-| Codice | **Step 1–5 di M0 fatti** (scaffold, enums/models, config, gate, state/orchestrator shell); 56 test verdi. |
+| Codice | **Step 1–6 di M0 fatti** (scaffold, enums/models, config, gate, state/orchestrator shell, recon/fingerprint); 77 test verdi. |
 | Milestone attiva | **M0** — vista read-only dell'attaccante. |
-| Focus immediato | Step 6 del build order: `recon/fingerprint.py` read-only (httpx/whatweb/katana + estrazione anon key dal bundle) → `Fingerprint` (§8). |
+| Focus immediato | Step 7 del build order: `modules/base.py` — `Module` ABC + `REGISTRY` (decoratore `register`) + `should_run` (§9). |
 | Target di collaudo | Staging del **Gestionale Officina** (Supabase + Cloudflare). |
 | Decisioni OPEN | O01–O05 (§5 di questo file) — **nessuna blocca M0**. |
 | Tool esterni | Da verificare con `bastione doctor` una volta che la CLI esiste. M0 dipende solo da: `httpx`/`katana`/`whatweb` (degradano se assenti). |
@@ -45,7 +45,7 @@ Se stai aprendo Bastione ora e non c'è ancora codice:
 [x]  3. CONFIG            config.py: load+validate TOML → TargetConfig (§5.6, §29); risoluzione <n>.local.toml > <n>.toml (§6 LOAD); targets/_example.toml
 [x]  4. GATE 🔒           gate.py: assert_preconditions + authorize + verify_ownership (§7, §7.1) — DEVE esistere PRIMA di ogni modulo
 [x]  5. STATE+ORCH        state.py (§24) + orchestrator.py: macchina a stati shell con le 12 fasi (§6), per ora fasi non implementate = pass
-[ ]  6. RECON             recon/fingerprint.py: read-only, httpx/whatweb/katana + estrazione anon key dal bundle (§8) → Fingerprint
+[x]  6. RECON             recon/fingerprint.py: read-only, httpx/whatweb/katana + estrazione anon key dal bundle (§8) → Fingerprint
 [ ]  7. MODULE BASE       modules/base.py: Module ABC + REGISTRY + should_run (§9)
 [ ]  8. SECRETS (det.)    modules/secrets/: Detector ABC + REGISTRY + **1 detector reale** SECRET_SERVICE_ROLE — solo detection, no liveness (§10)
 [ ]  9. SUPABASE 💎        modules/supabase/module.py §11.1: OpenAPI surface map + **RLS read test** (la gemma). §11.2 = stub NotImplementedError("M2")
@@ -129,8 +129,8 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
   "code_started": true,
   "build_steps_m0": {
     "total": 16,
-    "done": 5,
-    "next": "6. RECON"
+    "done": 6,
+    "next": "7. MODULE BASE"
   },
   "decisions_locked": 13,
   "open_decisions": ["O01","O02","O03","O04","O05"],
@@ -146,6 +146,7 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
 
 > Una riga per sessione: cosa è cambiato, cosa è stato deciso, dove riprendere.
 
+- **2026-06-13 — Sessione 3 (step 6: recon / fingerprint read-only).** Implementato in TDD `recon/fingerprint.py` (§8). Funzioni pure (la *gemma*, testate con input reali, niente mock): `extract_script_srcs` (fallback bundle **obbligatorio senza katana**), `extract_supabase_url`, `extract_anon_key` (JWT `role:anon` — **ignora di proposito la service_role**, §8/§10), `detect_cloudflare`, `is_wordpress`. Orchestratore `fingerprint()` con confini I/O monkeypatchabili (`_fetch`/`_run_whatweb`/`_run_katana`, degrado grazioso L06) + scrittura `fingerprint.json`. Scelta M0 (flaggata a Claudio): passo 1 con httpx-**lib**, non il binario projectdiscovery (ridondante; la lib copre URL finale/header/redirect/Cloudflare per un singolo base_url). Revisione adversariale multi-agente (3 dimensioni: correctness · sicurezza/guardrail · robustezza/contratto; ogni finding ri-verificato/refutato): **4 fix applicati** — **(F1)** `is_supabase` legato all'URL PostgREST, non più OR con `anon_key` (eliminato lo stato incoerente `True`+`supabase_url=None` che avrebbe fatto partire il modulo supabase senza URL, §9/§11.1); **(F4)** **filtro same-host** sui bundle (owned-only §7: niente GET verso CDN di terzi non dichiarati); **(F3)** test del bundle `None` in mezzo a più bundle (path DoD-critico); **(F2)** `_parse_whatweb` tollerante per-riga (una riga malformata non scarta le valide). Confermati corretti e già testati: distinzione anon/service_role, no command-injection nei subprocess (argv-list), test 100% offline. Segnalato come **hardening futuro** (non M0-blocking — `runs/` è gitignored, artifact solo locale): redazione `Set-Cookie` in `fingerprint.json`. **77 test verdi**, tutto offline/read-only, nessun target puntato. Step 5 (state+orchestrator) committato+pushato a inizio sessione; da questa sessione commit/push automatici (regola di Claudio). Prossimo: **step 7** — `modules/base.py` (Module ABC + REGISTRY + should_run, §9). Nessuna OPEN blocca M0.
 - **2026-06-13 — Sessione 2 (step 5: state + orchestrator shell).** Implementati in TDD `state.py` (§24: `RunState` schema `bastione-state/1`, save/load, `next_phase` per `--resume`) e `orchestrator.py` (§6: macchina a stati shell con le 12 fasi — `LOAD`+`OWNERSHIP`+`PERSIST` cablate, `RECON…NOTIFY` stub no-op; **gate cablato in LOAD** → produzione aborta senza scrivere su disco; condizionali registrate in `phases_skipped` non omesse; logica `--resume`). Shell verificato end-to-end su `_example` → `state.json` valido. Revisione adversariale multi-agente (3 dimensioni, ogni finding ri-verificato): **1 bug major trovato e corretto** — `REMEDIATE`/`NOTIFY` avevano la precondizione cablata ma nessun handler no-op, così al `--resume` con `counts` non nulli la fase sollevava `RuntimeError` abortendo la run (resumability rotta, §6/§24); aggiunti a `_SHELL_STUB` + **test di regressione**. **56 test verdi.** Tutto offline/read-only, nessun target puntato, nessuna scrittura. Prossimo passo: **step 6** — `recon/fingerprint.py` read-only → `Fingerprint` (§8). Nessuna OPEN blocca M0.
 - **2026-06-13 — Sessione 1 (primo codice).** Eseguiti gli **step 1–4** del build order M0 in **TDD** (RED→GREEN per ogni modulo): scaffold (pyproject `uv` + dev-deps in `[dependency-groups]`, `.gitignore` che ignora `runs/`+`targets/*.local.toml` ma **non** `baselines/`, README, `baselines/.gitkeep`); `enums.py` (§5.1) + `models.py` (§5.2–5.6, incl. `Location.canonical()` con normalizzazione content-hash); `config.py` (precedenza `.local.toml`, flatten TOML→`TargetConfig`, **separato dal gate**) + `targets/_example.toml` (§29); `gate.py` (§7/§7.1: `assert_preconditions`+`authorize`+`verify_ownership`, con httpx/dnspython **lazy** e degrado grazioso L06). **43 test verdi.** Revisione adversariale multi-agente (5 dimensioni + adversario anti-bypass sul gate, ogni finding ri-verificato): **0 difetti reali sul gate** (un dubbio sollevato e respinto in verifica); **1 incoerenza minore** README↔pyproject (fallback `pip install -e ".[dev]"` non installa i `[dependency-groups]`) → **corretta**. **Stop al checkpoint gate** (PROMPT-00 §5) per revisione di Claudio. **Nessuna scrittura, tutto read-only; nessun target puntato.** Prossimo passo: **step 5** — `state.py` (§24) + `orchestrator.py` shell con le 12 fasi (§6), fasi non implementate = `pass`. Nessuna OPEN blocca M0.
 - **2026-06-12 — Sessione 0-bis (revisione documentale).** Audit di coerenza sui 5 file: risolte le contraddizioni gate-vs-declassamento (§6/§7), semantica `known`/`accepted` + `baseline --accept` (§16/§25), baseline committabile per CI (L05/§22), fasi saltate per `--resume` (§24), Appendice A allineata a `bastione-devstate/1`; aggiunti §5.6 (TargetConfig/ModuleResult/RunSummary), normalizzazione content-hash nel finding_id (§5.2), fallback bundle senza katana (§8), criterio severità RLS (§11.1), confine headers/cloudflare (§12), precedenza `--fail-on` (§19), dnspython (§3); corretti refuso cirillico (§29) e conteggio sezioni. Stop rule `ownership_token` ora qualificata (> read-only). **Nessun codice scritto.** Prossimo passo: invariato, step 1 (scaffold).
