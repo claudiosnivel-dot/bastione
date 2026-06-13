@@ -1,7 +1,7 @@
 # BASTIONE — SESSION-STATE
 
 > **Codename:** BAS · **Traccia blueprint:** v2.1 · **Milestone attiva:** **M0** · **Aggiornato:** 2026-06-13
-> **Stato (una riga):** step **1–4 di M0** implementati e testati in TDD (scaffold + enums/models + config + **gate**), 43 test verdi; fermo al **checkpoint gate** (§5 di PROMPT-00) in attesa di revisione. Prossimo: step 5 (state+orchestrator shell).
+> **Stato (una riga):** step **1–5 di M0** implementati e testati in TDD (scaffold + enums/models + config + gate + **state/orchestrator shell**), 56 test verdi; fermo al **checkpoint di fine step 5** in attesa di revisione. Prossimo: step 6 (RECON / fingerprint read-only → Fingerprint).
 >
 > **⚠️ Due "stati" diversi — non confonderli:**
 > - **Questo file** (`SESSION-STATE.md`) = stato di *sviluppo del progetto*, handoff tra sessioni di coding. È ciò che Claude Code legge in testa a ogni sessione per sapere dove siamo.
@@ -26,9 +26,9 @@ Se stai aprendo Bastione ora e non c'è ancora codice:
 | Dimensione | Stato |
 |---|---|
 | Blueprint | **v2.1**, completo, decisioni bloccate. 31 sezioni (§0–§29 + §18-bis). |
-| Codice | **Step 1–4 di M0 fatti** (scaffold, enums/models, config, gate); 43 test verdi. |
+| Codice | **Step 1–5 di M0 fatti** (scaffold, enums/models, config, gate, state/orchestrator shell); 56 test verdi. |
 | Milestone attiva | **M0** — vista read-only dell'attaccante. |
-| Focus immediato | Step 5 del build order: `state.py` (§24) + `orchestrator.py` shell con le 12 fasi (§6), fasi non implementate = `pass`. |
+| Focus immediato | Step 6 del build order: `recon/fingerprint.py` read-only (httpx/whatweb/katana + estrazione anon key dal bundle) → `Fingerprint` (§8). |
 | Target di collaudo | Staging del **Gestionale Officina** (Supabase + Cloudflare). |
 | Decisioni OPEN | O01–O05 (§5 di questo file) — **nessuna blocca M0**. |
 | Tool esterni | Da verificare con `bastione doctor` una volta che la CLI esiste. M0 dipende solo da: `httpx`/`katana`/`whatweb` (degradano se assenti). |
@@ -44,7 +44,7 @@ Se stai aprendo Bastione ora e non c'è ancora codice:
 [x]  2. ENUMS+MODELS      enums.py (§5.1) + models.py (§5: Finding, PostureCheck, Fingerprint, RunContext, …) — TUTTO il resto dipende da qui
 [x]  3. CONFIG            config.py: load+validate TOML → TargetConfig (§5.6, §29); risoluzione <n>.local.toml > <n>.toml (§6 LOAD); targets/_example.toml
 [x]  4. GATE 🔒           gate.py: assert_preconditions + authorize + verify_ownership (§7, §7.1) — DEVE esistere PRIMA di ogni modulo
-[ ]  5. STATE+ORCH        state.py (§24) + orchestrator.py: macchina a stati shell con le 12 fasi (§6), per ora fasi non implementate = pass
+[x]  5. STATE+ORCH        state.py (§24) + orchestrator.py: macchina a stati shell con le 12 fasi (§6), per ora fasi non implementate = pass
 [ ]  6. RECON             recon/fingerprint.py: read-only, httpx/whatweb/katana + estrazione anon key dal bundle (§8) → Fingerprint
 [ ]  7. MODULE BASE       modules/base.py: Module ABC + REGISTRY + should_run (§9)
 [ ]  8. SECRETS (det.)    modules/secrets/: Detector ABC + REGISTRY + **1 detector reale** SECRET_SERVICE_ROLE — solo detection, no liveness (§10)
@@ -129,8 +129,8 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
   "code_started": true,
   "build_steps_m0": {
     "total": 16,
-    "done": 4,
-    "next": "5. STATE+ORCH"
+    "done": 5,
+    "next": "6. RECON"
   },
   "decisions_locked": 13,
   "open_decisions": ["O01","O02","O03","O04","O05"],
@@ -146,6 +146,7 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
 
 > Una riga per sessione: cosa è cambiato, cosa è stato deciso, dove riprendere.
 
+- **2026-06-13 — Sessione 2 (step 5: state + orchestrator shell).** Implementati in TDD `state.py` (§24: `RunState` schema `bastione-state/1`, save/load, `next_phase` per `--resume`) e `orchestrator.py` (§6: macchina a stati shell con le 12 fasi — `LOAD`+`OWNERSHIP`+`PERSIST` cablate, `RECON…NOTIFY` stub no-op; **gate cablato in LOAD** → produzione aborta senza scrivere su disco; condizionali registrate in `phases_skipped` non omesse; logica `--resume`). Shell verificato end-to-end su `_example` → `state.json` valido. Revisione adversariale multi-agente (3 dimensioni, ogni finding ri-verificato): **1 bug major trovato e corretto** — `REMEDIATE`/`NOTIFY` avevano la precondizione cablata ma nessun handler no-op, così al `--resume` con `counts` non nulli la fase sollevava `RuntimeError` abortendo la run (resumability rotta, §6/§24); aggiunti a `_SHELL_STUB` + **test di regressione**. **56 test verdi.** Tutto offline/read-only, nessun target puntato, nessuna scrittura. Prossimo passo: **step 6** — `recon/fingerprint.py` read-only → `Fingerprint` (§8). Nessuna OPEN blocca M0.
 - **2026-06-13 — Sessione 1 (primo codice).** Eseguiti gli **step 1–4** del build order M0 in **TDD** (RED→GREEN per ogni modulo): scaffold (pyproject `uv` + dev-deps in `[dependency-groups]`, `.gitignore` che ignora `runs/`+`targets/*.local.toml` ma **non** `baselines/`, README, `baselines/.gitkeep`); `enums.py` (§5.1) + `models.py` (§5.2–5.6, incl. `Location.canonical()` con normalizzazione content-hash); `config.py` (precedenza `.local.toml`, flatten TOML→`TargetConfig`, **separato dal gate**) + `targets/_example.toml` (§29); `gate.py` (§7/§7.1: `assert_preconditions`+`authorize`+`verify_ownership`, con httpx/dnspython **lazy** e degrado grazioso L06). **43 test verdi.** Revisione adversariale multi-agente (5 dimensioni + adversario anti-bypass sul gate, ogni finding ri-verificato): **0 difetti reali sul gate** (un dubbio sollevato e respinto in verifica); **1 incoerenza minore** README↔pyproject (fallback `pip install -e ".[dev]"` non installa i `[dependency-groups]`) → **corretta**. **Stop al checkpoint gate** (PROMPT-00 §5) per revisione di Claudio. **Nessuna scrittura, tutto read-only; nessun target puntato.** Prossimo passo: **step 5** — `state.py` (§24) + `orchestrator.py` shell con le 12 fasi (§6), fasi non implementate = `pass`. Nessuna OPEN blocca M0.
 - **2026-06-12 — Sessione 0-bis (revisione documentale).** Audit di coerenza sui 5 file: risolte le contraddizioni gate-vs-declassamento (§6/§7), semantica `known`/`accepted` + `baseline --accept` (§16/§25), baseline committabile per CI (L05/§22), fasi saltate per `--resume` (§24), Appendice A allineata a `bastione-devstate/1`; aggiunti §5.6 (TargetConfig/ModuleResult/RunSummary), normalizzazione content-hash nel finding_id (§5.2), fallback bundle senza katana (§8), criterio severità RLS (§11.1), confine headers/cloudflare (§12), precedenza `--fail-on` (§19), dnspython (§3); corretti refuso cirillico (§29) e conteggio sezioni. Stop rule `ownership_token` ora qualificata (> read-only). **Nessun codice scritto.** Prossimo passo: invariato, step 1 (scaffold).
 - **2026-06-12 — Sessione 0.** Blueprint portato a **v2.1**: riscrittura disambiguata da scanner one-shot a sistema di difesa continuo, + aggiunto **Agent Remediation Bundle** (§18-bis) e fase `REMEDIATE`. Creato questo SESSION-STATE. **Nessun codice scritto.** Prossimo passo: step 1 del build order (scaffold repo + pyproject uv). Nessuna OPEN blocca M0.
