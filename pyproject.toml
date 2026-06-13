@@ -1,0 +1,45 @@
+# Bastione (BAS) — pyproject (gestione dipendenze con uv, §2/§3 del blueprint).
+# Fallback documentato a venv + pip (L02): `python -m venv .venv && pip install -e .`.
+
+[project]
+name = "bastione"
+version = "0.0.0"
+description = "Bastione (BAS) — orchestratore di security testing difensivo per app web di proprietà"
+readme = "README.md"
+requires-python = ">=3.11"            # L01: Python 3.11+
+license = { text = "Proprietary" }
+authors = [{ name = "Claudio" }]
+
+# Runtime — versioni minime da §3 del blueprint (LOCKED).
+dependencies = [
+    "pydantic>=2.6",                 # modelli/validazione (L03)
+    "httpx>=0.27",                   # sonda Supabase/HTTP + ownership well-known (§7.1/§11)
+    "typer>=0.12",                   # CLI (§25)
+    "rich>=13",                      # output terminale
+    "jinja2>=3.1",                   # template report/playbook (§18/§23)
+    "python-dotenv>=1",              # env per i notifier (§19)
+    "dnspython>=2",                  # lookup DNS TXT per l'ownership challenge (§7.1; solo run > read-only)
+    "tomli>=2; python_version < '3.11'",  # TOML su <3.11; ≥3.11 usa tomllib (stdlib)
+]
+
+# La CLI `bastione` viene cablata allo step 15 (§25), quando esiste bastione/cli.py.
+# Tenuta commentata per non lasciare un entrypoint che punta a un modulo ancora assente.
+# [project.scripts]
+# bastione = "bastione.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",                     # test (un test minimo per modulo non banale, §3 L-test)
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bastione"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]                   # rende importabile il package `bastione` dalla root del repo
+testpaths = ["tests"]
+addopts = "-ra"

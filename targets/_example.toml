@@ -1,0 +1,34 @@
+# Risoluzione: `--target <nome>` carica targets/<nome>.local.toml se esiste
+# (config reale, gitignored), altrimenti targets/<nome>.toml (§6 LOAD).
+
+# ─── Identità target ────────────────────────────────────────────────
+name        = "gestionale"
+base_url    = "https://staging.gestionale-officina.example"
+environment = "staging"                # "staging" | "production"(BLOCCATO)
+ownership   = "owned"                   # "owned" | "authorized-written"
+ownership_token = "b3f1c2a4-…"          # pubblicato su /.well-known/bastione-ownership.txt o DNS TXT _bastione
+
+# ─── Supabase (opzionale: se non dichiarato, lo scopre il recon) ─────
+[supabase]
+url = "https://abcdef.supabase.co"      # opzionale; il recon può estrarlo dal bundle
+# anon_key: NON metterla qui — la estrae il recon (è pubblica)
+
+# ─── Notifiche ──────────────────────────────────────────────────────
+[notify]
+channel      = "telegram"               # telegram | email | webhook | none
+min_severity = "high"                   # soglia per alert/CI
+
+# ─── Modo oracolo (opzionale → abilita la profondità) ───────────────
+[expectations]
+[[expectations.table]]
+name = "clienti"
+anon_select = false
+anon_insert = false
+[[expectations.table]]
+name = "listino_pubblico"
+anon_select = true
+anon_insert = false
+
+# ─── Override moduli (opzionale) ────────────────────────────────────
+[modules]
+disabled = []                           # es. ["zap"] per saltarlo
