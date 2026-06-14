@@ -22,8 +22,10 @@ hidden): sono M1/orchestratore. Le scritture canary (§11.2) sono M2 e qui resta
 uno stub che solleva `NotImplementedError("M2")` — non si anticipano scritture.
 
 Resilienza (P8): un confine I/O che fallisce o un singolo asset che esplode viene
-saltato/loggato, non fa crashare il resto. Surface map irraggiungibile/non-JSON →
-`ModuleResult` vuoto.
+saltato/loggato, non fa crashare il resto. Surface map irraggiungibile/non-JSON
+(es. la root REST risponde 401 all'anon su un target reale) → NON si tace: si
+emette UN segnale onesto `SUPABASE_SCHEMA_NOT_ENUMERABLE` (RLS non verificabile
+via introspezione, verifica INCOMPLETA, §11.1).
 
 Il confine HTTP è la funzione modulo-livello `_get(url, headers)`: l'unica cosa
 monkeypatchata nei test (probe offline) — come per il gate (§7) e il recon (§8).
@@ -190,10 +192,16 @@ class SupabaseModule(Module):
         target = ctx.target_cfg.name
 
         # 1) SURFACE MAP — GET <supabase_url>/rest/v1/ → schema OpenAPI PostgREST.
-        schema = self._fetch_surface(base, headers)
+        schema, detail = self._fetch_surface(base, headers)
         if schema is None:
-            # Resiliente: surface map fallita/non-JSON → ModuleResult vuoto (§11.1).
-            log.warning("surface map non disponibile: probe Supabase vuota (§11.1)")
+            # Surface non disponibile (es. la root REST risponde 401 all'anon su un
+            # target reale): NON tacere (sarebbe fuorviante). Emettiamo UN segnale
+            # onesto — Supabase rilevato ma RLS NON verificabile via introspezione,
+            # quindi verifica INCOMPLETA — e ritorniamo solo quel finding (§11.1).
+            log.warning("surface map non disponibile (%s): emetto segnale onesto "
+                        "SUPABASE_SCHEMA_NOT_ENUMERABLE (§11.1)", detail)
+            findings.append(self._schema_not_enumerable_finding(
+                supabase_url, detail, target))
             return ModuleResult(findings, posture_checks)
 
         tables, rpc_count = _enumerate_surface(schema)
@@ -215,25 +223,81 @@ class SupabaseModule(Module):
 
     # ── passi interni ───────────────────────────────────────────────────────
 
-    def _fetch_surface(self, base: str, headers: dict[str, str]) -> dict | None:
-        """GET <base>/rest/v1/ → dict OpenAPI, o None se irraggiungibile/non-JSON.
-        Resiliente: qualunque errore di rete o di parsing → None (§11.1)."""
+    def _fetch_surface(
+        self, base: str, headers: dict[str, str]
+    ) -> tuple[dict | None, str]:
+        """GET <base>/rest/v1/ → `(schema, detail)` (§11.1).
+
+        Successo: `(schema_dict, "status=200")`. In caso contrario `schema` è None
+        e `detail` motiva ESPLICITAMENTE il fallimento (per un segnale onesto nel
+        report, §11.1) — es. "status=401", "nessuna risposta (httpx assente o
+        errore di rete)", "risposta non-JSON", "schema non valido".
+        Resiliente: qualunque errore di rete o di parsing → `(None, detail)`."""
         resp = _get(f"{base}/rest/v1/", headers)
         if resp is None:
-            log.warning("surface map: nessuna risposta dalla root REST "
-                        "(httpx assente o errore di rete) (§11.1)")
-            return None
+            detail = "nessuna risposta (httpx assente o errore di rete)"
+            log.warning("surface map: %s dalla root REST (§11.1)", detail)
+            return None, detail
         status = getattr(resp, "status_code", None)
         if status != 200:
-            log.warning("surface map: la root REST ha risposto status=%s "
-                        "(l'anon non legge lo schema OpenAPI?) (§11.1)", status)
-            return None
+            detail = f"status={status}"
+            log.warning("surface map: la root REST ha risposto %s "
+                        "(l'anon non legge lo schema OpenAPI?) (§11.1)", detail)
+            return None, detail
         try:
             schema = resp.json()
         except (ValueError, TypeError):
-            log.warning("surface map: risposta non-JSON dalla root REST (§11.1)")
-            return None
-        return schema if isinstance(schema, dict) else None
+            detail = "risposta non-JSON"
+            log.warning("surface map: %s dalla root REST (§11.1)", detail)
+            return None, detail
+        if not isinstance(schema, dict):
+            detail = "schema non valido"
+            log.warning("surface map: %s dalla root REST (§11.1)", detail)
+            return None, detail
+        return schema, "status=200"
+
+    @staticmethod
+    def _schema_not_enumerable_finding(
+        supabase_url: str,
+        detail: str,
+        target: str,
+    ) -> Finding:
+        """Segnale ONESTO `SUPABASE_SCHEMA_NOT_ENUMERABLE` (§11.1): Supabase è stato
+        rilevato (is_supabase + anon_key) ma la root REST non espone lo schema
+        OpenAPI all'anon → impossibile enumerare le tabelle e quindi verificare
+        l'RLS per-tabella via introspezione. Questo NON conferma che l'RLS sia
+        corretta: è una verifica INCOMPLETA, da rendere esplicita nel report.
+
+        Severità LOCKED `INFO` + confidence `TENTATIVE`. Evidence NON segreta
+        (solo l'esito della GET). finding_id via la STESSA formula LOCKED §16."""
+        location = Location(endpoint="/rest/v1/", url=supabase_url)
+        # Evidence NON segreta (P8): solo l'esito della GET, mai chiavi/dati.
+        evidence = f"GET /rest/v1/ -> {detail}"
+        description = (
+            "Supabase rilevato (is_supabase + anon_key) ma la root REST "
+            "(/rest/v1/) non espone lo schema OpenAPI all'anon → impossibile "
+            "enumerare le tabelle e quindi verificare l'RLS per-tabella via "
+            "introspezione (§11.1). **Questo NON conferma che l'RLS sia "
+            "corretta: è una verifica INCOMPLETA.** Un attaccante ricaverebbe i "
+            "nomi tabella dal bundle JS (.from('...')) e testerebbe l'RLS per "
+            "nome → copertura prevista in M1."
+        )
+        return Finding(
+            finding_id=_finding_id(
+                "supabase", "SUPABASE_SCHEMA_NOT_ENUMERABLE", location),
+            module="supabase",
+            rule_id="SUPABASE_SCHEMA_NOT_ENUMERABLE",
+            title="Superficie Supabase non enumerabile dall'anon",
+            severity=Severity.INFO,
+            confidence=Confidence.TENTATIVE,
+            target=target,
+            location=location,
+            evidence=evidence,
+            description=description,
+            remediation_ref="RLS_DISABLED",
+            owasp=["A01:2021"],
+            intrusion_used=IntrusionLevel.READ_ONLY,
+        )
 
     def _rls_read_test(
         self,

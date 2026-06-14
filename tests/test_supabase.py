@@ -276,23 +276,100 @@ def test_supabase_url_falls_back_to_target_cfg(monkeypatch):
     assert any(pc.check_id == "POSTURE_RLS_t" for pc in res.posture_checks)
 
 
-# ─── resilienza: surface map fallita / non-JSON → ModuleResult vuoto ────────
+# ─── segnale onesto: surface non enumerabile → UN finding INFO/TENTATIVE ─────
+#
+# Su un target reale la root REST può rispondere 401 all'anon (schema non
+# introspezionabile). NON si tace (sarebbe fuorviante): si emette UN finding
+# onesto SUPABASE_SCHEMA_NOT_ENUMERABLE che rende ESPLICITO che la verifica RLS
+# NON è stata fatta (verifica INCOMPLETA, §11.1).
 
-def test_surface_map_unreachable_returns_empty(monkeypatch):
-    monkeypatch.setattr(supa, "_get", lambda url, headers: None)
-    res = supa.SupabaseModule().run(make_ctx())
-    assert res.findings == []
-    assert res.posture_checks == []
-
-
-def test_surface_map_non_json_returns_empty(monkeypatch):
+def test_surface_map_401_emits_honest_not_enumerable_finding(monkeypatch):
     def router(url, headers):
-        # 200 ma corpo non-JSON: .json() solleva → niente schema
+        # la root REST risponde 401 all'anon: schema non introspezionabile
+        if url.rstrip("/").endswith("/rest/v1"):
+            return fake_resp(status_code=401, payload=None)
+        return None
+    monkeypatch.setattr(supa, "_get", router)
+
+    res = supa.SupabaseModule().run(make_ctx())
+
+    # esattamente UN finding onesto, nessun posture check (RLS non verificata)
+    assert len(res.findings) == 1
+    assert res.posture_checks == []
+    f = res.findings[0]
+    assert f.rule_id == "SUPABASE_SCHEMA_NOT_ENUMERABLE"
+    assert f.module == "supabase"
+    assert f.severity is Severity.INFO
+    assert f.confidence is Confidence.TENTATIVE
+    assert f.target == "gestionale"
+    assert f.location.endpoint == "/rest/v1/"
+    assert f.location.url == SUPA_URL
+    assert f.remediation_ref == "RLS_DISABLED"
+    assert f.owasp == ["A01:2021"]
+    assert f.intrusion_used is IntrusionLevel.READ_ONLY
+    # l'evidence (NON segreta) riporta il MOTIVO esplicito del fallimento
+    assert "status=401" in f.evidence
+    # nessuna chiave/segreto nell'evidence (P8)
+    assert ANON not in f.evidence
+
+
+def test_surface_map_unreachable_emits_honest_finding_with_network_detail(monkeypatch):
+    # _get → None (httpx assente o errore di rete): stesso segnale onesto
+    monkeypatch.setattr(supa, "_get", lambda url, headers: None)
+
+    res = supa.SupabaseModule().run(make_ctx())
+
+    assert len(res.findings) == 1
+    assert res.posture_checks == []
+    f = res.findings[0]
+    assert f.rule_id == "SUPABASE_SCHEMA_NOT_ENUMERABLE"
+    assert f.severity is Severity.INFO
+    assert f.confidence is Confidence.TENTATIVE
+    # il detail di rete deve comparire nell'evidence
+    assert "rete" in f.evidence.lower()
+
+
+def test_surface_map_non_json_emits_honest_finding(monkeypatch):
+    def router(url, headers):
+        # 200 ma corpo non-JSON: .json() solleva → schema non disponibile
         return fake_resp(status_code=200, payload=None, text="<html>not json</html>")
     monkeypatch.setattr(supa, "_get", router)
+
     res = supa.SupabaseModule().run(make_ctx())
-    assert res.findings == []
+
+    assert len(res.findings) == 1
     assert res.posture_checks == []
+    f = res.findings[0]
+    assert f.rule_id == "SUPABASE_SCHEMA_NOT_ENUMERABLE"
+    assert "non-JSON" in f.evidence
+
+
+# ─── REGRESSIONE: il path felice NON deve mostrare il segnale onesto ─────────
+
+def test_happy_path_does_not_emit_honest_signal(monkeypatch):
+    # 200 + tabella con RLS aperta → ancora il finding RLS_DISABLED come prima;
+    # il segnale onesto SUPABASE_SCHEMA_NOT_ENUMERABLE NON deve comparire.
+    schema = openapi_schema({"clienti": ["id", "email"]})
+    rows = {"clienti": (200, [{"id": 1, "email": "x@y.it"}])}
+    install_router(monkeypatch, schema=schema, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx())
+
+    rule_ids = {f.rule_id for f in res.findings}
+    assert "RLS_DISABLED" in rule_ids
+    assert "SUPABASE_SCHEMA_NOT_ENUMERABLE" not in rule_ids
+
+
+# ─── il finding_id del segnale onesto coincide con baseline.diff.finding_id ──
+
+def test_not_enumerable_finding_id_matches_baseline_diff(monkeypatch):
+    from bastione.baseline.diff import finding_id as baseline_finding_id
+
+    monkeypatch.setattr(supa, "_get", lambda url, headers: None)
+    res = supa.SupabaseModule().run(make_ctx())
+    f = res.findings[0]
+    assert f.finding_id == baseline_finding_id(f)
+    assert len(f.finding_id) == 16
 
 
 # ─── resilienza: una tabella che fa errore non blocca le altre ──────────────
