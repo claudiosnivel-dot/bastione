@@ -9,8 +9,15 @@ Scopo M0 (P5): READ_ONLY. Il modulo:
   5. Converte ogni RawSecret in Finding con evidence REDATTA (mai il segreto
      in chiaro, §P8): primi 6 + "..." + ultimi 4 caratteri del token.
 
+Stadio 2 — Liveness (PROBE 🟡, §10.2): opt-in, eseguito SOLO se il tetto della
+run è ≥ PROBE E l'ownership è verificata. Per i RawSecret il cui detector
+supporta `validate_liveness`, una GET read-only verifica se la chiave è ancora
+viva e arricchisce il Finding corrispondente (intrusion_used=PROBE). Gated dal
+backstop gate.authorize(PROBE, ctx); un fallimento qui non crasha la scansione.
+
 Il confine di I/O (_fetch a livello modulo) è monkeypatchabile nei test (pattern
-identico a bastione/recon/fingerprint.py, dove _fetch è la funzione a sé).
+identico a bastione/recon/fingerprint.py, dove _fetch è la funzione a sé). La
+liveness usa il proprio confine I/O (_probe in detectors/service_role.py).
 
 Resilienza (§4.7): ogni asset non scaricabile viene saltato e loggato — non
 crasha la scansione degli altri asset. Un modulo/asset che fallisce non
@@ -27,6 +34,7 @@ import logging
 from urllib.parse import urlparse
 
 from bastione.enums import Confidence, IntrusionLevel
+from bastione.gate import IntrusionDenied, authorize
 from bastione.models import (
     Finding,
     Fingerprint,
@@ -100,7 +108,13 @@ class SecretsModule(Module):
     """
 
     name = "secrets"
-    max_intrusion = IntrusionLevel.READ_ONLY
+    # PROBE: il tetto reale di capability del modulo (§10.2). La detection Stadio 1
+    # è READ_ONLY, ma lo Stadio 2 (liveness, _run_liveness) esegue azioni PROBE
+    # (authorize(PROBE) + GET privilegiata read-only). `max_intrusion` è "la più alta
+    # intrusione che il modulo può richiedere" (base.py) ed è esposto user-facing da
+    # `list-modules` (cli.py): deve riflettere PROBE. NON è un bypass del gate —
+    # l'autorizzazione runtime usa sempre il tetto run-wide ctx.max_intrusion.
+    max_intrusion = IntrusionLevel.PROBE
 
     def should_run(self, fp: Fingerprint, cfg: TargetConfig) -> bool:
         """Ritorna sempre True (§9/§10): i segreti possono essere in qualunque target."""
@@ -113,8 +127,10 @@ class SecretsModule(Module):
           1. Scarica le pagine in ctx.fingerprint.resolved_urls.
           2. Per ogni pagina, estrae bundle JS same-host (<script src>).
           3. Scarica i bundle same-host.
-          4. Esegue ogni Detector in DETECTORS su ogni TextAsset.
-          5. Converte RawSecret → Finding con evidence REDATTA.
+          4. Esegue ogni Detector in DETECTORS su ogni TextAsset (Stadio 1,
+             READ_ONLY). Converte RawSecret → Finding con evidence REDATTA.
+          5. Stadio 2 — Liveness (PROBE 🟡, §10.2): SOLO se tetto ≥ PROBE E
+             ownership verificata, arricchisce i Finding con la liveness.
 
         Resiliente: asset non scaricabile → saltato (§4.7).
         """
@@ -122,6 +138,10 @@ class SecretsModule(Module):
         from bastione.modules.secrets.detectors.base import DETECTORS
 
         findings: list[Finding] = []
+        # Traccia (finding, raw_secret, detector) per lo Stadio 2: serve a
+        # ricollegare il RawSecret (col token in chiaro, mai esposto) e il detector
+        # al Finding già redatto, così la liveness può arricchirlo senza riscansionare.
+        detected: list[tuple[Finding, RawSecret, object]] = []
         asset_urls: list[str] = list(ctx.fingerprint.resolved_urls)
 
         # Cache {url: TextAsset} per evitare il doppio fetch (§4.7): la pagina
@@ -178,7 +198,7 @@ class SecretsModule(Module):
                     loc = Location(file=url)
                     evidence = _redact(raw.value)
                     fid = _finding_id("secrets", detector.detector_id, loc)
-                    findings.append(Finding(
+                    finding = Finding(
                         finding_id=fid,
                         module="secrets",
                         rule_id=detector.detector_id,
@@ -198,6 +218,76 @@ class SecretsModule(Module):
                         owasp=["A05:2021"],
                         gdpr_relevant=detector.gdpr_relevant,
                         intrusion_used=IntrusionLevel.READ_ONLY,
-                    ))
+                    )
+                    findings.append(finding)
+                    detected.append((finding, raw, detector))
+
+        # ── Stadio 2 — Liveness (PROBE 🟡, §10.2) ────────────────────────────
+        # Opt-in e gated: gira SOLO con tetto ≥ PROBE E ownership verificata.
+        # Quando NON gira, il comportamento M0 resta IDENTICO (nessun probe,
+        # nessun authorize): solo la detection READ_ONLY sopra.
+        self._run_liveness(ctx, detected)
 
         return ModuleResult(findings=findings, posture_checks=[])
+
+    # ─── Stadio 2 — Liveness (PROBE) ────────────────────────────────────────
+
+    def _run_liveness(
+        self,
+        ctx: RunContext,
+        detected: list[tuple[Finding, RawSecret, object]],
+    ) -> None:
+        """Verifica read-only se i segreti rilevati sono ancora vivi (§10.2).
+
+        Gate (§7/§10.2): gira SOLO se tetto run ≥ PROBE E ownership verificata.
+        Prima di qualsiasi probe chiama `authorize(PROBE, ctx)` come backstop
+        (difesa in profondità): se solleva `IntrusionDenied`, logga e salta —
+        niente crash. Ogni finding arricchito passa a intrusion_used=PROBE
+        mantenendo confidence=FIRM (verificato; NON esiste Confidence.CONFIRMED).
+        L'evidence resta redatta e il token in chiaro non appare mai (§P8).
+
+        NON emette PostureCheck: POSTURE_SERVICE_ROLE_HIDDEN è già coperto dalla
+        fase NORMALIZE dell'orchestratore (la detection di una service_role lo fa
+        già fallire) — qui si arricchisce solo il Finding, senza duplicazioni."""
+        # Precondizione: niente liveness in read-only o senza ownership (M0 identico).
+        if ctx.max_intrusion < IntrusionLevel.PROBE or not ctx.ownership_verified:
+            return
+        if not detected:
+            return
+
+        # Backstop del gate (§7): se nega, salta tutta la liveness, non crasha.
+        try:
+            authorize(IntrusionLevel.PROBE, ctx)
+        except IntrusionDenied as exc:
+            log.info("secrets: liveness PROBE negata dal gate, salto (§7): %s", exc)
+            return
+
+        for finding, raw, detector in detected:
+            try:
+                result = detector.validate_liveness(raw)
+            except Exception as exc:  # noqa: BLE001
+                # Resilienza (§4.7): un probe che esplode non ferma gli altri.
+                log.warning(
+                    "secrets: liveness %r ha sollevato un'eccezione: %s",
+                    detector.detector_id, exc)
+                continue
+
+            if result is None:
+                # Esito sconosciuto: il finding di detection resta invariato.
+                continue
+
+            # Arricchimento del Finding (mutazione in place: è lo stesso oggetto
+            # già presente in `findings`). Evidence già redatta, immutata (§P8).
+            finding.intrusion_used = IntrusionLevel.PROBE
+            finding.confidence = Confidence.FIRM
+            if result.alive:
+                finding.description = (
+                    f"{detector.detector_id}: chiave CONFERMATA VIVA tramite "
+                    f"liveness read-only (PROBE). {result.detail} {finding.description}"
+                )
+            else:
+                finding.description = (
+                    f"{detector.detector_id}: chiave esposta ma apparentemente "
+                    f"REVOCATA/ruotata (liveness PROBE). {result.detail} "
+                    f"{finding.description}"
+                )

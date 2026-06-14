@@ -187,12 +187,15 @@ def test_service_role_detector_attributes():
     assert d.detector_id == "SECRET_SERVICE_ROLE"
 
 
-def test_service_role_detector_validate_liveness_returns_none():
-    """validate_liveness è stub: ritorna None (implementazione base, §10)."""
-    from bastione.modules.secrets.detectors.service_role import ServiceRoleDetector
-    d = ServiceRoleDetector()
-    token = make_jwt("service_role")
+def test_service_role_detector_validate_liveness_unknown_when_probe_none(monkeypatch):
+    """Se il probe degrada a None (es. errore di rete/httpx assente), la liveness
+    ritorna None (esito sconosciuto, §10.2). OFFLINE: il confine I/O `_probe` è
+    monkeypatchato — nessun host reale contattato anche con un ref valido."""
+    import bastione.modules.secrets.detectors.service_role as sr
+    d = sr.ServiceRoleDetector()
+    token = make_jwt("service_role")  # ref di default valido ([a-z0-9]+)
     raw = d.scan(TextAsset(source="x", content=f'"{token}"'))[0]
+    monkeypatch.setattr(sr, "_probe", lambda url, tok: None)
     assert d.validate_liveness(raw) is None
 
 
@@ -208,6 +211,95 @@ def test_service_role_detector_handles_malformed_jwt_gracefully():
     assert secrets == []
 
 
+# ─── (2-bis) Liveness owned-only: il `ref` artefatto NON deve generare un probe ──
+
+@pytest.mark.parametrize("evil_ref", [
+    "evil.com/",        # netloc effettivo → evil.com
+    "evil.com#",        # netloc effettivo → evil.com
+    "evil.com@",        # userinfo → host evil.com (urlparse)
+    "evil.com:8080/x",  # porta + path su host esterno
+    "good.supabase.co/../..",  # path traversal nell'authority
+    "UPPER",            # maiuscole: non è un project ref Supabase valido
+    "ab.cd",            # due etichette DNS: non è un singolo ref [a-z0-9]+
+    "ab cd",            # spazio
+    "",                 # vuoto (coperto anche dal guard isinstance/truthy)
+])
+def test_validate_liveness_rejects_non_supabase_ref_no_probe(monkeypatch, evil_ref):
+    """REGRESSIONE (SSRF/owned-only §7): un `ref` non conforme al formato project
+    ref Supabase ([a-z0-9]+) NON deve mai far partire un probe. Il claim `ref` è
+    CONTENUTO scansionato (attacker-controllable, firma non verificata): un ref come
+    'evil.com/' sposterebbe il netloc dell'URL fuori da *.supabase.co. La liveness
+    deve degradare a None senza chiamare `_probe`. OFFLINE: `_probe` è monkeypatchato
+    con un sentinel che FALLISCE il test se invocato."""
+    import bastione.modules.secrets.detectors.service_role as sr
+
+    def _must_not_probe(url, tok):
+        raise AssertionError(
+            f"PROBE NON deve partire per un ref non conforme (owned-only §7): {url!r}")
+
+    monkeypatch.setattr(sr, "_probe", _must_not_probe)
+
+    d = sr.ServiceRoleDetector()
+    # JWT service_role con il ref malevolo nel payload (firma fittizia, non verificata).
+    token = make_jwt("service_role", ref=evil_ref)
+    raw = sr.RawSecret(
+        detector_id="SECRET_SERVICE_ROLE",
+        value=token,
+        location=sr.Location(file="https://staging.example.com/app.js"),
+        entropy=None,
+    )
+    assert d.validate_liveness(raw) is None
+
+
+def test_validate_liveness_valid_ref_probes_only_supabase_host(monkeypatch):
+    """REGRESSIONE: con un ref valido ([a-z0-9]+) il probe parte e l'URL contattato
+    è ESATTAMENTE `https://<ref>.supabase.co/...` (netloc owned-only). OFFLINE."""
+    import bastione.modules.secrets.detectors.service_role as sr
+    from urllib.parse import urlparse
+
+    probed: dict[str, str] = {}
+
+    def _capture(url, tok):
+        probed["url"] = url
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(sr, "_probe", _capture)
+
+    d = sr.ServiceRoleDetector()
+    token = make_jwt("service_role", ref="abcdefghijklmnopqrst")
+    raw = sr.RawSecret(
+        detector_id="SECRET_SERVICE_ROLE",
+        value=token,
+        location=sr.Location(file="https://staging.example.com/app.js"),
+        entropy=None,
+    )
+    result = d.validate_liveness(raw)
+    assert result is not None and result.alive is True
+    # L'host contattato è esattamente <ref>.supabase.co, mai un host di terze parti.
+    assert urlparse(probed["url"]).netloc == "abcdefghijklmnopqrst.supabase.co"
+
+
+def test_probe_does_not_follow_redirects(monkeypatch):
+    """REGRESSIONE (P8/§7): `_probe` deve usare follow_redirects=False, così un 3xx
+    cross-host non inoltra l'header custom `apikey` (col token) a host terzi. httpx è
+    monkeypatchato per catturare i kwargs — OFFLINE, nessuna richiesta reale."""
+    import bastione.modules.secrets.detectors.service_role as sr
+    import httpx
+
+    captured: dict[str, object] = {}
+
+    def fake_get(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    resp = sr._probe("https://abcdefghijklmnopqrst.supabase.co/rest/v1/", "tok")
+    assert resp is not None
+    assert captured["kwargs"]["follow_redirects"] is False
+
+
 # ─── (3) SecretsModule — should_run ─────────────────────────────────────────
 
 def test_secrets_module_should_run_always_true():
@@ -220,10 +312,16 @@ def test_secrets_module_should_run_always_true():
     assert mod.should_run(fp, cfg) is True
 
 
-def test_secrets_module_max_intrusion_is_read_only():
-    """max_intrusion del modulo deve essere READ_ONLY (M0, §10)."""
+def test_secrets_module_max_intrusion_is_probe():
+    """max_intrusion del modulo deve essere PROBE (§10.2).
+
+    Con M1 step 2 lo Stadio 2 (liveness) esegue azioni PROBE (authorize(PROBE) +
+    GET privilegiata read-only), quindi il tetto di capability dichiarato — esposto
+    user-facing da `list-modules` (cli.py) — deve essere PROBE, non READ_ONLY.
+    Il gating runtime resta basato sul tetto run-wide ctx.max_intrusion (nessun
+    bypass): questo attributo è solo metadata/contratto."""
     from bastione.modules.secrets.module import SecretsModule
-    assert SecretsModule.max_intrusion == IntrusionLevel.READ_ONLY
+    assert SecretsModule.max_intrusion == IntrusionLevel.PROBE
 
 
 # ─── (4) SecretsModule.run — con _fetch monkeypatchato ──────────────────────

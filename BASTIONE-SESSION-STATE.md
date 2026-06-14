@@ -94,7 +94,7 @@ Se stai aprendo Bastione ora e non c'è ancora codice:
 
 ```
 [x] 1. TABLE-DISCOVERY dal bundle   §8 + §11.1    extract_table_names + Fingerprint.discovered_tables + RLS fallback su 401 (287 test, done 2026-06-14)
-[ ] 2. LIVENESS segreti (PROBE)     §10.2 + §7.1  validate_liveness gated (ownership challenge); 1ª attivazione del gate PROBE
+[x] 2. LIVENESS segreti (PROBE)     §10.2 + §7.1  validate_liveness service_role gated PROBE + 1ª attivazione gate PROBE (319 test, done 2026-06-14)
 [ ] 3. BASELINE/DRIFT completo      §16           accept-baseline 2-step (known→accepted), first/last_seen, kernel drift completo
 [ ] 4. REMEDIATION playbooks        §18           template MD per rule_id, iniettati nel report
 [ ] 5. AGENT BUNDLE + `verify`      §18-bis       cartella fix/ + FIX-PLAN.md + loop `bastione verify`
@@ -149,7 +149,7 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
   "m0_done": true,
   "m0_validated_live": "asv-officina.pages.dev (owned, read-only, 2026-06-14)",
   "code_started": true,
-  "tests_green": 291,
+  "tests_green": 319,
   "build_steps_m0": {
     "total": 16,
     "done": 16,
@@ -157,8 +157,8 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
   },
   "build_steps_m1": {
     "total": 7,
-    "done": 1,
-    "next": "step 2 — liveness segreti (PROBE, gated da ownership challenge §7.1, §10.2)"
+    "done": 2,
+    "next": "step 3 — baseline/drift completo (§16): accept-baseline 2-step, first/last_seen, kernel drift completo"
   },
   "m1_priority_1": "table-discovery dai nomi tabella nel bundle JS (.from('...')) per testare l'RLS quando l'introspezione OpenAPI e' chiusa (401) — emersa dalla run live — DONE (M1 step 1, 2026-06-14): extract_table_names + Fingerprint.discovered_tables + fallback sonda Supabase",
   "next_session_goal": "CHIUDERE M1 — step 2..7 (liveness PROBE, baseline/drift completo, remediation playbooks, agent bundle+verify, moduli black-box, report HTML+gauge) in task atomici via dynamic workflow (regola permanente di Claudio)",
