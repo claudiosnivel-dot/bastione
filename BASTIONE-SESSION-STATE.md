@@ -99,7 +99,7 @@ Se stai aprendo Bastione ora e non c'è ancora codice:
 [x] 4. REMEDIATION playbooks        §18           remediation/playbooks.py (Jinja2) + 9 template MD iniettati nel report (NEW/KNOWN/drift), fallback intatto (389 test, done 2026-06-14)
 [x] 5. AGENT BUNDLE + `verify`      §18-bis       modelli FixEntry/FixPlan + agent_bundle.py (FixBuilder registry, 5 builder) + fase REMEDIATE scrive fix/ (FIX-PLAN.md+json+migrations) + comando `verify` (451 test, done 2026-06-14)
 [x] 6. MODULI black-box             §14           nuclei + ZAP passive (colla sottile: self-gate PROBE, which→SKIPPED INFO onesto se assente, JSON in run_dir/raw/, parse→Finding[]). testssl/WPScan/trivy = drop-in futuri/M3 (505 test, done 2026-06-14)
-[ ] 7. REPORT HTML + posture gauge  §17/§23 (O02) single-file dark + gauge; consuma tutto → per ultimo
+[x] 7. REPORT HTML + posture gauge  §17/§23 (O02) report/html.py single-file dark + gauge SVG + filtri stato/severità, CSS/JS inline (no CDN), escaping XSS totale (P8). O02 default applicato (537 test, done 2026-06-14)
 ```
 
 > Note di sequenza: lo **step 5 dipende dal 4** (il bundle agente consuma i playbook). Lo **step 6 è indipendente** (colla sottile attorno a binari, riordinabile/parallelizzabile). Lo **step 7 è presentazione** → per ultimo (rende il set più ricco di finding/playbook/posture). Gli step 1→5 sono il cuore difensivo.
@@ -149,7 +149,7 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
   "m0_done": true,
   "m0_validated_live": "asv-officina.pages.dev (owned, read-only, 2026-06-14)",
   "code_started": true,
-  "tests_green": 505,
+  "tests_green": 537,
   "build_steps_m0": {
     "total": 16,
     "done": 16,
@@ -157,8 +157,8 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
   },
   "build_steps_m1": {
     "total": 7,
-    "done": 6,
-    "next": "step 7 — report HTML + posture gauge (§17/§23, O02 default: single-file dark + gauge + filtri). ULTIMO step M1"
+    "done": 7,
+    "next": "completato (tutti i 7 step M1 code-complete) — manca solo la validazione live read-only come capstone (gated su Claudio)"
   },
   "m1_priority_1": "table-discovery dai nomi tabella nel bundle JS (.from('...')) per testare l'RLS quando l'introspezione OpenAPI e' chiusa (401) — emersa dalla run live — DONE (M1 step 1, 2026-06-14): extract_table_names + Fingerprint.discovered_tables + fallback sonda Supabase",
   "next_session_goal": "CHIUDERE M1 — step 2..7 (liveness PROBE, baseline/drift completo, remediation playbooks, agent bundle+verify, moduli black-box, report HTML+gauge) in task atomici via dynamic workflow (regola permanente di Claudio)",

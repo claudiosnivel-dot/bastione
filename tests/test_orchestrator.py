@@ -375,6 +375,37 @@ def test_full_run_produces_sarif_report_and_state(tmp_path: Path, monkeypatch):
     assert state.posture_score is not None
 
 
+def test_full_run_produces_html_report_single_file(tmp_path: Path, monkeypatch):
+    """Una run completa scrive anche run_dir/report.html accanto a bastione.sarif e
+    report.md (§23, O02). Additivo: SARIF e MD restano invariati. Il report HTML è
+    single-file (CSS/JS inline, nessun riferimento esterno) e cita il finding NEW."""
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    stub = _StubModule("supabase", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    orch.run("g")
+
+    run_dir = next((runs / "g").glob("*/"))
+    # I tre artefatti coesistono: SARIF e MD invariati, HTML aggiunto.
+    assert (run_dir / "bastione.sarif").exists()
+    assert (run_dir / "report.md").exists()
+    html_path = run_dir / "report.html"
+    assert html_path.exists(), "report.html non scritto"
+
+    html = html_path.read_text(encoding="utf-8")
+    # HTML5 single-file: doctype, CSS e JS inline, nessuna risorsa esterna.
+    assert "<!doctype html" in html.lower()
+    assert "<style" in html.lower() and "<script" in html.lower()
+    low = html.lower()
+    assert "src=\"http" not in low and "href=\"http" not in low
+    assert "@import" not in low
+    # Cita il finding NEW emesso.
+    assert "RLS_DISABLED" in html
+
+
 def test_module_error_does_not_crash_others_and_emits_meta_finding(tmp_path: Path, monkeypatch):
     """Resilienza (§6): un modulo che solleva un'eccezione produce un MODULE_ERROR
     (severity INFO) e NON interrompe gli altri moduli, i cui finding restano emessi."""

@@ -60,6 +60,7 @@ from bastione.normalize.sarif import to_sarif
 from bastione.posture.checks import posture_score
 from bastione.recon.fingerprint import fingerprint
 from bastione.remediation.agent_bundle import build_fix_plan, write_fix_bundle
+from bastione.report.html import to_html
 from bastione.report.markdown import to_markdown
 from bastione.state import RunState, intrusion_to_cli
 
@@ -71,6 +72,7 @@ DEFAULT_BASELINES_ROOT = Path("baselines")
 FINGERPRINT_FILENAME = "fingerprint.json"
 SARIF_FILENAME = "bastione.sarif"
 REPORT_FILENAME = "report.md"
+REPORT_HTML_FILENAME = "report.html"   # single-file condivisibile (§23, O02)
 
 # Ordine deterministico delle 12 fasi (§6).
 PHASE_ORDER: list[Phase] = [
@@ -515,8 +517,11 @@ class Orchestrator:
     # ── REPORT (§23) ───────────────────────────────────────────────────────────
 
     def _report(self) -> None:
-        """Scrive run_dir/bastione.sarif (SARIF 2.1.0) e run_dir/report.md (§23).
-        L'evidence è già redatta a monte (P8): nessuna de-redazione qui."""
+        """Scrive run_dir/bastione.sarif (SARIF 2.1.0), run_dir/report.md e
+        run_dir/report.html (§23). Il report HTML è il formato single-file
+        condivisibile (O02): stesso contenuto del MD, autocontenuto (CSS/JS inline),
+        tema dark con posture gauge e filtri. L'evidence è già redatta a monte (P8):
+        nessuna de-redazione qui."""
         assert self._cfg is not None
         result = self._result or BaselineResult()
         self._run_dir.mkdir(parents=True, exist_ok=True)
@@ -525,7 +530,8 @@ class Orchestrator:
         (self._run_dir / SARIF_FILENAME).write_text(
             json.dumps(sarif, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        report = to_markdown(
+        # Stessi argomenti per MD e HTML: stesso contenuto, due rese (§23).
+        report_args = dict(
             target=self._cfg.name,
             posture_score=self._score,
             findings=result.findings,
@@ -533,7 +539,11 @@ class Orchestrator:
             posture_checks=result.posture_checks,
             counts=result.counts,
         )
+        report = to_markdown(**report_args)
         (self._run_dir / REPORT_FILENAME).write_text(report, encoding="utf-8")
+
+        report_html = to_html(**report_args)
+        (self._run_dir / REPORT_HTML_FILENAME).write_text(report_html, encoding="utf-8")
 
     # ── REMEDIATE (§18-bis.2 / O05) ──────────────────────────────────────────
 
