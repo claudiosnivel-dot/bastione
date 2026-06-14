@@ -44,6 +44,7 @@ from bastione.models import (
     ModuleResult,
     PostureCheck,
     RunContext,
+    TableExpectation,
     TargetConfig,
 )
 from bastione.modules.base import Module, register
@@ -115,6 +116,21 @@ def _is_personal_column(column: str) -> bool:
 def _has_personal_data(columns: list[str]) -> bool:
     """True se almeno una colonna della tabella è un dato personale (§11.1)."""
     return any(_is_personal_column(c) for c in columns)
+
+
+def _expectation_for(table: str, cfg: TargetConfig) -> TableExpectation | None:
+    """Modo ORACOLO (§15): l'attesa dichiarata dal proprietario per UNA tabella,
+    o None se la matrice §15 non la menziona.
+
+    Match per NOME tabella, **case-sensitive** come PostgREST (le relazioni sono
+    case-sensitive: `Clienti` ≠ `clienti`). Funzione PURA (nessuna I/O): è il
+    ponte tra la matrice di attese parsata in config (`cfg.expectations`) e la
+    sonda. None → modo adversario (comportamento invariato, euristica colonne);
+    presente → modo oracolo (la matrice dà ground-truth e chiude gli ambigui)."""
+    for exp in cfg.expectations:
+        if exp.name == table:
+            return exp
+    return None
 
 
 def _enumerate_surface(schema: dict) -> tuple[dict[str, list[str]], int]:
@@ -205,7 +221,7 @@ class SupabaseModule(Module):
                             detail, len(discovered))
                 self._rls_test_via_bundle(
                     base, headers, discovered, supabase_url, detail, target,
-                    findings, posture_checks,
+                    findings, posture_checks, ctx.target_cfg,
                 )
                 return ModuleResult(findings, posture_checks)
             # Nessun nome tabella NEMMENO nel bundle: NON tacere (sarebbe
@@ -227,7 +243,7 @@ class SupabaseModule(Module):
             try:
                 self._rls_read_test(
                     base, headers, table, columns, supabase_url, target,
-                    findings, posture_checks,
+                    findings, posture_checks, ctx.target_cfg,
                 )
             except Exception:  # noqa: BLE001 — resilienza (P8): un asset non blocca gli altri
                 log.warning("RLS read test fallito per la tabella %r: saltata",
@@ -373,6 +389,7 @@ class SupabaseModule(Module):
         target: str,
         findings: list[Finding],
         posture_checks: list[PostureCheck],
+        cfg: TargetConfig,
     ) -> None:
         """FALLBACK §11.1: l'OpenAPI è chiusa (surface non-200) ma il recon ha
         ricavato nomi tabella dal bundle JS (`.from('...')`). Testiamo l'RLS per
@@ -382,14 +399,20 @@ class SupabaseModule(Module):
         i nomi tabella, non lo schema). Passiamo quindi `columns=[]` → niente
         euristica GDPR → severità HIGH LOCKED. In più emettiamo UN finding onesto
         INFO/TENTATIVE che documenta la copertura PARZIALE (solo le tabelle
-        referenziate nel client JS; altre potrebbero esistere e non essere testate)."""
+        referenziate nel client JS; altre potrebbero esistere e non essere testate).
+
+        ORACOLO (§15): qui la matrice vale DI PIÙ — niente euristica colonne, ma la
+        matrice dà ground-truth per nome tabella. `cfg` è passato a `_rls_read_test`
+        così conformità (anon_select=True → soppressione) e violazioni
+        (anon_select=False → CRITICAL) si applicano anche senza colonne note."""
         for table in tables:
             try:
                 # columns=[] LOCKED: senza schema niente GDPR → HIGH. La nota di
                 # parzialità è iniettata da `_via_bundle` dentro la description.
+                # La matrice §15 (via cfg) può comunque sopprimere/scalare per nome.
                 self._rls_read_test(
                     base, headers, table, [], supabase_url, target,
-                    findings, posture_checks, via_bundle=True,
+                    findings, posture_checks, cfg, via_bundle=True,
                 )
             except Exception:  # noqa: BLE001 — resilienza (P8): un asset non blocca gli altri
                 log.warning("RLS read test (via bundle) fallito per la tabella %r: "
@@ -409,12 +432,22 @@ class SupabaseModule(Module):
         target: str,
         findings: list[Finding],
         posture_checks: list[PostureCheck],
+        cfg: TargetConfig,
         via_bundle: bool = False,
     ) -> None:
-        """RLS read test per UNA tabella (§11.1.2).
+        """RLS read test per UNA tabella (§11.1.2), arricchito dal modo ORACOLO (§15).
 
-        - 200 con array NON vuoto → Finding `RLS_DISABLED` (severità per dati
-          personali, evidence redatta).
+        - 200 con array NON vuoto → l'anon LEGGE la tabella. Qui entra la matrice
+          di attese (§15), che chiude gli ambigui da sola:
+            * exp.anon_select == True  → CONFORME (tabella pubblica BY DESIGN, es.
+              listino_pubblico): la lettura anon è ATTESA → si SOPPRIME il Finding
+              RLS_DISABLED ed si emette un PostureCheck passed=True onesto (lo score
+              resta onesto, non è un fallimento).
+            * exp.anon_select == False → VIOLAZIONE: il proprietario ha dichiarato
+              che l'anon NON deve leggere, ma legge → CRITICAL (criterio LOCKED
+              §11.1.2) + nota esplicita in description; confidence resta FIRM.
+            * exp None → modo adversario invariato (euristica colonne: CRITICAL se
+              dati personali, altrimenti HIGH; via_bundle senza colonne → HIGH).
         - 200 vuoto / 401 / 403 / altro → PostureCheck `POSTURE_RLS_<tabella>`
           passed (l'anon non legge → RLS sta proteggendo)."""
         endpoint = f"/rest/v1/{table}"
@@ -422,15 +455,28 @@ class SupabaseModule(Module):
 
         rows = self._readable_rows(resp)
         if rows is not None and len(rows) > 0:
-            # RLS disabilitata/permissiva: l'anon LEGGE la tabella. Calcoliamo la
-            # severità UNA volta (CRITICAL se i nomi colonna suggeriscono dati
-            # personali, altrimenti HIGH; via_bundle → columns=[] → HIGH) e la
-            # usiamo sia per il Finding sia per il PostureCheck FALLITO, così il
-            # peso nello score (§17) è proporzionale e i due restano allineati.
-            severity = self._rls_disabled_severity(columns)
+            # ORACOLO (§15): l'attesa dichiarata per QUESTA tabella (None se assente).
+            exp = _expectation_for(table, cfg)
+
+            # CONFORMITÀ: la lettura anon è ATTESA (tabella pubblica per scelta) →
+            # NON è un fallimento. Si SOPPRIME il Finding RLS_DISABLED e si emette
+            # un PostureCheck passed=True che dichiara la conformità alla matrice.
+            # Lo score resta onesto (§17): nessun peso fallito per questa tabella.
+            if exp is not None and exp.anon_select:
+                posture_checks.append(self._rls_expected_public_posture(
+                    table, endpoint, target))
+                return
+
+            # ESPOSTA NON ATTESA: severità LOCKED §11.1.2 — CRITICAL se i nomi
+            # colonna suggeriscono dati personali OPPURE se VIOLA un'attesa della
+            # matrice (exp esiste e not exp.anon_select); altrimenti HIGH. La
+            # calcoliamo UNA volta e la condividiamo tra Finding e PostureCheck
+            # FALLITO, così il peso nello score (§17) è proporzionale e allineato.
+            violates_matrix = exp is not None  # qui exp.anon_select è False
+            severity = self._rls_disabled_severity(columns, violates_matrix)
             findings.append(self._rls_disabled_finding(
                 table, columns, rows, supabase_url, endpoint, target, severity,
-                via_bundle))
+                via_bundle, violates_matrix))
             # Mutua esclusione (§17): tabella esposta → PostureCheck passed=False.
             # Senza, lo score si calcola dai PostureCheck e resterebbe 100/100
             # pur con finding HIGH/CRITICAL aperti (fuorviante). drift resta al
@@ -459,14 +505,26 @@ class SupabaseModule(Module):
         return data if isinstance(data, list) else None
 
     @staticmethod
-    def _rls_disabled_severity(columns: list[str]) -> Severity:
+    def _rls_disabled_severity(
+        columns: list[str],
+        violates_matrix: bool = False,
+    ) -> Severity:
         """Severità LOCKED del caso RLS disabilitata (§11.1.2), calcolata UNA volta
         e condivisa tra Finding e PostureCheck per evitare disallineamenti.
 
-        CRITICAL se i NOMI colonna suggeriscono dati personali (euristica §11.1),
-        altrimenti HIGH. Nel path via_bundle le colonne non sono note (columns=[])
-        → l'euristica non scatta → HIGH prudenziale."""
-        return Severity.CRITICAL if _has_personal_data(columns) else Severity.HIGH
+        Criterio LOCKED §11.1.2: CRITICAL se i NOMI colonna suggeriscono dati
+        personali (euristica §11.1) **OPPURE se la tabella viola un'attesa della
+        matrice §15** (`violates_matrix=True`, cioè exp.anon_select=False ma l'anon
+        legge); altrimenti HIGH.
+
+        Nel path via_bundle le colonne non sono note (columns=[]) → l'euristica non
+        scatta → HIGH prudenziale; ma la matrice §15 (per nome tabella) può comunque
+        portare a CRITICAL anche lì — ed è proprio dove l'oracolo dà più valore.
+        La CONFORMITÀ (anon_select=True → soppressione) è gestita PRIMA, in
+        `_rls_read_test`, quindi qui non serve gestirla."""
+        if _has_personal_data(columns) or violates_matrix:
+            return Severity.CRITICAL
+        return Severity.HIGH
 
     @staticmethod
     def _rls_disabled_finding(
@@ -478,6 +536,7 @@ class SupabaseModule(Module):
         target: str,
         severity: Severity,
         via_bundle: bool = False,
+        violates_matrix: bool = False,
     ) -> Finding:
         """Costruisce il Finding `RLS_DISABLED` (§11.1.2). Severità LOCKED (passata
         dal chiamante, calcolata da `_rls_disabled_severity` così da coincidere col
@@ -486,9 +545,18 @@ class SupabaseModule(Module):
 
         `via_bundle=True` (fallback §11.1): la tabella è stata scoperta dal bundle
         JS (`.from('...')`), NON dall'OpenAPI → le COLONNE non sono note (columns=[]).
-        Senza colonne non si applica l'euristica GDPR → severità HIGH LOCKED, e la
-        description lo NOTA esplicitamente."""
-        personal = severity is Severity.CRITICAL
+        Senza colonne non si applica l'euristica GDPR → severità HIGH LOCKED (salvo
+        violazione di matrice, vedi sotto), e la description lo NOTA esplicitamente.
+
+        `violates_matrix=True` (ORACOLO §15): il proprietario ha dichiarato
+        anon_select=False per questa tabella ma l'anon legge → VIOLAZIONE. La
+        severità è già CRITICAL (criterio LOCKED §11.1.2); qui la description lo
+        NOTA esplicitamente. La violazione NON forza `gdpr_relevant`: dichiarare
+        che l'anon non deve leggere non implica che il contenuto sia personale."""
+        # gdpr_relevant LEGATO all'euristica colonne (NON alla severità): una
+        # violazione di matrice può rendere CRITICAL una tabella senza colonne
+        # personali — in quel caso gdpr_relevant resta False (lo notiamo soltanto).
+        personal = _has_personal_data(columns)
 
         # Evidence REDATTA (P8): SOLO conteggio righe + NOMI colonna — mai i valori.
         # In fallback le colonne non sono note (tabella dal bundle) → lo si dichiara.
@@ -506,22 +574,48 @@ class SupabaseModule(Module):
         title = (
             f"RLS disabilitata/permissiva sulla tabella '{table}'"
             + (" (dati personali esposti)" if personal else "")
+            + (" (viola la matrice di attese §15)"
+               if violates_matrix and not personal else "")
+        )
+        # Spiegazione della severità: prima il motivo "colonne" (euristica/bundle),
+        # poi — se presente — la NOTA sulla violazione di matrice (§15), che da sola
+        # giustifica CRITICAL anche senza colonne personali (criterio LOCKED §11.1.2).
+        if via_bundle:
+            severity_note = (
+                "Le colonne non sono note (tabella scoperta dal bundle JS "
+                ".from('...'), non da OpenAPI): senza schema non si applica "
+                "l'euristica dati personali"
+                + (" → severità HIGH (potrebbe in realtà esporre dati personali, "
+                   "da verificare)." if not violates_matrix else ".")
+            )
+        elif personal:
+            severity_note = (
+                "I nomi colonna suggeriscono dati personali → severità CRITICAL e "
+                "gdpr_relevant."
+            )
+        elif violates_matrix:
+            severity_note = (
+                "Nessun nome colonna riconducibile a dati personali."
+            )
+        else:
+            severity_note = (
+                "Nessun nome colonna riconducibile a dati personali → severità HIGH."
+            )
+        # NOTA ORACOLO (§15): la violazione della matrice è il motivo che ALZA a
+        # CRITICAL quando le colonne da sole non lo farebbero (criterio LOCKED).
+        matrix_note = (
+            " La matrice di attese (§15) dichiara che l'anon NON deve leggere "
+            "questa tabella (anon_select=false), ma legge: **viola la matrice di "
+            "attese (§15)** → severità CRITICAL (criterio LOCKED §11.1.2), "
+            "confidence FIRM. (La violazione non implica di per sé dati personali.)"
+            if violates_matrix else ""
         )
         description = (
             f"La GET anonima a {endpoint}?limit=1 ha restituito righe: l'anon key "
             f"legge la tabella '{table}'. RLS assente o policy SELECT troppo "
             f"permissiva (§11.1). "
-            + (
-                "Le colonne non sono note (tabella scoperta dal bundle JS "
-                ".from('...'), non da OpenAPI): senza schema non si applica "
-                "l'euristica dati personali → severità HIGH (potrebbe in realtà "
-                "esporre dati personali, da verificare)."
-                if via_bundle else
-                "I nomi colonna suggeriscono dati personali → severità CRITICAL e "
-                "gdpr_relevant."
-                if personal else
-                "Nessun nome colonna riconducibile a dati personali → severità HIGH."
-            )
+            + severity_note
+            + matrix_note
         )
         return Finding(
             finding_id=_finding_id("supabase", "RLS_DISABLED", location),
@@ -553,6 +647,38 @@ class SupabaseModule(Module):
             detail=(
                 f"GET anonima a /rest/v1/{table}?limit=1 non ha restituito righe "
                 f"(vuoto/401/403): l'anon non legge la tabella → RLS protegge (§11.1)."
+            ),
+            remediation_ref="RLS_DISABLED",
+        )
+
+    @staticmethod
+    def _rls_expected_public_posture(
+        table: str,
+        endpoint: str,
+        target: str,
+    ) -> PostureCheck:
+        """PostureCheck CONFORME alla matrice di attese (§15): l'anon LEGGE la
+        tabella ma la matrice dichiara `anon_select=true` → è una tabella PUBBLICA
+        BY DESIGN (es. listino_pubblico). La lettura anon è ATTESA: NON è un
+        fallimento → `passed=True`, e il Finding RLS_DISABLED viene SOPPRESSO a
+        monte (in `_rls_read_test`).
+
+        Distinto da `_rls_protected_posture` (lì l'anon NON legge): qui l'anon
+        legge ma è OK perché dichiarato. Lo score resta onesto (§17): pesa come un
+        check passato, non come un'esposizione. È l'oracolo (§15) che chiude
+        l'ambiguo da solo — un 200 con righe che sarebbe un finding diventa una
+        conferma di posture corretta."""
+        return PostureCheck(
+            check_id=f"POSTURE_RLS_{table}",
+            title=f"Tabella '{table}' pubblica per scelta (lettura anon attesa, §15)",
+            passed=True,
+            severity_if_failed=Severity.HIGH,
+            target=target,
+            detail=(
+                f"GET anonima a {endpoint}?limit=1 ha restituito righe, MA la "
+                f"matrice di attese (§15) dichiara anon_select=true per '{table}': "
+                f"lettura anon ATTESA → tabella pubblica per scelta, non un'esposizione. "
+                f"Finding RLS_DISABLED soppresso/declassato; lo score resta onesto (§17)."
             ),
             remediation_ref="RLS_DISABLED",
         )

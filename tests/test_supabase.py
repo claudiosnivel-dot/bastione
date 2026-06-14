@@ -32,6 +32,7 @@ from bastione.models import (
     Fingerprint,
     PostureCheck,
     RunContext,
+    TableExpectation,
     TargetConfig,
 )
 from bastione.modules import supabase as supabase_pkg  # noqa: F401  (assicura l'import del package)
@@ -44,13 +45,14 @@ ANON = "eyJhbGciOiJI.anonpayload.sig"  # placeholder: il modulo non decodifica l
 
 # ─── helper di costruzione (config / contesto / fingerprint) ────────────────
 
-def make_cfg(*, name="gestionale", supabase_url=None):
+def make_cfg(*, name="gestionale", supabase_url=None, expectations=None):
     return TargetConfig(
         name=name,
         base_url="https://staging.example",
         environment="staging",
         ownership="owned",
         supabase_url=supabase_url,
+        expectations=expectations or [],
     )
 
 
@@ -667,3 +669,205 @@ def test_finding_id_is_stable_across_runs(monkeypatch):
     f2 = next(f for f in supa.SupabaseModule().run(make_ctx()).findings)
     assert f1.finding_id == f2.finding_id
     assert len(f1.finding_id) == 16
+
+
+# ─── §15 MODO ORACOLO: consumo della matrice di attese (M2 step 1) ───────────
+#
+# La matrice di attese (§15) chiude gli ambigui da sola: un risultato che VIOLA
+# un'attesa sale di severità (→ CRITICAL, criterio LOCKED §11.1.2); un risultato
+# CONFORME (tabella pubblica per scelta) viene DECLASSATO/SOPPRESSO (niente
+# Finding RLS_DISABLED, solo un PostureCheck passed=True onesto).
+# In questo step si consuma SOLO `anon_select` (sul RLS READ test); `anon_insert`
+# sarà consumato dal canary §11.2 in M2 step 2.
+
+# ── helper puro `_expectation_for(table, cfg)` ──────────────────────────────
+
+def test_expectation_for_matches_by_name_case_sensitive():
+    # match per nome tabella, case-sensitive come PostgREST
+    cfg = make_cfg(expectations=[
+        TableExpectation(name="clienti", anon_select=False),
+        TableExpectation(name="listino_pubblico", anon_select=True),
+    ])
+    exp = supa._expectation_for("clienti", cfg)
+    assert exp is not None and exp.name == "clienti" and exp.anon_select is False
+    pub = supa._expectation_for("listino_pubblico", cfg)
+    assert pub is not None and pub.anon_select is True
+    # case-sensitive: "Clienti" ≠ "clienti" → None
+    assert supa._expectation_for("Clienti", cfg) is None
+    # tabella non in matrice → None
+    assert supa._expectation_for("ordini", cfg) is None
+
+
+def test_expectation_for_none_when_no_expectations():
+    # nessuna matrice → sempre None (modo adversario, comportamento invariato)
+    assert supa._expectation_for("clienti", make_cfg()) is None
+
+
+# ── VIOLAZIONE: anon_select=False ESPOSTA → CRITICAL + nota matrice ──────────
+
+def test_matrix_violation_anon_select_false_is_critical(monkeypatch):
+    # il proprietario ha dichiarato anon_select=False ma l'anon LEGGE: VIOLAZIONE.
+    # Severità → CRITICAL (criterio LOCKED §11.1.2), confidence resta FIRM, la
+    # description NOTA esplicitamente che viola la matrice di attese (§15).
+    cfg = make_cfg(expectations=[
+        TableExpectation(name="ordini", anon_select=False),
+    ])
+    # colonne NON personali: senza la matrice sarebbe HIGH; la violazione → CRITICAL
+    schema = openapi_schema({"ordini": ["id", "codice", "totale"]})
+    rows = {"ordini": (200, [{"id": 1, "codice": "A", "totale": 9}])}
+    install_router(monkeypatch, schema=schema, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx(cfg=cfg))
+
+    findings = [f for f in res.findings if f.rule_id == "RLS_DISABLED"]
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.severity is Severity.CRITICAL
+    assert f.confidence is Confidence.FIRM
+    # gdpr_relevant NON forzato: la violazione di matrice non implica dati personali
+    assert f.gdpr_relevant is False
+    # la description cita la matrice di attese (§15)
+    assert "matrice" in f.description.lower()
+    assert "§15" in f.description
+    # PostureCheck fallito allineato sulla stessa severità (peso 8)
+    pcs = [pc for pc in res.posture_checks if pc.check_id == "POSTURE_RLS_ordini"]
+    assert len(pcs) == 1
+    assert pcs[0].passed is False
+    assert pcs[0].severity_if_failed is Severity.CRITICAL
+
+
+# ── CONFORMITÀ: anon_select=True ESPOSTA → finding SOPPRESSO, posture pass ───
+
+def test_matrix_conformance_anon_select_true_suppresses_finding(monkeypatch):
+    # tabella pubblica BY DESIGN (es. listino_pubblico): la lettura anon è ATTESA
+    # → NON emettere il Finding RLS_DISABLED; emettere POSTURE_RLS_<t> passed=True
+    # con detail che dichiara la conformità alla matrice (§15).
+    cfg = make_cfg(expectations=[
+        TableExpectation(name="listino_pubblico", anon_select=True),
+    ])
+    schema = openapi_schema({"listino_pubblico": ["id", "prezzo"]})
+    rows = {"listino_pubblico": (200, [{"id": 1, "prezzo": 9}])}
+    install_router(monkeypatch, schema=schema, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx(cfg=cfg))
+
+    # NESSUN Finding RLS_DISABLED (soppresso/declassato)
+    assert not [f for f in res.findings if f.rule_id == "RLS_DISABLED"]
+    # PostureCheck POSTURE_RLS_<t> passed=True (lo score resta onesto)
+    pcs = [pc for pc in res.posture_checks if pc.check_id == "POSTURE_RLS_listino_pubblico"]
+    assert len(pcs) == 1
+    pc = pcs[0]
+    assert pc.passed is True
+    # il detail dichiara che la lettura anon è ATTESA dalla matrice (§15)
+    assert "§15" in pc.detail
+    assert "attes" in pc.detail.lower() or "pubblica" in pc.detail.lower()
+    # mutua esclusione: nessun posture fallito per la stessa tabella
+    assert not any(not p.passed for p in res.posture_checks)
+
+
+def test_matrix_conformance_does_not_lower_posture_score(monkeypatch):
+    # una tabella pubblica per scelta (conforme) NON deve abbassare lo score:
+    # lo score resta onesto (non è un fallimento).
+    from bastione.posture.checks import posture_score
+
+    cfg = make_cfg(expectations=[
+        TableExpectation(name="listino_pubblico", anon_select=True),
+    ])
+    schema = openapi_schema({"listino_pubblico": ["id", "prezzo"]})
+    rows = {"listino_pubblico": (200, [{"id": 1, "prezzo": 9}])}
+    install_router(monkeypatch, schema=schema, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx(cfg=cfg))
+
+    assert posture_score(res.posture_checks) == 100.0
+
+
+# ── tabella NON in matrice ESPOSTA → comportamento ATTUALE invariato ─────────
+
+def test_table_not_in_matrix_keeps_adversary_behaviour_high(monkeypatch):
+    # con matrice ma SENZA voce per questa tabella → exp None → modo adversario:
+    # colonne non personali → HIGH (comportamento invariato).
+    cfg = make_cfg(expectations=[
+        TableExpectation(name="altra_tabella", anon_select=False),
+    ])
+    schema = openapi_schema({"listino": ["id", "codice", "prezzo"]})
+    rows = {"listino": (200, [{"id": 1, "codice": "A", "prezzo": 9}])}
+    install_router(monkeypatch, schema=schema, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx(cfg=cfg))
+
+    findings = [f for f in res.findings if f.rule_id == "RLS_DISABLED"]
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.HIGH
+    assert findings[0].gdpr_relevant is False
+    # nessun riferimento alla matrice nella description (exp None)
+    assert "matrice di attese" not in findings[0].description.lower()
+
+
+def test_table_not_in_matrix_personal_columns_stay_critical(monkeypatch):
+    # con matrice ma SENZA voce per questa tabella → exp None → euristica colonne:
+    # colonne personali → CRITICAL + gdpr (comportamento invariato).
+    cfg = make_cfg(expectations=[
+        TableExpectation(name="altra_tabella", anon_select=False),
+    ])
+    schema = openapi_schema({"clienti": ["id", "nome", "email"]})
+    rows = {"clienti": (200, [{"id": 1, "nome": "Mario", "email": "m@x.it"}])}
+    install_router(monkeypatch, schema=schema, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx(cfg=cfg))
+
+    findings = [f for f in res.findings if f.rule_id == "RLS_DISABLED"]
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.CRITICAL
+    assert findings[0].gdpr_relevant is True
+
+
+# ── VIA BUNDLE: la matrice si applica anche senza colonne (per nome) ─────────
+
+def test_via_bundle_matrix_violation_is_critical(monkeypatch):
+    # OpenAPI chiusa (401) → fallback via bundle (colonne ignote). La matrice dà
+    # comunque ground-truth per nome: anon_select=False + esposta → CRITICAL,
+    # NONOSTANTE columns=[] (qui l'oracolo dà più valore: niente euristica colonne).
+    cfg = make_cfg(expectations=[
+        TableExpectation(name="clienti", anon_select=False),
+    ])
+    fp = make_fp(discovered_tables=["clienti"])
+    rows = {"clienti": (200, [{"id": 1, "email": "x@y.it"}])}
+    install_fallback_router(monkeypatch, surface_status=401, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx(fp=fp, cfg=cfg))
+
+    findings = [f for f in res.findings if f.rule_id == "RLS_DISABLED"]
+    assert len(findings) == 1
+    f = findings[0]
+    # CRITICAL per violazione di matrice, anche senza colonne note
+    assert f.severity is Severity.CRITICAL
+    assert "matrice" in f.description.lower()
+    assert "§15" in f.description
+    # PostureCheck fallito allineato (peso 8)
+    pcs = [pc for pc in res.posture_checks if pc.check_id == "POSTURE_RLS_clienti"]
+    assert len(pcs) == 1
+    assert pcs[0].passed is False
+    assert pcs[0].severity_if_failed is Severity.CRITICAL
+
+
+def test_via_bundle_matrix_conformance_suppresses_finding(monkeypatch):
+    # OpenAPI chiusa (401) → fallback via bundle. Tabella pubblica per scelta
+    # (anon_select=True) esposta → finding SOPPRESSO, POSTURE_RLS_<t> passed=True.
+    cfg = make_cfg(expectations=[
+        TableExpectation(name="listino_pubblico", anon_select=True),
+    ])
+    fp = make_fp(discovered_tables=["listino_pubblico"])
+    rows = {"listino_pubblico": (200, [{"id": 1, "prezzo": 9}])}
+    install_fallback_router(monkeypatch, surface_status=401, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx(fp=fp, cfg=cfg))
+
+    # NESSUN Finding RLS_DISABLED (conforme alla matrice)
+    assert not [f for f in res.findings if f.rule_id == "RLS_DISABLED"]
+    pcs = [pc for pc in res.posture_checks if pc.check_id == "POSTURE_RLS_listino_pubblico"]
+    assert len(pcs) == 1
+    assert pcs[0].passed is True
+    assert "§15" in pcs[0].detail
+    # il finding onesto di copertura parziale resta (enumerazione via bundle)
+    assert any(f.rule_id == "SUPABASE_SCHEMA_VIA_BUNDLE" for f in res.findings)
