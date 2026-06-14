@@ -219,7 +219,14 @@ class SupabaseModule(Module):
         """GET <base>/rest/v1/ → dict OpenAPI, o None se irraggiungibile/non-JSON.
         Resiliente: qualunque errore di rete o di parsing → None (§11.1)."""
         resp = _get(f"{base}/rest/v1/", headers)
-        if resp is None or getattr(resp, "status_code", None) != 200:
+        if resp is None:
+            log.warning("surface map: nessuna risposta dalla root REST "
+                        "(httpx assente o errore di rete) (§11.1)")
+            return None
+        status = getattr(resp, "status_code", None)
+        if status != 200:
+            log.warning("surface map: la root REST ha risposto status=%s "
+                        "(l'anon non legge lo schema OpenAPI?) (§11.1)", status)
             return None
         try:
             schema = resp.json()
