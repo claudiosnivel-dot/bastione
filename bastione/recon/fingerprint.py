@@ -49,6 +49,58 @@ _SUPABASE_URL_RE = re.compile(r"https://[a-z0-9]+\.supabase\.co")
 # JWT a tre segmenti base64url che inizia con l'header tipico `{"alg":...}` → "eyJ".
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 
+# `.from('NAME')` / `.from("NAME")` — la entry del query-builder PostgREST nel
+# client Supabase. NAME = identificatore relazione (`[A-Za-z_][A-Za-z0-9_]*`),
+# opzionalmente con UN prefisso schema (`schema.tabella`). L'intero literal deve
+# matchare (apici di chiusura subito dopo il nome) → scarta url/spazi/espressioni.
+_TABLE_FROM_RE = re.compile(
+    r"\.from\(\s*"
+    r"(['\"])"
+    r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)"
+    r"\1"
+    r"\s*\)"
+)
+# Builtin JS che espongono un `.from(...)` NON-PostgREST (Array.from, typed-array,
+# ecc.): un loro `.from('abc')` non è una tabella, va scartato (§8/§11.1). Il
+# nome del costruttore va registrato (per offset) e usato come post-filtro in
+# `extract_table_names` — la regex Python non supporta un lookbehind a lunghezza
+# variabile sull'alternanza dei builtin, quindi si confronta l'offset esatto del
+# `.from(` (v. _JS_BUILTIN_FROM_RE e il post-filtro più sotto).
+_JS_FROM_BUILTINS: tuple[str, ...] = (
+    "Array",
+    "String",
+    "Buffer",
+    "Object",
+    "Number",
+    "Promise",
+    "Date",
+    "Int8Array",
+    "Uint8Array",
+    "Uint8ClampedArray",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "Float32Array",
+    "Float64Array",
+    "BigInt64Array",
+    "BigUint64Array",
+)
+# Costruttore builtin (eventualmente seguito da spazi) prima del `.from(` —
+# usato come post-filtro: se un `.from('x')` è preceduto da `Array`/typed-array/
+# ecc. NON è una tabella. Il `(?:^|[^A-Za-z0-9_$])` davanti al nome è il confine
+# di parola che evita di scambiare `MyArray` per `Array`; `\s*` tollera lo spazio
+# tra nome e `.from(` (in bundle MINIFICATI — l'unico input reale, download
+# same-host del recon — non c'è spazio, ma il filtro resta corretto anche se ne
+# comparisse uno). Il gruppo catturante include il `.` di `.from(` così possiamo
+# allineare l'offset del `.from(` builtin con quello del match-tabella (un
+# builtin lontano non sopprime una tabella vicina).
+# NB: i commenti `/* */` tra nome e `.from(` non sono coperti (servirebbe un parse
+# JS): irrilevante sui bundle minificati, dove i commenti sono già rimossi.
+_JS_BUILTIN_FROM_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9_$])(?:" + "|".join(_JS_FROM_BUILTINS) + r")\s*(\.from\()"
+)
+
 
 # ─── funzioni pure (la gemma): nessuna I/O, testate con input reali ─────────
 
@@ -85,6 +137,33 @@ def extract_anon_key(text: str) -> str | None:
         if claims and claims.get("role") == "anon":
             return token
     return None
+
+
+def extract_table_names(text: str) -> list[str]:
+    """Nomi tabella PostgREST referenziati dal client Supabase nel bundle (§8).
+
+    Estrae i nomi da `.from('NAME')` / `.from("NAME")` — la entry del query-builder
+    PostgREST. NAME valido = identificatore relazione (`[A-Za-z_][A-Za-z0-9_]*`),
+    con opzionale UN prefisso schema (`schema.tabella`). Url, spazi ed espressioni
+    non sono identificatori → scartati dal regex stesso.
+
+    Scarta i falsi positivi dei builtin JS (`Array.from('abc')`, typed-array,
+    `String/Buffer/Object/...`): il loro `.from(...)` non è una relazione. Il
+    confronto è puramente testuale — nessuna I/O, nessun download: lavora SOLO sul
+    testo già in memoria (owned-only, §7). Dedup + ordina (deterministico)."""
+    # Offset (inizio del `.from(`) di ogni `.from(` preceduto da un builtin JS:
+    # quei `.from(` non sono PostgREST. group(1) è `.from(`, quindi il suo start
+    # è l'offset del punto — lo stesso punto da cui parte il match-tabella.
+    builtin_dots = {m.start(1) for m in _JS_BUILTIN_FROM_RE.finditer(text)}
+
+    names: set[str] = set()
+    for m in _TABLE_FROM_RE.finditer(text):
+        # _TABLE_FROM_RE inizia col `.` di `.from(`: se quell'offset è un builtin,
+        # scarta (un builtin lontano non tocca una tabella vicina: confronto esatto).
+        if m.start() in builtin_dots:
+            continue
+        names.add(m.group(2))
+    return sorted(names)
 
 
 def detect_cloudflare(headers: dict[str, str]) -> bool:
@@ -207,6 +286,7 @@ def fingerprint(target: str, run_dir: Path | None = None) -> Fingerprint:
 
     supabase_url: str | None = None
     anon_key: str | None = None
+    discovered: set[str] = set()
     for url in js_urls:
         # Owned-only (§7/§4.2): non scarichiamo bundle su host esterni non
         # dichiarati. La chiave Supabase sta nel bundle same-origin dell'app; gli
@@ -219,8 +299,14 @@ def fingerprint(target: str, run_dir: Path | None = None) -> Fingerprint:
             continue
         supabase_url = supabase_url or extract_supabase_url(jresp.text)
         anon_key = anon_key or extract_anon_key(jresp.text)
-        if supabase_url and anon_key:
-            break
+        # Table discovery (§8): aggrega i nomi `.from('...')` da TUTTI i bundle
+        # same-host già scaricati. Funzione PURA su testo in memoria: nessun nuovo
+        # download (owned-only). Non c'è break su url/anon_key — altrimenti i
+        # bundle successivi (che possono referenziare altre tabelle) sarebbero
+        # persi; restiamo comunque entro gli stessi host owned già dichiarati.
+        discovered.update(extract_table_names(jresp.text))
+
+    discovered_tables = sorted(discovered)
 
     fp = Fingerprint(
         target=target,
@@ -232,6 +318,7 @@ def fingerprint(target: str, run_dir: Path | None = None) -> Fingerprint:
         # modulo supabase senza un URL su cui mappare la superficie (§9/§11.1).
         is_supabase=supabase_url is not None,
         supabase_url=supabase_url,
+        discovered_tables=discovered_tables,
         anon_key=anon_key,
         cloudflare_fronted=cloudflare,
         endpoints=endpoints,

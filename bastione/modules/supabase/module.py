@@ -195,11 +195,25 @@ class SupabaseModule(Module):
         schema, detail = self._fetch_surface(base, headers)
         if schema is None:
             # Surface non disponibile (es. la root REST risponde 401 all'anon su un
-            # target reale): NON tacere (sarebbe fuorviante). Emettiamo UN segnale
-            # onesto — Supabase rilevato ma RLS NON verificabile via introspezione,
-            # quindi verifica INCOMPLETA — e ritorniamo solo quel finding (§11.1).
-            log.warning("surface map non disponibile (%s): emetto segnale onesto "
-                        "SUPABASE_SCHEMA_NOT_ENUMERABLE (§11.1)", detail)
+            # target reale): l'introspezione OpenAPI è chiusa. FALLBACK (§11.1): se
+            # il recon ha ricavato nomi tabella dal bundle JS (.from('...')) li
+            # usiamo per testare l'RLS per nome — esattamente come un attaccante.
+            discovered = list(ctx.fingerprint.discovered_tables)
+            if discovered:
+                log.warning("surface map non disponibile (%s): fallback su %d "
+                            "tabelle scoperte dal bundle (§11.1)",
+                            detail, len(discovered))
+                self._rls_test_via_bundle(
+                    base, headers, discovered, supabase_url, detail, target,
+                    findings, posture_checks,
+                )
+                return ModuleResult(findings, posture_checks)
+            # Nessun nome tabella NEMMENO nel bundle: NON tacere (sarebbe
+            # fuorviante). Emettiamo UN segnale onesto — Supabase rilevato ma RLS
+            # NON verificabile via introspezione, verifica INCOMPLETA (§11.1).
+            log.warning("surface map non disponibile (%s) e nessuna tabella dal "
+                        "bundle: emetto SUPABASE_SCHEMA_NOT_ENUMERABLE (§11.1)",
+                        detail)
             findings.append(self._schema_not_enumerable_finding(
                 supabase_url, detail, target))
             return ModuleResult(findings, posture_checks)
@@ -278,9 +292,10 @@ class SupabaseModule(Module):
             "(/rest/v1/) non espone lo schema OpenAPI all'anon → impossibile "
             "enumerare le tabelle e quindi verificare l'RLS per-tabella via "
             "introspezione (§11.1). **Questo NON conferma che l'RLS sia "
-            "corretta: è una verifica INCOMPLETA.** Un attaccante ricaverebbe i "
-            "nomi tabella dal bundle JS (.from('...')) e testerebbe l'RLS per "
-            "nome → copertura prevista in M1."
+            "corretta: è una verifica INCOMPLETA.** Inoltre NESSUN nome tabella è "
+            "stato trovato nel bundle JS (nessun riferimento `.from('...')` del "
+            "client Supabase): non c'è quindi alcun nome su cui ripiegare per "
+            "testare l'RLS per nome. La superficie resta non verificabile."
         )
         return Finding(
             finding_id=_finding_id(
@@ -299,6 +314,91 @@ class SupabaseModule(Module):
             intrusion_used=IntrusionLevel.READ_ONLY,
         )
 
+    @staticmethod
+    def _schema_via_bundle_finding(
+        supabase_url: str,
+        detail: str,
+        tables: list[str],
+        target: str,
+    ) -> Finding:
+        """Segnale ONESTO `SUPABASE_SCHEMA_VIA_BUNDLE` (§11.1): l'OpenAPI è chiusa
+        (surface non-200) quindi l'enumerazione delle tabelle è avvenuta via bundle
+        JS (`.from('...')`). È una copertura PARZIALE: testiamo SOLO le tabelle
+        referenziate nel client JS — altre relazioni possono esistere e NON essere
+        state testate (l'OpenAPI, che le elencherebbe tutte, non è disponibile).
+
+        Severità LOCKED `INFO` + confidence `TENTATIVE`. Evidence NON segreta (solo
+        l'esito della GET + il conteggio tabelle). finding_id via formula LOCKED §16."""
+        location = Location(endpoint="/rest/v1/", url=supabase_url)
+        # Evidence NON segreta (P8): esito GET surface + quante tabelle dal bundle.
+        evidence = (
+            f"GET /rest/v1/ -> {detail}; enumerazione via bundle: "
+            f"{len(tables)} tabelle referenziate nel client JS"
+        )
+        description = (
+            "L'introspezione OpenAPI è chiusa all'anon (la root REST /rest/v1/ non "
+            f"ha risposto 200: {detail}). L'enumerazione delle tabelle è quindi "
+            "avvenuta dal bundle JS, sui riferimenti `.from('...')` del client "
+            "Supabase, e l'RLS è stata testata per ciascun nome (§11.1). "
+            "**Copertura PARZIALE:** sono testate SOLO le tabelle referenziate nel "
+            "client JS; poiché l'OpenAPI non è disponibile, potrebbero esistere "
+            "altre tabelle/relazioni non referenziate nel bundle e quindi NON "
+            "testate. Inoltre le colonne non sono note → niente euristica dati "
+            "personali sui finding via-bundle (severità HIGH prudenziale)."
+        )
+        return Finding(
+            finding_id=_finding_id(
+                "supabase", "SUPABASE_SCHEMA_VIA_BUNDLE", location),
+            module="supabase",
+            rule_id="SUPABASE_SCHEMA_VIA_BUNDLE",
+            title="Superficie Supabase enumerata dal bundle (OpenAPI chiusa, copertura parziale)",
+            severity=Severity.INFO,
+            confidence=Confidence.TENTATIVE,
+            target=target,
+            location=location,
+            evidence=evidence,
+            description=description,
+            remediation_ref="RLS_DISABLED",
+            owasp=["A01:2021"],
+            intrusion_used=IntrusionLevel.READ_ONLY,
+        )
+
+    def _rls_test_via_bundle(
+        self,
+        base: str,
+        headers: dict[str, str],
+        tables: list[str],
+        supabase_url: str,
+        detail: str,
+        target: str,
+        findings: list[Finding],
+        posture_checks: list[PostureCheck],
+    ) -> None:
+        """FALLBACK §11.1: l'OpenAPI è chiusa (surface non-200) ma il recon ha
+        ricavato nomi tabella dal bundle JS (`.from('...')`). Testiamo l'RLS per
+        ogni nome (riuso `_rls_read_test`) — come farebbe un attaccante.
+
+        Differenza chiave dal path OpenAPI: le COLONNE non sono note (il bundle dà
+        i nomi tabella, non lo schema). Passiamo quindi `columns=[]` → niente
+        euristica GDPR → severità HIGH LOCKED. In più emettiamo UN finding onesto
+        INFO/TENTATIVE che documenta la copertura PARZIALE (solo le tabelle
+        referenziate nel client JS; altre potrebbero esistere e non essere testate)."""
+        for table in tables:
+            try:
+                # columns=[] LOCKED: senza schema niente GDPR → HIGH. La nota di
+                # parzialità è iniettata da `_via_bundle` dentro la description.
+                self._rls_read_test(
+                    base, headers, table, [], supabase_url, target,
+                    findings, posture_checks, via_bundle=True,
+                )
+            except Exception:  # noqa: BLE001 — resilienza (P8): un asset non blocca gli altri
+                log.warning("RLS read test (via bundle) fallito per la tabella %r: "
+                            "saltata", table, exc_info=True)
+
+        # Finding onesto sulla copertura PARZIALE (§11.1): enumerazione via bundle.
+        findings.append(self._schema_via_bundle_finding(
+            supabase_url, detail, tables, target))
+
     def _rls_read_test(
         self,
         base: str,
@@ -309,6 +409,7 @@ class SupabaseModule(Module):
         target: str,
         findings: list[Finding],
         posture_checks: list[PostureCheck],
+        via_bundle: bool = False,
     ) -> None:
         """RLS read test per UNA tabella (§11.1.2).
 
@@ -322,7 +423,7 @@ class SupabaseModule(Module):
         rows = self._readable_rows(resp)
         if rows is not None and len(rows) > 0:
             findings.append(self._rls_disabled_finding(
-                table, columns, rows, supabase_url, endpoint, target))
+                table, columns, rows, supabase_url, endpoint, target, via_bundle))
             return
 
         # protetto (vuoto / 401 / 403 / irraggiungibile) → posture positiva
@@ -352,17 +453,30 @@ class SupabaseModule(Module):
         supabase_url: str,
         endpoint: str,
         target: str,
+        via_bundle: bool = False,
     ) -> Finding:
         """Costruisce il Finding `RLS_DISABLED` (§11.1.2). Severità LOCKED e
-        evidence REDATTA (P8): mai i valori delle righe, solo conteggio + colonne."""
+        evidence REDATTA (P8): mai i valori delle righe, solo conteggio + colonne.
+
+        `via_bundle=True` (fallback §11.1): la tabella è stata scoperta dal bundle
+        JS (`.from('...')`), NON dall'OpenAPI → le COLONNE non sono note (columns=[]).
+        Senza colonne non si applica l'euristica GDPR → severità HIGH LOCKED, e la
+        description lo NOTA esplicitamente."""
         personal = _has_personal_data(columns)
         severity = Severity.CRITICAL if personal else Severity.HIGH
 
         # Evidence REDATTA (P8): SOLO conteggio righe + NOMI colonna — mai i valori.
-        evidence = (
-            f"{len(rows)} righe leggibili da anon; "
-            f"colonne: {sorted(columns)}"
-        )
+        # In fallback le colonne non sono note (tabella dal bundle) → lo si dichiara.
+        if via_bundle:
+            evidence = (
+                f"{len(rows)} righe leggibili da anon; colonne non note "
+                f"(tabella scoperta dal bundle, non da OpenAPI)"
+            )
+        else:
+            evidence = (
+                f"{len(rows)} righe leggibili da anon; "
+                f"colonne: {sorted(columns)}"
+            )
         location = Location(endpoint=endpoint, url=supabase_url)
         title = (
             f"RLS disabilitata/permissiva sulla tabella '{table}'"
@@ -373,6 +487,11 @@ class SupabaseModule(Module):
             f"legge la tabella '{table}'. RLS assente o policy SELECT troppo "
             f"permissiva (§11.1). "
             + (
+                "Le colonne non sono note (tabella scoperta dal bundle JS "
+                ".from('...'), non da OpenAPI): senza schema non si applica "
+                "l'euristica dati personali → severità HIGH (potrebbe in realtà "
+                "esporre dati personali, da verificare)."
+                if via_bundle else
                 "I nomi colonna suggeriscono dati personali → severità CRITICAL e "
                 "gdpr_relevant."
                 if personal else

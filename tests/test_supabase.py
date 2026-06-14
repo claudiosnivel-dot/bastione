@@ -54,13 +54,15 @@ def make_cfg(*, name="gestionale", supabase_url=None):
     )
 
 
-def make_fp(*, is_supabase=True, supabase_url=SUPA_URL, anon_key=ANON):
+def make_fp(*, is_supabase=True, supabase_url=SUPA_URL, anon_key=ANON,
+            discovered_tables=None):
     return Fingerprint(
         target="gestionale",
         resolved_urls=["https://staging.example/"],
         is_supabase=is_supabase,
         supabase_url=supabase_url,
         anon_key=anon_key,
+        discovered_tables=discovered_tables or [],
     )
 
 
@@ -342,6 +344,126 @@ def test_surface_map_non_json_emits_honest_finding(monkeypatch):
     f = res.findings[0]
     assert f.rule_id == "SUPABASE_SCHEMA_NOT_ENUMERABLE"
     assert "non-JSON" in f.evidence
+
+
+# ─── FALLBACK via bundle: surface 401 + discovered_tables → RLS test per nome ─
+#
+# Su un target hardened la root REST risponde 401 (OpenAPI non introspezionabile).
+# Un attaccante ricava i nomi tabella dal bundle (.from('clienti')) e testa l'RLS
+# per nome. `fingerprint.discovered_tables` porta quei nomi: il modulo fa il
+# fallback e testa l'RLS tabella per tabella, riusando _rls_read_test.
+
+def install_fallback_router(monkeypatch, *, surface_status=401, rows):
+    """Router offline: la root REST risponde `surface_status` (≠200, schema NON
+    enumerabile), le GET RLS per tabella seguono `rows` (nome → (status, payload))."""
+    calls: list[str] = []
+
+    def router(url, headers):
+        calls.append(url)
+        if url.rstrip("/").endswith("/rest/v1"):
+            return fake_resp(status_code=surface_status, payload=None)
+        for tbl, (status, payload) in rows.items():
+            if f"/rest/v1/{tbl}?" in url or url.rstrip("/").endswith(f"/rest/v1/{tbl}"):
+                return fake_resp(status_code=status, payload=payload)
+        return None
+
+    monkeypatch.setattr(supa, "_get", router)
+    return calls
+
+
+def test_fallback_via_bundle_rls_disabled_is_high(monkeypatch):
+    # surface 401 + discovered_tables=['clienti'] con righe → RLS_DISABLED HIGH.
+    # Severità LOCKED HIGH anche con colonne personali nel NOME: le colonne NON
+    # sono note (tabella scoperta dal bundle, non da OpenAPI) → columns=[].
+    fp = make_fp(discovered_tables=["clienti"])
+    rows = {"clienti": (200, [{"id": 1, "email": "x@y.it"}])}
+    install_fallback_router(monkeypatch, surface_status=401, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx(fp=fp))
+
+    findings = [f for f in res.findings if f.rule_id == "RLS_DISABLED"]
+    assert len(findings) == 1
+    f = findings[0]
+    # severità HIGH LOCKED (no euristica GDPR senza colonne)
+    assert f.severity is Severity.HIGH
+    assert f.gdpr_relevant is False
+    assert f.location.endpoint == "/rest/v1/clienti"
+    # la nota deve dire esplicitamente che le colonne non sono note / dal bundle
+    assert "colonne non" in f.description.lower() or "non note" in f.description.lower()
+    assert "bundle" in f.description.lower()
+    # evidence redatta: nessun valore di riga
+    assert "x@y.it" not in f.evidence
+
+
+def test_fallback_via_bundle_protected_table_yields_posture(monkeypatch):
+    # tabella protetta (401) in fallback → POSTURE_RLS_<tab> passed
+    fp = make_fp(discovered_tables=["clienti"])
+    rows = {"clienti": (401, None)}
+    install_fallback_router(monkeypatch, surface_status=401, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx(fp=fp))
+
+    assert not [f for f in res.findings if f.rule_id == "RLS_DISABLED"]
+    pcs = [pc for pc in res.posture_checks if pc.check_id == "POSTURE_RLS_clienti"]
+    assert len(pcs) == 1
+    assert pcs[0].passed is True
+
+
+def test_fallback_via_bundle_emits_partial_coverage_honest_finding(monkeypatch):
+    # in fallback si emette UN finding onesto INFO/TENTATIVE che documenta la
+    # copertura PARZIALE (enumerazione via bundle, OpenAPI non disponibile).
+    fp = make_fp(discovered_tables=["clienti", "ordini"])
+    rows = {"clienti": (401, None), "ordini": (401, None)}
+    install_fallback_router(monkeypatch, surface_status=401, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx(fp=fp))
+
+    partial = [f for f in res.findings if f.rule_id == "SUPABASE_SCHEMA_VIA_BUNDLE"]
+    assert len(partial) == 1
+    f = partial[0]
+    assert f.severity is Severity.INFO
+    assert f.confidence is Confidence.TENTATIVE
+    assert f.intrusion_used is IntrusionLevel.READ_ONLY
+    # onesto sulla parzialità: enumerazione via bundle, OpenAPI non disponibile
+    assert "bundle" in f.description.lower()
+    assert "parzial" in f.description.lower() or "potrebbero esistere" in f.description.lower()
+    # nessun segreto nell'evidence (P8)
+    assert ANON not in f.evidence
+    # NON deve comparire il segnale "non enumerabile" (le tabelle ci sono dal bundle)
+    assert "SUPABASE_SCHEMA_NOT_ENUMERABLE" not in {x.rule_id for x in res.findings}
+
+
+def test_fallback_no_tables_keeps_not_enumerable(monkeypatch):
+    # REGRESSIONE: surface 401 + discovered_tables=[] → resta
+    # SUPABASE_SCHEMA_NOT_ENUMERABLE (comportamento attuale invariato).
+    fp = make_fp(discovered_tables=[])
+    monkeypatch.setattr(supa, "_get", lambda url, headers: (
+        fake_resp(status_code=401, payload=None)
+        if url.rstrip("/").endswith("/rest/v1") else None))
+
+    res = supa.SupabaseModule().run(make_ctx(fp=fp))
+
+    assert len(res.findings) == 1
+    assert res.posture_checks == []
+    assert res.findings[0].rule_id == "SUPABASE_SCHEMA_NOT_ENUMERABLE"
+
+
+def test_happy_path_ignores_discovered_tables(monkeypatch):
+    # REGRESSIONE path felice: surface 200 enumera da OpenAPI e IGNORA del tutto
+    # discovered_tables (decisione LOCKED: bundle solo come fallback sul 401).
+    fp = make_fp(discovered_tables=["tabella_dal_bundle"])
+    schema = openapi_schema({"clienti": ["id", "email"]})
+    rows = {"clienti": (401, None)}
+    install_router(monkeypatch, schema=schema, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx(fp=fp))
+
+    pc_ids = {pc.check_id for pc in res.posture_checks}
+    # solo la tabella da OpenAPI è stata testata, non quella dal bundle
+    assert "POSTURE_RLS_clienti" in pc_ids
+    assert "POSTURE_RLS_tabella_dal_bundle" not in pc_ids
+    # nessun finding via-bundle sul path felice
+    assert "SUPABASE_SCHEMA_VIA_BUNDLE" not in {f.rule_id for f in res.findings}
 
 
 # ─── REGRESSIONE: il path felice NON deve mostrare il segnale onesto ─────────

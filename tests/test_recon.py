@@ -28,6 +28,7 @@ from bastione.recon.fingerprint import (
     extract_anon_key,
     extract_script_srcs,
     extract_supabase_url,
+    extract_table_names,
     fingerprint,
     is_wordpress,
 )
@@ -101,6 +102,95 @@ def test_extract_anon_key_picks_anon_among_multiple_jwts():
 
 def test_extract_anon_key_absent_returns_none():
     assert extract_anon_key("nessun jwt qui, solo testo") is None
+
+
+# ─── funzioni pure: table discovery dal bundle (§8 / §11.1 fallback) ─────────
+#
+# Un attaccante che non può introspezionare l'OpenAPI (root REST 401) ricava i
+# nomi tabella dai riferimenti del client Supabase nel bundle JS: `.from('clienti')`.
+# `extract_table_names` replica esattamente questa enumerazione, in modo PURO
+# (lavora solo su testo già in memoria, niente I/O, niente download nuovo).
+
+def test_extract_table_names_single_apex():
+    js = "supabase.from('clienti').select('*')"
+    assert extract_table_names(js) == ["clienti"]
+
+
+def test_extract_table_names_double_apex():
+    js = 'supabase.from("ordini_2024").select("*")'
+    assert extract_table_names(js) == ["ordini_2024"]
+
+
+def test_extract_table_names_chained_select_minified():
+    # frammento minificato realistico: catena .from('x').select(...)
+    js = 'const r=await s.from("fatture").select("id,totale").eq("anno",2024);'
+    assert extract_table_names(js) == ["fatture"]
+
+
+def test_extract_table_names_with_schema_prefix():
+    # identificatore con UN prefisso schema: public.fatture
+    js = "s.from('public.fatture').select('*')"
+    assert extract_table_names(js) == ["public.fatture"]
+
+
+def test_extract_table_names_dedup_and_sorted_deterministic():
+    js = (
+        "a.from('ordini');b.from(\"clienti\");c.from('ordini');"
+        "d.from('clienti').select('*')"
+    )
+    # dedup + ordinamento deterministico
+    assert extract_table_names(js) == ["clienti", "ordini"]
+
+
+def test_extract_table_names_ignores_array_from_builtin():
+    # LOCKED: i builtin JS .from NON sono tabelle. Array.from('abc') non
+    # deve produrre una "tabella" 'abc'.
+    assert extract_table_names("const a = Array.from('abc');") == []
+
+
+def test_extract_table_names_ignores_other_js_builtins():
+    js = (
+        "Array.from('a');String.from('b');Buffer.from('c');Object.from('d');"
+        "Number.from('e');Promise.from('f');Date.from('g');Int8Array.from('h');"
+        "Uint8Array.from('i');Float64Array.from('j');"
+    )
+    assert extract_table_names(js) == []
+
+
+def test_extract_table_names_keeps_real_table_amid_builtins():
+    # un .from builtin non deve oscurare una vera .from() su tabella vicina
+    js = "Array.from('abc'); supabase.from('clienti').select('*')"
+    assert extract_table_names(js) == ["clienti"]
+
+
+def test_extract_table_names_ignores_builtin_with_space_before_from():
+    # Regressione (blind-review #1): un builtin con spazio prima di `.from(`
+    # (`Array .from('abc')`) NON è una tabella. Caso non realistico sui bundle
+    # MINIFICATI (lo spazio è già rimosso), ma il filtro deve restare corretto:
+    # `\s*` tollera lo spazio senza scambiare `MyArray` per `Array`.
+    assert extract_table_names("const a = Array .from('abc');") == []
+    assert extract_table_names("Uint8Array .from('x');") == []
+
+
+def test_extract_table_names_keeps_userclass_from_with_space():
+    # Controprova del fix #1: il confine di parola NON deve sopprimere una vera
+    # `.from()` su una classe utente il cui nome FINISCE per un builtin
+    # (`MyArray.from('clienti')` resta una tabella, anche con spazio).
+    assert extract_table_names("MyArray.from('clienti');") == ["clienti"]
+    assert extract_table_names("MyArray .from('clienti');") == ["clienti"]
+
+
+def test_extract_table_names_rejects_non_identifiers():
+    # spazi, url, espressioni: niente di tutto ciò è un identificatore PostgREST
+    js = (
+        "s.from('https://x.y/z');s.from('ha spazi');s.from(variabile);"
+        "s.from('');s.from('1abc')"
+    )
+    assert extract_table_names(js) == []
+
+
+def test_extract_table_names_empty_text():
+    assert extract_table_names("") == []
 
 
 # ─── funzioni pure: Cloudflare / WordPress ──────────────────────────────────
@@ -275,6 +365,61 @@ def test_fingerprint_skips_failed_bundle_and_finds_key_in_next(monkeypatch):
 
     assert fp.is_supabase is True
     assert fp.anon_key == anon
+
+
+def test_fingerprint_populates_discovered_tables_from_bundles(monkeypatch):
+    # discovered_tables = aggregazione di extract_table_names su TUTTI i bundle
+    # same-host già scaricati (gli stessi da cui si estraggono url/anon key).
+    anon = make_jwt("anon")
+    base = "https://app.example.com/"
+    b1 = "https://app.example.com/a.js"
+    b2 = "https://app.example.com/b.js"
+    pages = {
+        base: fake_resp(url=base, text=(
+            '<script src="/a.js"></script><script src="/b.js"></script>')),
+        b1: fake_resp(url=b1, text=(
+            f'const u="https://abcdefghijklmnopqrst.supabase.co";'
+            f'const k="{anon}";s.from("clienti").select("*");')),
+        b2: fake_resp(url=b2, text="x.from('ordini');Array.from('abc');"),
+    }
+    _patch_tools(monkeypatch, fetch=lambda url: pages.get(url))
+
+    fp = fingerprint(base)
+
+    # aggregato, dedup, ordinato; Array.from non inquina
+    assert fp.discovered_tables == ["clienti", "ordini"]
+
+
+def test_fingerprint_discovered_tables_default_empty(monkeypatch):
+    # nessun .from() nei bundle → lista vuota (backward-compatible)
+    base = "https://app.example.com/"
+    _patch_tools(monkeypatch,
+                 fetch=lambda url: fake_resp(url=base, text="<html></html>"))
+    fp = fingerprint(base)
+    assert fp.discovered_tables == []
+
+
+def test_fingerprint_discovered_tables_ignores_off_host_bundle(monkeypatch):
+    # owned-only: i bundle off-host non vengono scaricati → niente tabelle da lì.
+    base = "https://app.example.com/"
+    off_host = "https://cdn.jsdelivr.net/app.js"
+    pages = {
+        base: fake_resp(url=base,
+                        text='<script src="https://cdn.jsdelivr.net/app.js"></script>'),
+        off_host: fake_resp(url=off_host, text="x.from('segreta');"),
+    }
+    fetched: list[str] = []
+
+    def recording_fetch(url):
+        fetched.append(url)
+        return pages.get(url)
+
+    _patch_tools(monkeypatch, fetch=recording_fetch)
+
+    fp = fingerprint(base)
+
+    assert off_host not in fetched
+    assert fp.discovered_tables == []
 
 
 def test_parse_whatweb_skips_malformed_line_keeps_valid():

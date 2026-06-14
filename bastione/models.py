@@ -93,6 +93,10 @@ class Fingerprint(BaseModel):          # output di RECON (§8)
     is_supabase: bool = False          # PostgREST rilevato
     supabase_url: str | None = None
     anon_key: str | None = None        # pubblica per design, estratta dal bundle
+    # Nomi tabella ricavati dai riferimenti `.from('...')` del client Supabase nei
+    # bundle same-host (§8). Fallback per l'RLS test quando l'OpenAPI è chiusa (401,
+    # §11.1). Default [] → backward-compatible e serializza in fingerprint.json.
+    discovered_tables: list[str] = []
     cloudflare_fronted: bool = False
     endpoints: list[str] = []
     response_headers: dict[str, str] = {}
