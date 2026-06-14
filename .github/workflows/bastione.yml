@@ -1,0 +1,144 @@
+# Bastione (BAS) — monitoring schedulato via GitHub Actions (§20, ricetta #2).
+#
+# Il monitoring NON è un daemon: è semplicemente *scan schedulato → diff baseline
+# (§16) → notify (§19)*, coerente con free-tier e con la filosofia "niente
+# infrastruttura prematura" (§20). Questo workflow fa girare Bastione ogni notte
+# (più on-demand) come gate CI difensivo (§22): scansiona il target READ_ONLY,
+# carica il SARIF su GitHub code scanning e fallisce sui NEW/DRIFT.
+#
+# PERCHÉ FUNZIONA SENZA FALSI NEW: la baseline `baselines/<target>.baseline.json`
+# è committata nel repo (L05/§22 — il formato §16 contiene solo finding_id/status/
+# rule_id/module, MAI evidenze). Senza baseline versionata ogni run vedrebbe tutto
+# come NEW e il gate fallirebbe sempre. Quando emerge una nuova esposizione legittima
+# la accetti localmente (`bastione scan --target <t> --accept-baseline`) e committi la
+# baseline aggiornata.
+#
+# SEGRETI: il token e la chat di Telegram (§19) vivono nei *repository secrets*
+# (Settings → Secrets and variables → Actions), MAI nel TOML né nel workflow. Sono
+# passati come env al solo step di scan; se assenti il notifier degrada a no-op
+# loggato (best-effort §19), non un errore.
+#
+# SICUREZZA (LOCKED): qui si usa `--ci`, che RIFIUTA `--unsafe-show-secrets` (un'
+# esecuzione CI non deve mai stampare segreti in chiaro, P8/§25 → exit 2). La run è
+# READ_ONLY: nessuna scrittura sul target. Per salire a MUTATING (scritture canary
+# §11.2) servirebbe `--i-own-this-its-staging` esplicito su uno staging di proprietà
+# — fuori dallo scopo di questo monitoring notturno.
+
+name: bastione-monitoring
+
+# Trigger del job (§20): notturno schedulato + avvio manuale on-demand.
+on:
+  schedule:
+    # Ogni notte alle 03:00 UTC (cron a 5 campi, fuso UTC su GitHub Actions).
+    # Coerente con la ricetta crontab self-host del README ("0 3 * * *").
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}   # avvio manuale dalla tab "Actions" (run ad-hoc)
+
+# Permessi minimi del token del job: serve `security-events: write` per caricare il
+# SARIF su GitHub code scanning; `contents: read` per il checkout. Niente di più.
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  scan:
+    name: Bastione scan (READ_ONLY, gate §22)
+    runs-on: ubuntu-latest
+    env:
+      # Il target da monitorare: deve esistere in `targets/<target>.toml` ed essere
+      # dichiarato owned/authorized-written (il gate §7 lo verifica a runtime).
+      BAS_TARGET: gestionale
+
+    steps:
+      # 1) Checkout: porta anche la baseline committata (baselines/<target>.baseline.json),
+      #    indispensabile perché il diff (§16) non segnali falsi NEW.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2) Python 3.11+ (L01): runtime di Bastione.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 3) Install del pacchetto in editable: registra il console script `bastione`
+      #    (entrypoint reale `bastione = bastione.cli:app`). I tool esterni opzionali
+      #    (whatweb/katana/testssl.sh/nuclei/zap, §24) NON sono installati qui: la loro
+      #    assenza DEGRADA il recon (§8), non è un errore — è esattamente il
+      #    comportamento best-effort previsto.
+      - name: Install Bastione
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      # 4) Scan schedulato (§20): READ_ONLY + gate CI (§22). `--ci` attiva il gate
+      #    exit-code (exit 1 su ≥1 NEW ≥ soglia o ≥1 DRIFT) e rifiuta
+      #    `--unsafe-show-secrets`. `--fail-on high`: soglia dei NEW. I segreti
+      #    Telegram (§19) arrivano dai repository secrets come env, mai dal TOML;
+      #    se assenti il notify è un no-op loggato (best-effort §19).
+      #    `continue-on-error: true`: NON interrompiamo subito il job sull'exit 1 del
+      #    gate, così gli step successivi (upload SARIF, riepilogo) girano comunque;
+      #    il fallimento esplicito è imposto allo step finale ("Fallisci sui NEW/DRIFT").
+      - name: Run Bastione scan
+        id: bastione_scan
+        continue-on-error: true
+        env:
+          BASTIONE_TELEGRAM_BOT_TOKEN: ${{ secrets.BASTIONE_TELEGRAM_BOT_TOKEN }}
+          BASTIONE_TELEGRAM_CHAT_ID: ${{ secrets.BASTIONE_TELEGRAM_CHAT_ID }}
+        run: |
+          bastione scan \
+            --target "$BAS_TARGET" \
+            --max-intrusion read-only \
+            --ci \
+            --fail-on high
+
+      # 5) Risolve il path del SARIF dell'ultima run. Gli artefatti vivono in
+      #    `runs/<target>/<timestamp>/bastione.sarif`: i timestamp ordinano
+      #    lessicograficamente, quindi l'ultimo in ordine è la run appena conclusa.
+      #    Esporta il path per gli step successivi (upload code scanning + artifact).
+      - name: Locate SARIF
+        id: sarif
+        run: |
+          latest="$(ls -d runs/"$BAS_TARGET"/*/ 2>/dev/null | sort | tail -n 1)"
+          sarif="${latest}bastione.sarif"
+          if [ -f "$sarif" ]; then
+            echo "path=$sarif" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "SARIF trovato: $sarif"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Nessun SARIF prodotto in runs/$BAS_TARGET/<ts>/ — scan non riuscita?"
+          fi
+
+      # 6) Upload del SARIF su GitHub code scanning (§23): i finding di Bastione
+      #    compaiono nella tab "Security" e GitHub li traccia nel tempo via
+      #    partialFingerprints.findingId (stesso identificatore di Bastione).
+      #    Gira solo se il SARIF esiste.
+      - name: Upload SARIF to code scanning
+        if: steps.sarif.outputs.found == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.sarif.outputs.path }}
+          category: bastione
+
+      # 7) Upload dell'intera run come artifact (fallback/diagnostica): SARIF + report
+      #    MD/HTML + state. Utile anche quando il code scanning non è disponibile (es.
+      #    repo privato senza GitHub Advanced Security). `if: always()` per averlo
+      #    anche quando il gate è fallito.
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bastione-run-${{ env.BAS_TARGET }}
+          path: runs/${{ env.BAS_TARGET }}/
+          if-no-files-found: warn
+
+      # 8) Gate finale (§22): propaga l'exit code della scan. Se `bastione scan --ci`
+      #    è uscito ≠ 0 (exit 1 = ≥1 NEW ≥ soglia o ≥1 DRIFT; exit 2/3/4 = config/
+      #    ownership/interno) facciamo fallire il job. Così l'upload del SARIF è già
+      #    avvenuto e il fallimento è visibile (e Telegram, §19, ha già avvisato).
+      - name: Fallisci sui NEW/DRIFT (gate §22)
+        if: steps.bastione_scan.outcome == 'failure'
+        run: |
+          echo "::error::Bastione gate fallito (§22): nuova esposizione o regressione di posture rilevata su $BAS_TARGET. Vedi la tab Security / l'artifact della run."
+          exit 1
