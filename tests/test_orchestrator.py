@@ -684,3 +684,140 @@ def test_remediate_eseguita_al_resume_post_baseline_via_state_counts(tmp_path: P
     orch._result = None
     orch._no_fix = False
     assert orch._should_run(orch_mod.Phase.REMEDIATE, state, IntrusionLevel.READ_ONLY) is True
+
+
+# ─── M2 step 3: NOTIFY ora ESEGUE dispatch (§19) ─────────────────────────────
+
+def test_notify_dispatches_when_trigger_fires(tmp_path: Path, monkeypatch):
+    """Con ≥1 finding NEW HIGH (≥ soglia default HIGH) e [notify].channel=telegram,
+    la fase NOTIFY non è più uno stub: invoca notify.dispatch (qui monkeypatchato,
+    OFFLINE) con un RunSummary che riflette la run. NOTIFY resta in phases_completed."""
+    captured: dict = {}
+
+    def _fake_dispatch(cfg, summary):
+        captured["cfg_channel"] = cfg.notify_channel
+        captured["summary"] = summary
+
+    monkeypatch.setattr(orch_mod.notify, "dispatch", _fake_dispatch, raising=True)
+
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    stub = _StubModule("supabase", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING_NOTIFY), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g")
+
+    assert "NOTIFY" in state.phases_completed
+    assert captured.get("cfg_channel") == "telegram"
+    summary = captured["summary"]
+    assert summary.target == "g"
+    assert summary.counts["new"] == 1
+    assert summary.report_path.endswith("report.html")
+
+
+def test_notify_dispatch_raising_does_not_crash_run(tmp_path: Path, monkeypatch):
+    """INVARIANTE chiave (§19): un dispatch che solleva NON deve far fallire la run.
+    NOTIFY resta in phases_completed e la run arriva a PERSIST."""
+    def _boom_dispatch(cfg, summary):
+        raise RuntimeError("notifier esploso (rete giù, env corrotto, …)")
+
+    monkeypatch.setattr(orch_mod.notify, "dispatch", _boom_dispatch, raising=True)
+
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    stub = _StubModule("supabase", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING_NOTIFY), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g")   # NON deve sollevare
+
+    assert "NOTIFY" in state.phases_completed
+    assert "PERSIST" in state.phases_completed
+
+
+# ─── M2 step 3: soglia effettiva del trigger NOTIFY (§19 LOCKED) ─────────────
+
+def _finding_sev(severity: Severity, *, rule_id="R", endpoint="/x"):
+    f = _finding(module="m", rule_id=rule_id, endpoint=endpoint)
+    f.severity = severity
+    return f
+
+
+def test_notify_skipped_when_new_below_threshold(tmp_path: Path, monkeypatch):
+    """NEW MEDIUM con soglia default HIGH → NEW < soglia e nessun DRIFT → NOTIFY skip."""
+    finding = _finding_sev(Severity.MEDIUM, rule_id="MED", endpoint="/m")
+    stub = _StubModule("m", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING_NOTIFY), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g")
+
+    assert state.counts["new"] == 1
+    assert state.counts["new_by_severity"]["medium"] == 1
+    assert "NOTIFY" in state.phases_skipped, "NOTIFY non saltata con NEW < soglia"
+
+
+def test_notify_triggers_when_new_at_threshold(tmp_path: Path, monkeypatch):
+    """NEW HIGH con soglia default HIGH → NEW ≥ soglia → NOTIFY scatta (eseguita)."""
+    monkeypatch.setattr(orch_mod.notify, "dispatch", lambda cfg, summary: None, raising=True)
+    finding = _finding_sev(Severity.HIGH, rule_id="HI", endpoint="/h")
+    stub = _StubModule("m", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING_NOTIFY), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g")
+
+    assert state.counts["new_by_severity"]["high"] == 1
+    assert "NOTIFY" in state.phases_completed
+
+
+def test_notify_fail_on_overrides_toml_threshold(tmp_path: Path, monkeypatch):
+    """La soglia passata da --fail-on (qui MEDIUM) vince sul default HIGH del TOML:
+    un NEW MEDIUM ora ≥ soglia → NOTIFY scatta (§19 LOCKED: --fail-on > min_severity)."""
+    monkeypatch.setattr(orch_mod.notify, "dispatch", lambda cfg, summary: None, raising=True)
+    finding = _finding_sev(Severity.MEDIUM, rule_id="MED", endpoint="/m")
+    stub = _StubModule("m", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING_NOTIFY), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g", fail_on=Severity.MEDIUM)
+
+    assert state.counts["new_by_severity"]["medium"] == 1
+    assert "NOTIFY" in state.phases_completed, "NOTIFY non scattata con --fail-on=MEDIUM"
+
+
+def test_notify_triggers_on_drift_only(tmp_path: Path, monkeypatch):
+    """Solo DRIFT (nessun NEW): il trigger NOTIFY scatta comunque (§19)."""
+    monkeypatch.setattr(orch_mod.notify, "dispatch", lambda cfg, summary: None, raising=True)
+
+    # Baseline con il posture check PASSANTE; ora il modulo lo emette FAILED → DRIFT.
+    baselines = tmp_path / "baselines"
+    baselines.mkdir(parents=True, exist_ok=True)
+    (baselines / "g.baseline.json").write_text(json.dumps({
+        "target": "g", "updated_at": None, "findings": {},
+        "posture": {"POSTURE_HSTS": {"passed": True}},
+    }), encoding="utf-8")
+
+    posture = PostureCheck(
+        check_id="POSTURE_HSTS", title="HSTS", passed=False,
+        severity_if_failed=Severity.HIGH, target="g", detail="mancante ora")
+    stub = _StubModule("m", posture=[posture])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING_NOTIFY), runs_root=runs,
+                        baselines_root=baselines)
+    state = orch.run("g")
+
+    assert state.counts["new"] == 0
+    assert state.counts["drift"] >= 1
+    assert "NOTIFY" in state.phases_completed, "NOTIFY non scattata sul solo DRIFT"

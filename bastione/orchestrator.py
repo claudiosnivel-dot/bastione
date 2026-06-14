@@ -23,9 +23,12 @@ REMEDIATE è cablata a M1 (§18-bis.2): con ≥1 finding aperto (NEW/KNOWN) e sa
 in `runs/<target>/<ts>/fix/`. È READ_ONLY rispetto al target: scrive solo
 artefatti locali, nessuna azione sul target, nessuna rete (O05 LOCKED).
 
-NOTIFY resta stub (M2): la decisione skip/esegui resta in `_should_run`; eseguita,
-è un no-op loggato (non un crash, anche al `--resume` con `counts` non nulli
-riletti da state.json).
+NOTIFY è cablata a M2 (§19): con ≥1 finding NEW ≥ soglia OPPURE ≥1 DRIFT e un
+canale configurato (`[notify].channel`), costruisce il `RunSummary` e chiama
+`notify.dispatch`. La soglia effettiva è UNA sola per run (§19 LOCKED): il flag
+`--fail-on` vince sul TOML (`notify_min_severity`, default HIGH). È **resiliente**:
+una notifica fallita (env mancante, rete giù) NON fa crashare la run — la fase
+NOTIFY si completa comunque.
 """
 
 from __future__ import annotations
@@ -57,6 +60,7 @@ from bastione.models import (
     TargetConfig,
 )
 from bastione.normalize.sarif import to_sarif
+from bastione import notify   # §19: il package popola NOTIFIERS al primo import
 from bastione.posture.checks import posture_score
 from bastione.recon.fingerprint import fingerprint
 from bastione.remediation.agent_bundle import build_fix_plan, write_fix_bundle
@@ -81,12 +85,12 @@ PHASE_ORDER: list[Phase] = [
     Phase.REMEDIATE, Phase.NOTIFY, Phase.PERSIST,
 ]
 
-# Fase ancora stub: NOTIFY arriva a M2. Eseguita nello shell è un no-op loggato.
-# Resta QUI di proposito: se la sua precondizione (§6) scatta — p.es. `counts` non
-# nulli riletti al `--resume` (§24) — l'esecuzione dev'essere un no-op, non un
-# crash. La decisione skip/esegui resta in `_should_run`; questo set garantisce
-# solo che l'esecuzione non aborti. (REMEDIATE è ora cablata, vedi `_remediate`.)
-_SHELL_STUB = {Phase.NOTIFY}
+# Fasi ancora stub (no-op loggato in `_execute`). VUOTO a M2 step 3: NOTIFY è ora
+# cablata (vedi `_notify`), come REMEDIATE lo era da M1. Il set resta come hook
+# difensivo: una futura fase non-ancora-implementata può finire qui per essere un
+# no-op invece di sollevare "fase senza handler". La decisione skip/esegui resta
+# sempre in `_should_run`.
+_SHELL_STUB: set[Phase] = set()
 
 # Lunghezza massima dell'evidence nel meta-finding MODULE_ERROR (§6): tronchiamo
 # il testo dell'eccezione per non gonfiare il report con stack/messaggi enormi.
@@ -131,6 +135,9 @@ class Orchestrator:
         self._max_intrusion: IntrusionLevel = IntrusionLevel.READ_ONLY
         self._accept_baseline: bool = False
         self._no_fix: bool = False
+        # Soglia effettiva del trigger NOTIFY (§19): se passata da --fail-on vince
+        # sul TOML (notify_min_severity). None → si usa cfg.notify_min_severity.
+        self._fail_on: Severity | None = None
         self._fp: Fingerprint | None = None
         self._plan: list = []
         self._raw_findings: list[Finding] = []
@@ -148,12 +155,16 @@ class Orchestrator:
         resume: bool = False,
         accept_baseline: bool = False,
         no_fix: bool = False,
+        fail_on: Severity | None = None,
     ) -> RunState:
         self._target = target
         self._cfg = None
         self._max_intrusion = max_intrusion
         self._accept_baseline = accept_baseline
         self._no_fix = no_fix
+        # Soglia del trigger NOTIFY (§19 LOCKED): --fail-on vince sul TOML. La CLI
+        # passa qui la severità già risolta da --fail-on (o None se assente).
+        self._fail_on = fail_on
         self._fp = None
         self._plan = []
         self._raw_findings = []
@@ -253,11 +264,38 @@ class Orchestrator:
                 if self._no_fix:
                     return False
                 return counts.get("new", 0) + counts.get("known", 0) > 0
-            # NOTIFY: notifier configurato E (≥1 NEW ≥ soglia OPPURE ≥1 DRIFT).
+            # NOTIFY (§19): notifier configurato E (≥1 NEW ≥ soglia OPPURE ≥1 DRIFT).
             channel = self._cfg.notify_channel if self._cfg else "none"
-            has_signal = counts.get("new", 0) > 0 or counts.get("drift", 0) > 0
-            return channel != "none" and has_signal
+            if channel == "none":
+                return False
+            return self._notify_signal(counts)
         return True
+
+    def _notify_threshold(self) -> Severity:
+        """Soglia effettiva del trigger NOTIFY (§19 LOCKED): UNA sola per run.
+
+        Il flag `--fail-on` (self._fail_on, passato a run()) vince sul TOML; in sua
+        assenza il default è `cfg.notify_min_severity` (a sua volta HIGH di default,
+        §5.6). È la stessa soglia usata dal gate CI (§22): un'unica nozione di
+        "abbastanza grave da avvisare/far fallire"."""
+        if self._fail_on is not None:
+            return self._fail_on
+        if self._cfg is not None:
+            return self._cfg.notify_min_severity
+        return Severity.HIGH
+
+    def _notify_signal(self, counts: dict) -> bool:
+        """True se la run ha un segnale da notificare (§19): ≥1 finding NEW con
+        severity ≥ soglia OPPURE ≥1 DRIFT. Legge `new_by_severity` (prodotto dalla
+        baseline §16) e il contatore `drift`."""
+        if counts.get("drift", 0) > 0:
+            return True
+        threshold = self._notify_threshold()
+        new_by_sev = counts.get("new_by_severity", {}) or {}
+        for sev in Severity:
+            if sev >= threshold and new_by_sev.get(sev.name.lower(), 0) > 0:
+                return True
+        return False
 
     # ── azioni di fase ────────────────────────────────────────────────────
 
@@ -282,6 +320,8 @@ class Orchestrator:
             self._report()
         elif phase is Phase.REMEDIATE:
             self._remediate()
+        elif phase is Phase.NOTIFY:
+            self._notify()
         elif phase is Phase.PERSIST:
             self._persist(state)
         elif phase in _SHELL_STUB:
@@ -574,6 +614,38 @@ class Orchestrator:
         write_fix_bundle(plan, self._run_dir)
         log.info("REMEDIATE: bundle fix/ generato (%d fix) in %s",
                  len(plan.fixes), self._run_dir / "fix")
+
+    # ── NOTIFY (§19) ───────────────────────────────────────────────────────────
+
+    def _notify(self) -> None:
+        """Invia l'alert sul delta della run (§19): costruisce il `RunSummary` dai
+        dati in memoria e chiama `notify.dispatch`.
+
+        La precondizione (canale configurato + ≥1 NEW ≥ soglia OPPURE ≥1 DRIFT) è
+        già stata valutata in `_should_run`: qui si è certi che valga la pena
+        avvisare. Il `report_path` è il path del report HTML (single-file, O02).
+
+        RESILIENTE (invariante §19): NOTIFY è best-effort. `notify.dispatch` assorbe
+        già ogni errore di invio (canale ignoto, env mancante, rete giù); in più
+        avvolgiamo qui la *costruzione* del summary in un try/except, così nemmeno un
+        dato mancante in memoria (es. counts/result assenti a un --resume entrato qui)
+        può far fallire la fase. NOTIFY si completa comunque — la run è già riuscita."""
+        assert self._cfg is not None
+        try:
+            counts = self._result.counts if self._result is not None else {}
+            report_path = str(self._run_dir / REPORT_HTML_FILENAME)
+            summary = notify.build_run_summary(
+                target=self._cfg.name,
+                posture_score=self._score,
+                counts=counts,
+                report_path=report_path,
+            )
+            notify.dispatch(self._cfg, summary)
+        except Exception:  # noqa: BLE001 — best-effort §19: NOTIFY non crasha la run
+            log.warning(
+                "NOTIFY: errore nella costruzione/invio dell'alert — notifica non "
+                "riuscita ma la run NON è compromessa (best-effort §19).",
+                exc_info=True)
 
     # ── PERSIST (§24) ──────────────────────────────────────────────────────────
 

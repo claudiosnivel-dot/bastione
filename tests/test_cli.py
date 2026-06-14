@@ -72,11 +72,12 @@ def _patch_run(monkeypatch, *, state: RunState | None = None, capture: dict | No
     st = state if state is not None else _state()
 
     def _fake_run(self, target, *, max_intrusion=IntrusionLevel.READ_ONLY,
-                  resume=False, accept_baseline=False, no_fix=False):
+                  resume=False, accept_baseline=False, no_fix=False, fail_on=None):
         if capture is not None:
             capture.update(
                 target=target, max_intrusion=max_intrusion,
                 resume=resume, accept_baseline=accept_baseline, no_fix=no_fix,
+                fail_on=fail_on,
             )
         self._run_dir = Path(run_dir)
         if exc is not None:
@@ -198,6 +199,27 @@ def test_scan_default_no_fix_is_false(monkeypatch):
     result = runner.invoke(app, ["scan", "--target", "g"])
     assert result.exit_code == 0, result.output
     assert cap["no_fix"] is False
+
+
+def test_scan_fail_on_threshold_is_passed_to_orchestrator(monkeypatch):
+    # M2 step 3 (§19 LOCKED): la soglia risolta da --fail-on viene passata a
+    # orch.run come Severity, così il trigger NOTIFY usa la STESSA soglia del gate.
+    from bastione.enums import Severity
+    cap: dict = {}
+    _patch_run(monkeypatch, capture=cap)
+    result = runner.invoke(app, ["scan", "--target", "g", "--fail-on", "medium"])
+    assert result.exit_code == 0, result.output
+    assert cap["fail_on"] == Severity.MEDIUM
+
+
+def test_scan_without_fail_on_passes_none_threshold(monkeypatch):
+    # Senza --fail-on la soglia passata a orch.run è None: il notify ricade sul
+    # default del TOML (cfg.notify_min_severity, HIGH) — non sul gate CI.
+    cap: dict = {}
+    _patch_run(monkeypatch, capture=cap)
+    result = runner.invoke(app, ["scan", "--target", "g"])
+    assert result.exit_code == 0, result.output
+    assert cap["fail_on"] is None
 
 
 # ─── scan: incompatibilità e gate ───────────────────────────────────────────
@@ -344,10 +366,11 @@ def _patch_verify_run(monkeypatch, *, result: BaselineResult | None = None,
     res = result if result is not None else BaselineResult()
 
     def _fake_run(self, target, *, max_intrusion=IntrusionLevel.READ_ONLY,
-                  resume=False, accept_baseline=False, no_fix=False):
+                  resume=False, accept_baseline=False, no_fix=False, fail_on=None):
         if capture is not None:
             capture.update(target=target, max_intrusion=max_intrusion,
-                           no_fix=no_fix, accept_baseline=accept_baseline)
+                           no_fix=no_fix, accept_baseline=accept_baseline,
+                           fail_on=fail_on)
         self._run_dir = Path(run_dir)
         self._result = res
         if exc is not None:

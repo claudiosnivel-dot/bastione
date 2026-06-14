@@ -186,6 +186,14 @@ def scan(
             "[dim]nota:[/] --unsafe-show-secrets: la de-redazione dell'evidence è "
             "M1; in M0 i segreti restano redatti nei file (P8).")
 
+    # Soglia del trigger NOTIFY (§19 LOCKED): il flag --fail-on vince sul TOML
+    # (notify_min_severity). Passiamo all'orchestratore SOLO la severità di
+    # --fail-on quando è esplicito (None altrimenti): è il default --ci a NON
+    # dover sovrascrivere il min_severity del notify (il default HIGH di --ci
+    # serve al gate CI §22, non al notify). Così la soglia di NOTIFY resta "il
+    # flag se c'è, altrimenti il TOML".
+    notify_threshold = _CLI_TO_SEVERITY[fail_on] if fail_on is not None else None
+
     orch = Orchestrator()
     try:
         state = orch.run(
@@ -194,6 +202,7 @@ def scan(
             resume=resume,
             accept_baseline=accept_baseline,
             no_fix=no_fix,
+            fail_on=notify_threshold,
         )
     except PreconditionDenied as exc:
         # Precondizione di LOAD non soddisfatta (produzione bloccata o ownership
