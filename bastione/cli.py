@@ -26,7 +26,9 @@ un exit code ≠ 0 — MAI uno stacktrace in faccia all'utente.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -34,9 +36,15 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from bastione.baseline.diff import (
+    accept_finding,
+    load_baseline,
+    save_baseline,
+)
 from bastione.enums import IntrusionLevel, Severity
 from bastione.gate import IntrusionDenied, PreconditionDenied
 from bastione.orchestrator import (
+    DEFAULT_BASELINES_ROOT,
     REPORT_FILENAME,
     SARIF_FILENAME,
     Orchestrator,
@@ -249,6 +257,203 @@ def _print_summary(state: RunState, run_dir: Path) -> None:
     console.print(f"Artefatti in: [cyan]{run_dir}[/]")
     console.print(f"  • SARIF : {run_dir / SARIF_FILENAME}")
     console.print(f"  • Report: {run_dir / REPORT_FILENAME}")
+
+
+# ─── baseline (§25 riga 946 / §16 gradino 2) ─────────────────────────────────
+
+def _validate_target_name(target: str) -> None:
+    """Rifiuta nomi di target che evaderebbero la baselines root (path traversal).
+
+    A differenza di `scan` — protetto a monte da `load_target`/`resolve_target_path`
+    (§7 fase LOAD), che fallisce su un target inesistente PRIMA di toccare la
+    baseline — il comando `baseline` opera direttamente sul path. Senza questa
+    guardia un `--target ../../x` farebbe uscire `--reset` (unlink) e `--accept`
+    (write) dalla root: una cancellazione/scrittura distruttiva fuori dalla
+    directory prevista (GUARDRAIL LOCKED: tocca SOLO il file baseline locale).
+
+    Rifiuta separatori di percorso, componenti `..`/`.` e NUL → messaggio chiaro
+    + exit 2 (niente stacktrace, §25). Nessun I/O qui: la guardia precede ogni
+    accesso al filesystem."""
+    invalid = (
+        not target
+        or os.sep in target
+        or (os.altsep is not None and os.altsep in target)
+        or "\x00" in target
+        or target in {".", ".."}
+        or ".." in Path(target).parts
+    )
+    if invalid:
+        err_console.print(
+            f"[bold red]Errore:[/] target non valido: [bold]{target!r}[/]. "
+            "Il nome del target non può contenere separatori di percorso né "
+            "componenti '..' (la baseline vive in baselines/<target>.baseline.json).")
+        raise typer.Exit(code=2)
+
+
+def _baseline_path(baselines_dir: Path | None, target: str) -> Path:
+    """Path della baseline del target (§16). Usa lo STESSO formato/root di
+    `scan --accept-baseline` (`DEFAULT_BASELINES_ROOT`, orchestrator.py) così i due
+    gradini operano sullo stesso file. `--baselines-dir` (nascosto) lo redirige a
+    una dir temporanea nei test."""
+    root = baselines_dir if baselines_dir is not None else DEFAULT_BASELINES_ROOT
+    return root / f"{target}.baseline.json"
+
+
+@app.command()
+def baseline(
+    target: str = typer.Option(..., "--target", help="Nome del target (baselines/<target>.baseline.json)."),
+    show: bool = typer.Option(
+        False, "--show", help="Stampa il contenuto della baseline (default se nessuna opzione)."),
+    reset: bool = typer.Option(
+        False, "--reset", help="Cancella il file baseline del target (azione deliberata, non interattiva)."),
+    accept: str | None = typer.Option(
+        None, "--accept", metavar="FINDING_ID",
+        help="Promuove un singolo finding KNOWN→ACCEPTED (gradino 2, §16)."),
+    baselines_dir: Path | None = typer.Option(
+        None, "--baselines-dir", hidden=True,
+        help="Override della root delle baseline (uso interno/test)."),
+) -> None:
+    """Gestisce la baseline locale del target (§25/§16): mostra, resetta o accetta.
+
+    Comando LOCALE e READ-ONLY rispetto al target: tocca SOLO il file baseline JSON
+    (mai rete, mai il target). Le tre azioni sono mutuamente esclusive. Il file
+    contiene SOLO finding_id/status/date/rule_id/module + esito booleano dei posture
+    check — mai evidenze (L05)."""
+    # Mutua esclusione (§25): al più UNA delle tre opzioni.
+    chosen = [name for name, on in
+              (("--show", show), ("--reset", reset), ("--accept", accept is not None)) if on]
+    if len(chosen) > 1:
+        err_console.print(
+            f"[bold red]Errore:[/] {', '.join(chosen)} sono mutuamente esclusive: "
+            "scegline una sola (§25).")
+        raise typer.Exit(code=2)
+
+    # Guardia path-traversal (GUARDRAIL LOCKED): rifiuta target che evaderebbero la
+    # baselines root PRIMA di qualsiasi I/O (reset/unlink, accept/write, show/read).
+    _validate_target_name(target)
+
+    path = _baseline_path(baselines_dir, target)
+
+    if reset:
+        _baseline_reset(target, path)
+    elif accept is not None:
+        _baseline_accept(target, path, accept)
+    else:
+        # --show esplicito oppure default (nessuna opzione data).
+        _baseline_show(target, path)
+
+
+def _baseline_show(target: str, path: Path) -> None:
+    """`--show` (§25): stampa header + tabella finding + tabella posture. Se il file
+    non esiste → messaggio amichevole, exit 0 (non è un errore: la baseline si crea
+    con `scan --accept-baseline`)."""
+    if not path.exists():
+        console.print(f"[yellow]Nessuna baseline per[/] [cyan]{target}[/] "
+                      f"(atteso in {path}). Creala con [bold]scan --accept-baseline[/].")
+        return
+
+    bl = load_baseline(path)
+    console.print()
+    console.print(f"[bold]Baseline[/] di [cyan]{bl.get('target') or target}[/]  "
+                  f"updated_at: {bl.get('updated_at') or '—'}")
+
+    findings = bl.get("findings", {})
+    f_table = Table(title="Finding", show_header=True, header_style="bold")
+    for col in ("finding_id", "status", "first_seen", "last_seen", "rule_id", "module"):
+        f_table.add_column(col)
+    for fid, entry in findings.items():
+        entry = entry if isinstance(entry, dict) else {}
+        f_table.add_row(
+            fid,
+            str(entry.get("status", "")),
+            str(entry.get("first_seen") or "—"),
+            str(entry.get("last_seen") or "—"),
+            str(entry.get("rule_id") or "—"),
+            str(entry.get("module") or "—"),
+        )
+    console.print(f_table)
+
+    posture = bl.get("posture", {})
+    p_table = Table(title="Posture", show_header=True, header_style="bold")
+    p_table.add_column("check_id")
+    p_table.add_column("passed")
+    for check_id, entry in posture.items():
+        entry = entry if isinstance(entry, dict) else {}
+        p_table.add_row(check_id, str(bool(entry.get("passed"))))
+    console.print(p_table)
+
+
+def _baseline_reset(target: str, path: Path) -> None:
+    """`--reset` (§25): cancella il file baseline del target. Azione deliberata e
+    NON interattiva (la CLI gira non-interattiva): nessun prompt, ma stampa
+    chiaramente cosa è stato rimosso. Se il file non esiste → nota, exit 0."""
+    if not path.exists():
+        console.print(f"[dim]nota:[/] niente da resettare per [cyan]{target}[/] "
+                      f"(nessuna baseline in {path}).")
+        return
+    bl = load_baseline(path)
+    n_findings = len(bl.get("findings", {}))
+    n_posture = len(bl.get("posture", {}))
+    path.unlink()
+    console.print(
+        f"Baseline di [cyan]{target}[/] rimossa ({path}): conteneva "
+        f"[bold]{n_findings}[/] finding e [bold]{n_posture}[/] posture check.")
+
+
+def _baseline_accept(target: str, path: Path, finding_id: str) -> None:
+    """`--accept <id>` (§25 / §16 gradino 2): promozione selettiva e deliberata di
+    UN finding KNOWN→ACCEPTED. Carica, promuove via `accept_finding` (puro), salva.
+
+    Errori chiari (niente stacktrace, §25):
+    - baseline assente o id non presente → messaggio + exit ≠ 0;
+    - id presente ma entry corrotta (non-dict) → messaggio dedicato + exit ≠ 0;
+    - già accepted → vero no-op su disco, nota idempotente, exit 0.
+    Non promuove nessun altro finding."""
+    if not path.exists():
+        err_console.print(
+            f"[bold red]Errore:[/] nessuna baseline per [cyan]{target}[/] "
+            f"(atteso in {path}): niente da accettare. Creala con "
+            f"[bold]scan --accept-baseline[/].")
+        raise typer.Exit(code=2)
+
+    bl = load_baseline(path)
+    findings = bl.get("findings", {})
+    entry = findings.get(finding_id) if isinstance(findings, dict) else None
+    id_present = isinstance(findings, dict) and finding_id in findings
+
+    # Già accepted → vero no-op su disco: non riscriviamo il file (mtime invariato,
+    # nessun rischio di azzerare un updated_at non-ISO). Idempotente per davvero.
+    if isinstance(entry, dict) and entry.get("status") == "accepted":
+        console.print(f"[dim]nota:[/] finding [bold]{finding_id}[/] era già "
+                      f"[bold]accepted[/] (idempotente, nessuna modifica su disco).")
+        return
+
+    if not accept_finding(bl, finding_id):
+        # accept_finding ritorna False sia per id assente sia per entry corrotta
+        # (non-dict): distinguiamo i due casi per un messaggio preciso (§25).
+        if id_present:
+            err_console.print(
+                f"[bold red]Errore:[/] finding [bold]{finding_id}[/] presente nella "
+                f"baseline di [cyan]{target}[/] ma con entry corrotta (non è un "
+                f"oggetto): impossibile accettarlo. Ispeziona/rigenera la baseline.")
+        else:
+            err_console.print(
+                f"[bold red]Errore:[/] finding [bold]{finding_id}[/] non presente nella "
+                f"baseline di [cyan]{target}[/]. Usa [bold]baseline --show[/] per gli id noti.")
+        raise typer.Exit(code=2)
+
+    # Promozione REALE: la baseline è cambiata → updated_at = adesso. Così non
+    # azzeriamo mai silenziosamente un updated_at preesistente (anche non-ISO):
+    # lo aggiorniamo deliberatamente perché il file è stato davvero modificato.
+    save_baseline(
+        path,
+        target=bl.get("target") or target,
+        findings=bl.get("findings", {}),
+        posture=bl.get("posture", {}),
+        updated_at=datetime.now(timezone.utc),
+    )
+    console.print(f"Finding [bold]{finding_id}[/] promosso a "
+                  f"[bold]accepted[/] nella baseline di [cyan]{target}[/].")
 
 
 # ─── doctor (§24) ────────────────────────────────────────────────────────────

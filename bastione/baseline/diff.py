@@ -109,6 +109,32 @@ def save_baseline(
     return path
 
 
+# ─── promozione selettiva KNOWN→ACCEPTED (gradino 2, §16 riga 599) ───────────
+
+def accept_finding(baseline: dict, finding_id: str) -> bool:
+    """Promozione *selettiva e deliberata* di UN finding a `accepted` (§16, gradino
+    2). Imposta `status="accepted"` per quel solo `finding_id` nella baseline.
+
+    Funzione PURA: muta il dict in-place e ritorna un esito booleano, **senza I/O**
+    (load/save restano a carico del chiamante CLI). Idempotente:
+
+    - `finding_id` assente in baseline → ritorna `False` (niente da promuovere);
+    - già `accepted` → no-op, ritorna `True` (idempotente);
+    - altrimenti → status portato a `accepted`, ritorna `True`.
+
+    Non tocca nessun altro finding: la promozione è puntuale (L05 — il file resta
+    solo id/status/date/rule_id/module + esito posture, mai evidenze).
+    """
+    findings = baseline.get("findings") if isinstance(baseline, dict) else None
+    if not isinstance(findings, dict) or finding_id not in findings:
+        return False
+    entry = findings[finding_id]
+    if not isinstance(entry, dict):
+        return False
+    entry["status"] = Status.ACCEPTED.value
+    return True
+
+
 # ─── risultato del diff ─────────────────────────────────────────────────────
 
 @dataclass

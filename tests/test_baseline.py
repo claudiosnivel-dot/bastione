@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bastione.baseline.diff import (
+    accept_finding,
     apply_baseline,
     finding_id,
     load_baseline,
@@ -287,6 +288,36 @@ def test_counts_shape_and_values():
     assert c["new_by_severity"]["high"] == 0
     assert c["new_by_severity"]["low"] == 0
     assert c["new_by_severity"]["info"] == 0
+
+
+# ─── accept_finding: promozione pura KNOWN→ACCEPTED (§16 gradino 2) ──────────
+
+def test_accept_finding_promotes_single_known():
+    baseline = {
+        "target": "g",
+        "findings": {
+            "id_a": {"status": "known", "first_seen": EARLIER.isoformat()},
+            "id_b": {"status": "known", "first_seen": EARLIER.isoformat()},
+        },
+        "posture": {},
+    }
+    assert accept_finding(baseline, "id_a") is True
+    assert baseline["findings"]["id_a"]["status"] == "accepted"
+    # NON tocca gli altri finding (promozione puntuale).
+    assert baseline["findings"]["id_b"]["status"] == "known"
+
+
+def test_accept_finding_unknown_id_returns_false():
+    baseline = {"target": "g", "findings": {"id_a": {"status": "known"}}, "posture": {}}
+    assert accept_finding(baseline, "nope") is False
+    # baseline invariata.
+    assert baseline["findings"]["id_a"]["status"] == "known"
+
+
+def test_accept_finding_already_accepted_is_idempotent():
+    baseline = {"target": "g", "findings": {"id_a": {"status": "accepted"}}, "posture": {}}
+    assert accept_finding(baseline, "id_a") is True
+    assert baseline["findings"]["id_a"]["status"] == "accepted"
 
 
 def test_counts_accepted_does_not_count_as_known():
