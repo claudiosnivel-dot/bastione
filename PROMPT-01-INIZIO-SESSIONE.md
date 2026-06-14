@@ -32,5 +32,3 @@ Sulla base del `next` nel build order, proponi **il prossimo task concreto**:
 - dove ti fermerai (definisci un checkpoint rivedibile, non 8 step in fila).
 
 Poi **fermati e aspetta il mio ok.** Non iniziare a scrivere codice finché non confermo o aggiusto la direzione. Se ho richieste diverse dal `next` previsto, le do qui.
-
-> Promemoria: questa è una sessione, non l'intera milestone. Lavoriamo a incrementi piccoli e rivedibili (3h/settimana). Meglio un pezzo solido e testato che molti pezzi abbozzati. E a fine sessione: `PROMPT-02-FINE-SESSIONE` per lasciare il contesto pulito.
