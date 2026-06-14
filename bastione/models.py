@@ -5,14 +5,15 @@ proprio formato. Tutte le classi sono `pydantic.BaseModel` (L03), salvo
 `ModuleResult` che è una `NamedTuple` (valore di ritorno di `Module.run`, §9).
 
 NB di scopo M0: questo file copre §5.2–§5.6. I contratti dell'Agent Remediation
-Bundle (`FixEntry`/`FixPlan`, §18-bis.3) sono M1 e verranno aggiunti lì — non si
-anticipano (P5).
+Bundle (`FixEntry`/`FixPlan`, §18-bis.3) sono M1 e ora sono aggiunti in coda, nella
+loro sezione dedicata (§18-bis.3).
 """
 
 from __future__ import annotations
 
 import re
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -177,3 +178,73 @@ class RunSummary(BaseModel):           # input dei Notifier (§19)
 # RunContext referenzia TargetConfig in avanti (§5.5 prima di §5.6): ora che
 # TargetConfig è definita, risolviamo il forward ref.
 RunContext.model_rebuild()
+
+
+# ─── 18-bis.3 Agent Remediation Bundle (M1) ────────────────────────────────
+#
+# Stessa conoscenza di remediation dei playbook umani (§18), in una resa
+# *machine-consumable* per un agente di coding. La chiave di mapping resta il
+# `rule_id`. Shape LOCKED (§18-bis.3): non cambiare i valori degli enum né i
+# nomi dei campi — il bundle `fix/` (FIX-PLAN.md, fix-plan.json) è un contratto
+# versionato (`schema_version="bastione-fixplan/1"`).
+
+class FixType(str, Enum):
+    """Categoria di fix — determina la *shape* di `FixEntry.instructions` (§18-bis.4)."""
+
+    SQL_MIGRATION   = "sql_migration"     # artefatto letterale: file .sql pronto
+    CONFIG_CHANGE   = "config_change"     # header/impostazione: valore letterale
+    INFRA_CHANGE    = "infra_change"      # Cloudflare/DNS: valore letterale
+    CODE_CHANGE     = "code_change"       # intent + hint: l'agente localizza nel repo
+    SECRET_ROTATION = "secret_rotation"   # rotazione chiave: passo umano obbligatorio
+
+
+class Applicability(str, Enum):
+    """Chi può applicare il fix end-to-end (§18-bis.3)."""
+
+    AGENT       = "agent"          # un agente di coding lo applica end-to-end
+    HUMAN       = "human"          # richiede una console/dashboard del provider
+    AGENT_HUMAN = "agent+human"    # l'agente prepara, l'umano completa (o viceversa)
+
+
+class Verification(BaseModel):
+    """Criterio di accettazione di un fix: si chiude solo con un re-scan (§18-bis.8)."""
+
+    method: str = "bastione-rescan"
+    command: str                    # es. "bastione verify --target gestionale"
+    expect: str                     # es. "finding 7f3a…e1 → FIXED"
+
+
+class FixEntry(BaseModel):
+    """Una singola voce del piano di remediation per l'agente (§18-bis.3).
+
+    `finding_id` è lo stesso id stabile del `Finding` (§16): chiude il loop tra
+    "ecco il bug" e "ecco la patch + la prova che è chiusa". La shape di
+    `instructions` dipende da `fix_type` (§18-bis.4, LOCKED).
+    """
+
+    finding_id: str                 # stesso id stabile del Finding (§16) — chiude il loop
+    rule_id: str
+    severity: Severity
+    title: str
+    fix_type: FixType
+    applicable_by: Applicability
+    priority: int                   # 1 = primo. secret_rotation è SEMPRE 1 (§18-bis.5).
+    depends_on: list[str] = []      # finding_id da risolvere prima (es. ruota PRIMA di ripulire)
+    context: dict                   # {resource, endpoint, file, evidence_redacted}
+    instructions: dict              # shape dipende da fix_type (§18-bis.4)
+    verification: Verification
+
+
+class FixPlan(BaseModel):
+    """Il piano di remediation completo, serializzato in `fix-plan.json` (§18-bis.3).
+
+    `fixes` è ordinato per priority crescente, poi severity decrescente
+    (§18-bis.4). `summary` riassume i conteggi (§18-bis.6).
+    """
+
+    schema_version: str = "bastione-fixplan/1"
+    target: str
+    generated_at: datetime
+    run_dir: str
+    summary: dict                   # {total, agent_applicable, human_required, by_severity}
+    fixes: list[FixEntry]           # ordinati per priority, poi severity

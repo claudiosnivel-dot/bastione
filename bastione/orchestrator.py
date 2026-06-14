@@ -18,9 +18,14 @@ Regole motore (LOCKED):
 - READ_ONLY (M0): nessuna fase supera la sola GET; la verifica di ownership
   (§7.1) gira solo se max_intrusion > READ_ONLY.
 
-REMEDIATE/NOTIFY restano stub (M1/M2): la decisione skip/esegui resta in
-`_should_run`; eseguite, sono no-op loggati (non un crash, anche al `--resume`
-con `counts` non nulli riletti da state.json).
+REMEDIATE è cablata a M1 (§18-bis.2): con ≥1 finding aperto (NEW/KNOWN) e salvo
+`--no-fix`, genera il bundle `fix/` (FIX-PLAN.md + fix-plan.json + migrations/)
+in `runs/<target>/<ts>/fix/`. È READ_ONLY rispetto al target: scrive solo
+artefatti locali, nessuna azione sul target, nessuna rete (O05 LOCKED).
+
+NOTIFY resta stub (M2): la decisione skip/esegui resta in `_should_run`; eseguita,
+è un no-op loggato (non un crash, anche al `--resume` con `counts` non nulli
+riletti da state.json).
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ from bastione.models import (
 from bastione.normalize.sarif import to_sarif
 from bastione.posture.checks import posture_score
 from bastione.recon.fingerprint import fingerprint
+from bastione.remediation.agent_bundle import build_fix_plan, write_fix_bundle
 from bastione.report.markdown import to_markdown
 from bastione.state import RunState, intrusion_to_cli
 
@@ -73,12 +79,12 @@ PHASE_ORDER: list[Phase] = [
     Phase.REMEDIATE, Phase.NOTIFY, Phase.PERSIST,
 ]
 
-# Fasi ancora stub: REMEDIATE/NOTIFY arrivano a M1/M2. Eseguite nello shell sono
-# no-op loggati. Restano QUI di proposito: se la loro precondizione (§6) scatta
-# — p.es. `counts` non nulli riletti al `--resume` (§24) — l'esecuzione dev'essere
-# un no-op, non un crash. La decisione skip/esegui resta in `_should_run`; questo
-# set garantisce solo che l'esecuzione non aborti.
-_SHELL_STUB = {Phase.REMEDIATE, Phase.NOTIFY}
+# Fase ancora stub: NOTIFY arriva a M2. Eseguita nello shell è un no-op loggato.
+# Resta QUI di proposito: se la sua precondizione (§6) scatta — p.es. `counts` non
+# nulli riletti al `--resume` (§24) — l'esecuzione dev'essere un no-op, non un
+# crash. La decisione skip/esegui resta in `_should_run`; questo set garantisce
+# solo che l'esecuzione non aborti. (REMEDIATE è ora cablata, vedi `_remediate`.)
+_SHELL_STUB = {Phase.NOTIFY}
 
 # Lunghezza massima dell'evidence nel meta-finding MODULE_ERROR (§6): tronchiamo
 # il testo dell'eccezione per non gonfiare il report con stack/messaggi enormi.
@@ -120,6 +126,7 @@ class Orchestrator:
         self._run_dir: Path = Path(".")
         self._max_intrusion: IntrusionLevel = IntrusionLevel.READ_ONLY
         self._accept_baseline: bool = False
+        self._no_fix: bool = False
         self._fp: Fingerprint | None = None
         self._plan: list = []
         self._raw_findings: list[Finding] = []
@@ -136,11 +143,13 @@ class Orchestrator:
         max_intrusion: IntrusionLevel = IntrusionLevel.READ_ONLY,
         resume: bool = False,
         accept_baseline: bool = False,
+        no_fix: bool = False,
     ) -> RunState:
         self._target = target
         self._cfg = None
         self._max_intrusion = max_intrusion
         self._accept_baseline = accept_baseline
+        self._no_fix = no_fix
         self._fp = None
         self._plan = []
         self._raw_findings = []
@@ -235,7 +244,10 @@ class Orchestrator:
         if phase is Phase.REMEDIATE or phase is Phase.NOTIFY:
             counts = self._result.counts if self._result is not None else state.counts
             if phase is Phase.REMEDIATE:
-                # ≥1 finding aperto (NEW/KNOWN). Stub: in M0 è comunque no-op.
+                # O05 (LOCKED): genera il bundle SEMPRE che ci sia ≥1 finding aperto
+                # (NEW/KNOWN), SALVO --no-fix che salta la fase del tutto.
+                if self._no_fix:
+                    return False
                 return counts.get("new", 0) + counts.get("known", 0) > 0
             # NOTIFY: notifier configurato E (≥1 NEW ≥ soglia OPPURE ≥1 DRIFT).
             channel = self._cfg.notify_channel if self._cfg else "none"
@@ -259,11 +271,13 @@ class Orchestrator:
         elif phase is Phase.NORMALIZE:
             self._normalize()
         elif phase is Phase.BASELINE:
-            self._baseline()
+            self._baseline(state)
         elif phase is Phase.POSTURE:
             self._posture(state)
         elif phase is Phase.REPORT:
             self._report()
+        elif phase is Phase.REMEDIATE:
+            self._remediate()
         elif phase is Phase.PERSIST:
             self._persist(state)
         elif phase in _SHELL_STUB:
@@ -470,12 +484,19 @@ class Orchestrator:
 
     # ── BASELINE (§16) ───────────────────────────────────────────────────────
 
-    def _baseline(self) -> None:
+    def _baseline(self, state: RunState) -> None:
         """Diff dei finding e dei posture check contro la baseline (§16):
-        arricchisce gli status (NEW/KNOWN/FIXED), marca il DRIFT e calcola i counts."""
+        arricchisce gli status (NEW/KNOWN/FIXED), marca il DRIFT e calcola i counts.
+
+        Persiste subito ``state.counts`` (anche se PERSIST li ri-salverà in fase 12):
+        così, su un ``--resume`` entrato in REMEDIATE/NOTIFY dopo BASELINE ma prima di
+        PERSIST — dove ``self._result`` è ``None`` e la precondizione di ``_should_run``
+        ricade su ``state.counts`` (§24) — i counts reali sono già su disco e il bundle
+        viene rigenerato invece di essere saltato per counts a zero (§6/O05)."""
         baseline = load_baseline(self._baseline_path())
         self._result = apply_baseline(
             self._raw_findings, self._raw_posture, baseline, now=self._now())
+        state.counts = self._result.counts
 
     def _baseline_path(self) -> Path:
         assert self._cfg is not None
@@ -511,6 +532,36 @@ class Orchestrator:
             counts=result.counts,
         )
         (self._run_dir / REPORT_FILENAME).write_text(report, encoding="utf-8")
+
+    # ── REMEDIATE (§18-bis.2 / O05) ──────────────────────────────────────────
+
+    def _remediate(self) -> None:
+        """Genera l'Agent Remediation Bundle (§18-bis.2) in run_dir/fix/.
+
+        O05 (LOCKED): la fase scatta SEMPRE che ci sia ≥1 finding aperto (NEW/KNOWN)
+        e NON sia attivo --no-fix (vedi `_should_run`). Costruisce il `FixPlan` dai
+        finding emessi nella run — `self._result.findings`, che esclude già i FIXED
+        (§16) — e scrive il bundle. È READ_ONLY rispetto al target: solo scrittura di
+        artefatti locali sotto run_dir/fix/, nessuna azione sul target, nessuna rete.
+
+        Resiliente (§4.7): se per qualunque ragione i finding non sono disponibili in
+        memoria (es. `self._result is None` a un --resume entrato qui senza la catena
+        BASELINE ricostruita), logga e non scrive — non crasha la run."""
+        assert self._cfg is not None
+        if self._result is None:
+            log.warning(
+                "REMEDIATE: nessun risultato di baseline in memoria — bundle non "
+                "generato (resilienza §4.7).")
+            return
+        plan = build_fix_plan(
+            self._result.findings,
+            self._cfg,
+            now=self._now(),
+            run_dir=str(self._run_dir),
+        )
+        write_fix_bundle(plan, self._run_dir)
+        log.info("REMEDIATE: bundle fix/ generato (%d fix) in %s",
+                 len(plan.fixes), self._run_dir / "fix")
 
     # ── PERSIST (§24) ──────────────────────────────────────────────────────────
 

@@ -491,3 +491,165 @@ def test_plan_excludes_disabled_modules(tmp_path: Path, monkeypatch):
     assert "POSTURE_CLOUDFLARE_FRONTED" not in report
     # headers gira (resolved_urls presenti) → i suoi check compaiono
     assert "POSTURE_HSTS" in report
+
+
+# ─── REMEDIATE (§18-bis.2 / O05) — fase reale che scrive il bundle fix/ ──────
+
+def test_remediate_writes_fix_bundle_when_open_findings(tmp_path: Path, monkeypatch):
+    """O05 (LOCKED): con ≥1 finding aperto (NEW/KNOWN) la fase REMEDIATE genera il
+    bundle in runs/<target>/<ts>/fix/ (FIX-PLAN.md + fix-plan.json), READ_ONLY
+    rispetto al target. Qui un RLS_DISABLED NEW → c'è un fix da emettere."""
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    stub = _StubModule("supabase", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g")
+
+    assert "REMEDIATE" in state.phases_completed
+    run_dir = next((runs / "g").glob("*/"))
+    fix_dir = run_dir / "fix"
+    assert (fix_dir / "FIX-PLAN.md").is_file(), "FIX-PLAN.md non scritto da REMEDIATE"
+    assert (fix_dir / "fix-plan.json").is_file(), "fix-plan.json non scritto da REMEDIATE"
+    # il piano cita il finding aperto
+    plan_json = (fix_dir / "fix-plan.json").read_text(encoding="utf-8")
+    assert "RLS_DISABLED" in plan_json
+
+
+def test_remediate_skipped_with_no_fix_writes_no_bundle(tmp_path: Path, monkeypatch):
+    """--no-fix (no_fix=True) salta del tutto REMEDIATE: nessun bundle fix/ scritto,
+    anche se ci sono finding aperti (O05: il bundle si genera SEMPRE salvo --no-fix)."""
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    stub = _StubModule("supabase", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g", no_fix=True)
+
+    assert state.counts["new"] == 1
+    assert "REMEDIATE" in state.phases_skipped
+    assert "REMEDIATE" not in state.phases_completed
+    run_dir = next((runs / "g").glob("*/"))
+    assert not (run_dir / "fix").exists(), "nessun bundle deve essere scritto con --no-fix"
+
+
+def test_remediate_skipped_without_open_findings_writes_no_bundle(tmp_path: Path, monkeypatch):
+    """Senza finding aperti la precondizione di REMEDIATE non scatta: niente bundle
+    (§6: la fase resta in phases_skipped)."""
+    _patch_offline(monkeypatch)
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g")
+
+    assert state.counts["new"] == 0
+    assert "REMEDIATE" in state.phases_skipped
+    run_dir = next((runs / "g").glob("*/"))
+    assert not (run_dir / "fix").exists(), "nessun finding aperto → nessun bundle"
+
+
+def test_remediate_bundle_under_run_dir_fix(tmp_path: Path, monkeypatch):
+    """Il bundle finisce ESATTAMENTE in runs/<target>/<ts>/fix/ (non altrove) e il
+    migration .sql letterale dell'RLS è presente (artefatto applicabile)."""
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    stub = _StubModule("supabase", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    orch.run("g")
+
+    run_dir = next((runs / "g").glob("*/"))
+    migs = list((run_dir / "fix" / "migrations").glob("*.sql"))
+    assert len(migs) == 1, "migration .sql dell'RLS non scritta nel bundle"
+    assert "ENABLE ROW LEVEL SECURITY" in migs[0].read_text(encoding="utf-8")
+
+
+def test_remediate_resilient_when_baseline_not_in_memory(tmp_path: Path, monkeypatch):
+    """Resilienza (§4.7): se REMEDIATE entra senza una BaselineResult in memoria
+    (es. un --resume con BASELINE già completata e catena scan NON ricostruita), la
+    fase logga e non scrive — NON crasha. Forziamo lo scenario azzerando _result."""
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    stub = _StubModule("supabase", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    # _remediate legge self._result: simuliamo "non disponibile" → no crash, no bundle.
+    orch._cfg = None  # verrà ripopolato da LOAD; qui prepariamo solo il monkeypatch
+    real_remediate = Orchestrator._remediate
+
+    def _remediate_no_result(self):
+        self._result = None
+        return real_remediate(self)
+
+    monkeypatch.setattr(Orchestrator, "_remediate", _remediate_no_result, raising=True)
+    state = orch.run("g")   # NON deve sollevare
+
+    assert "REMEDIATE" in state.phases_completed
+    run_dir = next((runs / "g").glob("*/"))
+    assert not (run_dir / "fix").exists(), "senza BaselineResult non si scrive il bundle"
+
+
+def test_baseline_persiste_counts_subito(tmp_path: Path, monkeypatch):
+    """REGRESSIONE (§6/§24): BASELINE persiste `state.counts` SUBITO (non solo in
+    PERSIST). Così, al `--resume` entrato in REMEDIATE dopo BASELINE ma prima di
+    PERSIST — dove `self._result` è None e `_should_run` ricade su `state.counts` —
+    i counts reali sono già su disco e la precondizione di REMEDIATE è valutata
+    correttamente invece di vedere uno zero-default che salterebbe il bundle."""
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    stub = _StubModule("supabase", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+
+    # Catturiamo lo state subito dopo BASELINE (prima di PERSIST) leggendo state.json.
+    real_persist = Orchestrator._persist
+    captured: dict = {}
+
+    def _spy_persist(self, state):
+        # a questo punto BASELINE è già passata: i counts devono già esserci
+        captured["counts_pre_persist"] = dict(state.counts)
+        return real_persist(self, state)
+
+    monkeypatch.setattr(Orchestrator, "_persist", _spy_persist, raising=True)
+    state = orch.run("g")
+
+    assert captured["counts_pre_persist"].get("new", 0) >= 1, (
+        "BASELINE non ha persistito i counts prima di PERSIST")
+    # e con counts reali, su un resume self._result=None la precondizione REMEDIATE è True
+    orch._result = None
+    orch._no_fix = False
+    assert orch._should_run(orch_mod.Phase.REMEDIATE, state, IntrusionLevel.READ_ONLY) is True
+
+
+def test_remediate_eseguita_al_resume_post_baseline_via_state_counts(tmp_path: Path, monkeypatch):
+    """End-to-end del fix #5: simuliamo un resume entrato in REMEDIATE con
+    `self._result is None` ma `state.counts` reidratati da state.json (popolati ora
+    già in BASELINE): la precondizione passa e — con la catena reidratata — il bundle
+    si genera. Verifichiamo almeno che REMEDIATE non finisca in phases_skipped per
+    counts a zero quando ci sono finding aperti."""
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    stub = _StubModule("supabase", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g")
+    # nella run normale REMEDIATE è completata (finding aperto + counts persistiti)
+    assert "REMEDIATE" in state.phases_completed
+    assert "REMEDIATE" not in state.phases_skipped
+    # i counts su state riflettono il finding aperto: la precondizione resta valida
+    # anche valutata sul solo state.counts (ramo resume con _result=None)
+    orch._result = None
+    orch._no_fix = False
+    assert orch._should_run(orch_mod.Phase.REMEDIATE, state, IntrusionLevel.READ_ONLY) is True

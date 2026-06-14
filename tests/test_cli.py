@@ -72,11 +72,11 @@ def _patch_run(monkeypatch, *, state: RunState | None = None, capture: dict | No
     st = state if state is not None else _state()
 
     def _fake_run(self, target, *, max_intrusion=IntrusionLevel.READ_ONLY,
-                  resume=False, accept_baseline=False):
+                  resume=False, accept_baseline=False, no_fix=False):
         if capture is not None:
             capture.update(
                 target=target, max_intrusion=max_intrusion,
-                resume=resume, accept_baseline=accept_baseline,
+                resume=resume, accept_baseline=accept_baseline, no_fix=no_fix,
             )
         self._run_dir = Path(run_dir)
         if exc is not None:
@@ -131,13 +131,32 @@ def test_scan_prints_summary(monkeypatch):
     assert "report.md" in out
 
 
-def test_scan_m1m2_flags_are_noop_in_m0(monkeypatch):
-    # --no-fix e --i-own-this-its-staging sono accettati (no-op in M0 read-only)
+def test_scan_m2_flag_is_noop_in_m0(monkeypatch):
+    # --i-own-this-its-staging è accettato (no-op in M0/M1 read-only).
     cap: dict = {}
     _patch_run(monkeypatch, capture=cap)
     result = runner.invoke(
-        app, ["scan", "--target", "g", "--no-fix", "--i-own-this-its-staging"])
+        app, ["scan", "--target", "g", "--i-own-this-its-staging"])
     assert result.exit_code == 0, result.output
+
+
+def test_scan_no_fix_is_propagated_to_orchestrator(monkeypatch):
+    # --no-fix non è più un no-op (M1): viene propagato all'orchestratore, che
+    # salta la fase REMEDIATE e non genera il bundle fix/.
+    cap: dict = {}
+    _patch_run(monkeypatch, capture=cap)
+    result = runner.invoke(app, ["scan", "--target", "g", "--no-fix"])
+    assert result.exit_code == 0, result.output
+    assert cap["no_fix"] is True
+
+
+def test_scan_default_no_fix_is_false(monkeypatch):
+    # Senza --no-fix il flag arriva False all'orchestratore (remediation attiva).
+    cap: dict = {}
+    _patch_run(monkeypatch, capture=cap)
+    result = runner.invoke(app, ["scan", "--target", "g"])
+    assert result.exit_code == 0, result.output
+    assert cap["no_fix"] is False
 
 
 # ─── scan: incompatibilità e gate ───────────────────────────────────────────
@@ -256,3 +275,138 @@ def test_list_detectors_lists_service_role(monkeypatch):
     result = runner.invoke(app, ["list-detectors"])
     assert result.exit_code == 0, result.output
     assert "SECRET_SERVICE_ROLE" in result.output
+
+
+# ─── verify (§18-bis.8) ─────────────────────────────────────────────────────
+
+from bastione.baseline.diff import BaselineResult  # noqa: E402
+from bastione.enums import Confidence, Severity, Status  # noqa: E402
+from bastione.models import Finding, Location  # noqa: E402
+
+
+def _vfinding(fid: str, *, rule_id: str, status: Status,
+              severity: Severity = Severity.HIGH) -> Finding:
+    return Finding(
+        finding_id=fid, module="supabase", rule_id=rule_id, title=f"{rule_id}",
+        severity=severity, confidence=Confidence.FIRM, target="g",
+        location=Location(endpoint="/rest/v1/x"), evidence="[REDACTED]",
+        description="d", status=status,
+    )
+
+
+def _patch_verify_run(monkeypatch, *, result: BaselineResult | None = None,
+                      capture: dict | None = None,
+                      run_dir: Path = Path("runs/g/ts"),
+                      exc: Exception | None = None):
+    """Sostituisce Orchestrator.run con un fake che popola self._result (la
+    BaselineResult con gli status per-finding che verify legge) e self._run_dir."""
+    res = result if result is not None else BaselineResult()
+
+    def _fake_run(self, target, *, max_intrusion=IntrusionLevel.READ_ONLY,
+                  resume=False, accept_baseline=False, no_fix=False):
+        if capture is not None:
+            capture.update(target=target, max_intrusion=max_intrusion,
+                           no_fix=no_fix, accept_baseline=accept_baseline)
+        self._run_dir = Path(run_dir)
+        self._result = res
+        if exc is not None:
+            raise exc
+        return _state()
+
+    monkeypatch.setattr(Orchestrator, "run", _fake_run, raising=True)
+
+
+def test_verify_renders_table_with_correct_states(monkeypatch):
+    # Un FIXED, un NEW→new, un KNOWN→still_open (§18-bis.8).
+    result = BaselineResult(
+        findings=[
+            _vfinding("new111", rule_id="MISSING_CSP", status=Status.NEW),
+            _vfinding("known22", rule_id="RLS_DISABLED", status=Status.KNOWN),
+        ],
+        fixed=[_vfinding("fixed33", rule_id="POSTURE_HSTS", status=Status.FIXED)],
+    )
+    _patch_verify_run(monkeypatch, result=result)
+    out = runner.invoke(app, ["verify", "--target", "g"], color=False)
+    assert out.exit_code == 0, out.output
+    text = out.output
+    # gli id compaiono con lo stato mappato
+    assert "new111" in text and "new" in text
+    assert "known22" in text and "still_open" in text
+    assert "fixed33" in text and "FIXED" in text
+
+
+def test_verify_runs_orchestrator_read_only(monkeypatch):
+    cap: dict = {}
+    _patch_verify_run(monkeypatch, capture=cap)
+    out = runner.invoke(app, ["verify", "--target", "g"])
+    assert out.exit_code == 0, out.output
+    assert cap["target"] == "g"
+    # verify è una ri-scansione READ_ONLY del target (§18-bis.8)
+    assert cap["max_intrusion"] == IntrusionLevel.READ_ONLY
+    # verify non genera bundle: --no-fix attivo per una ri-scansione di sola lettura
+    assert cap["no_fix"] is True
+
+
+def test_verify_precondition_denied_maps_to_exit_2(monkeypatch):
+    _patch_verify_run(monkeypatch, exc=PreconditionDenied(
+        "Bastione non opera su 'production'."))
+    out = runner.invoke(app, ["verify", "--target", "g"])
+    assert out.exit_code == 2, out.output
+    assert "Traceback" not in out.output
+
+
+def test_verify_intrusion_denied_maps_to_exit_3(monkeypatch):
+    _patch_verify_run(monkeypatch, exc=IntrusionDenied("Ownership challenge fallito."))
+    out = runner.invoke(app, ["verify", "--target", "g"])
+    assert out.exit_code == 3, out.output
+    assert "Traceback" not in out.output
+
+
+def test_verify_missing_target_maps_to_exit_4(monkeypatch):
+    _patch_verify_run(monkeypatch, exc=FileNotFoundError("targets/g.toml"))
+    out = runner.invoke(app, ["verify", "--target", "g"])
+    assert out.exit_code == 4, out.output
+    assert "Traceback" not in out.output
+
+
+def test_verify_no_findings_is_clean(monkeypatch):
+    # Nessun finding e nessun fixed: tutto a posto, exit 0, niente crash.
+    _patch_verify_run(monkeypatch, result=BaselineResult())
+    out = runner.invoke(app, ["verify", "--target", "g"])
+    assert out.exit_code == 0, out.output
+
+
+def test_verify_segnala_precondizione_baseline_se_solo_new_e_zero_fixed(monkeypatch):
+    """REGRESSIONE (§18-bis.8): nel flusso senza baseline accettata, un finding
+    corretto sparisce e quelli ancora aperti compaiono come `new`, mai FIXED. La
+    verify deve SEGNALARE la precondizione (serve --accept-baseline) invece di lasciar
+    credere che '0 FIXED' significhi 'fix falliti'."""
+    result = BaselineResult(
+        findings=[_vfinding("n1", rule_id="RLS_DISABLED", status=Status.NEW)],
+        fixed=[],
+    )
+    _patch_verify_run(monkeypatch, result=result)
+    out = runner.invoke(app, ["verify", "--target", "g"], color=False)
+    assert out.exit_code == 0, out.output
+    assert "accept-baseline" in out.output
+
+
+def test_verify_non_segnala_precondizione_quando_ci_sono_fixed(monkeypatch):
+    """Se almeno un finding risulta FIXED, il loop sta funzionando: niente nota sulla
+    precondizione (evitiamo rumore quando la baseline è chiaramente stata accettata)."""
+    result = BaselineResult(
+        findings=[_vfinding("n1", rule_id="RLS_DISABLED", status=Status.NEW)],
+        fixed=[_vfinding("f1", rule_id="POSTURE_HSTS", status=Status.FIXED)],
+    )
+    _patch_verify_run(monkeypatch, result=result)
+    out = runner.invoke(app, ["verify", "--target", "g"], color=False)
+    assert out.exit_code == 0, out.output
+    assert "accept-baseline" not in out.output
+
+
+def test_verify_help_documenta_precondizione_accept_baseline():
+    """L'help di `verify` documenta esplicitamente la precondizione del loop: FIXED si
+    misura contro la baseline salvata (serve `scan --accept-baseline` prima)."""
+    out = runner.invoke(app, ["verify", "--help"], color=False)
+    assert out.exit_code == 0, out.output
+    assert "accept-baseline" in out.output

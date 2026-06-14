@@ -15,8 +15,12 @@ from pydantic import ValidationError
 
 from bastione.enums import Confidence, IntrusionLevel, Severity, Status
 from bastione.models import (
+    Applicability,
     Finding,
     Fingerprint,
+    FixEntry,
+    FixPlan,
+    FixType,
     Location,
     LivenessResult,
     ModuleResult,
@@ -27,6 +31,7 @@ from bastione.models import (
     TableExpectation,
     TargetConfig,
     TextAsset,
+    Verification,
 )
 
 
@@ -164,3 +169,86 @@ def test_support_models_construct():
     rsum = RunSummary(target="g", posture_score=80.0, counts={},
                       drift_count=0, report_path="r.html")
     assert rsum.posture_score == 80.0
+
+
+# ─── 18-bis.3 Agent Remediation Bundle — contratti dati (shape LOCKED) ───
+
+def test_fixtype_values_locked():
+    # I valori finiscono in fix-plan.json (contratto versionato): LOCKED.
+    assert FixType.SQL_MIGRATION.value == "sql_migration"
+    assert FixType.CONFIG_CHANGE.value == "config_change"
+    assert FixType.INFRA_CHANGE.value == "infra_change"
+    assert FixType.CODE_CHANGE.value == "code_change"
+    assert FixType.SECRET_ROTATION.value == "secret_rotation"
+
+
+def test_applicability_values_locked():
+    assert Applicability.AGENT.value == "agent"
+    assert Applicability.HUMAN.value == "human"
+    assert Applicability.AGENT_HUMAN.value == "agent+human"
+
+
+def test_verification_defaults_method_rescan():
+    v = Verification(command="bastione verify --target g", expect="abc → FIXED")
+    assert v.method == "bastione-rescan"
+    assert v.command == "bastione verify --target g"
+    assert v.expect == "abc → FIXED"
+
+
+def test_fixentry_defaults_depends_on_empty():
+    fe = FixEntry(
+        finding_id="abc123",
+        rule_id="RLS_DISABLED",
+        severity=Severity.HIGH,
+        title="RLS disabilitata",
+        fix_type=FixType.SQL_MIGRATION,
+        applicable_by=Applicability.AGENT,
+        priority=2,
+        context={"resource": "clienti"},
+        instructions={"migration_sql": "ALTER TABLE ..."},
+        verification=Verification(command="bastione verify --target g", expect="→ FIXED"),
+    )
+    assert fe.depends_on == []
+    assert fe.priority == 2
+    assert fe.fix_type is FixType.SQL_MIGRATION
+
+
+def test_fixplan_schema_version_default():
+    plan = FixPlan(
+        target="g",
+        generated_at=datetime(2026, 1, 1, 12, 0, 0),
+        run_dir="runs/g/2026",
+        summary={"total": 0},
+        fixes=[],
+    )
+    assert plan.schema_version == "bastione-fixplan/1"
+    assert plan.fixes == []
+
+
+def test_fixplan_roundtrip_json_reloadable():
+    # fix-plan.json deve essere serializzabile e ricaricabile in FixPlan.
+    plan = FixPlan(
+        target="g",
+        generated_at=datetime(2026, 1, 1, 12, 0, 0),
+        run_dir="runs/g/2026",
+        summary={"total": 1, "agent_applicable": 1, "human_required": 0},
+        fixes=[
+            FixEntry(
+                finding_id="abc123",
+                rule_id="RLS_DISABLED",
+                severity=Severity.HIGH,
+                title="RLS",
+                fix_type=FixType.SQL_MIGRATION,
+                applicable_by=Applicability.AGENT,
+                priority=2,
+                context={"resource": "clienti"},
+                instructions={"migration_sql": "ALTER TABLE ..."},
+                verification=Verification(command="c", expect="e"),
+            )
+        ],
+    )
+    dumped = plan.model_dump_json()
+    reloaded = FixPlan.model_validate_json(dumped)
+    assert reloaded.schema_version == "bastione-fixplan/1"
+    assert reloaded.fixes[0].fix_type is FixType.SQL_MIGRATION
+    assert reloaded.fixes[0].finding_id == "abc123"

@@ -5,17 +5,19 @@ sull'`Orchestrator` (§6) e ne presenta i risultati con `rich`. Le regole di
 sicurezza restano dove devono stare: il gate (§7, fase LOAD) è l'autorità — la CLI
 non declassa e non aggira (GUARDRAIL LOCKED). In M0 il default è **READ_ONLY**.
 
-Comandi M0 (§25):
+Comandi (§25):
   - `scan`          : esegue una run sull'orchestratore e stampa il sommario;
+  - `verify`        : ri-scansiona (READ_ONLY) e mostra lo stato dei finding (§18-bis.8);
+  - `baseline`      : gestisce la baseline locale del target (§16);
   - `doctor`        : verifica quali tool esterni / lib opzionali sono presenti;
   - `list-modules`  : elenca i moduli registrati (§9);
   - `list-detectors`: elenca i detector di segreti registrati (§10).
 
-Vincoli M0 (LOCKED):
+Vincoli (LOCKED):
   - `--unsafe-show-secrets` è INCOMPATIBILE con `--ci` (un CI non deve mai stampare
     segreti in chiaro): combinazione → errore, exit ≠ 0 (P8/§25);
-  - i flag M1/M2 (`--no-fix` remediation, `--i-own-this-its-staging`) sono
-    ACCETTATI ma in M0 read-only sono **no-op** con una nota (nessuna scrittura);
+  - `--no-fix` (M1) salta la generazione del bundle di remediation `fix/` (§18-bis);
+    `--i-own-this-its-staging` (M2) è ACCETTATO ma resta **no-op** in read-only;
   - `--fail-on` / `--ci`: dopo la run, se ≥1 finding emesso ha severity ≥ soglia →
     exit 1 (gate CI minimale §22); altrimenti 0.
 
@@ -41,7 +43,7 @@ from bastione.baseline.diff import (
     load_baseline,
     save_baseline,
 )
-from bastione.enums import IntrusionLevel, Severity
+from bastione.enums import IntrusionLevel, Severity, Status
 from bastione.gate import IntrusionDenied, PreconditionDenied
 from bastione.orchestrator import (
     DEFAULT_BASELINES_ROOT,
@@ -129,7 +131,8 @@ def scan(
         False, "--unsafe-show-secrets",
         help="Mostra i segreti in chiaro (P8). INCOMPATIBILE con --ci."),
     no_fix: bool = typer.Option(
-        False, "--no-fix", help="[M1] Disabilita la remediation. In M0 è no-op."),
+        False, "--no-fix",
+        help="Disabilita la remediation: salta la generazione del bundle fix/ (§18-bis)."),
     i_own_this_its_staging: bool = typer.Option(
         False, "--i-own-this-its-staging",
         help="[M2] Conferma ownership per scritture su staging. In M0 è no-op."),
@@ -146,9 +149,7 @@ def scan(
             "un'esecuzione CI non deve mai stampare segreti in chiaro (P8/§25).")
         raise typer.Exit(code=2)
 
-    # Flag M1/M2: accettati ma no-op in M0 (read-only). Nota esplicita, non azione.
-    if no_fix:
-        console.print("[dim]nota:[/] --no-fix è un no-op in M0 (remediation arriva a M1).")
+    # Flag M2: accettato ma no-op in M0/M1 (read-only). Nota esplicita, non azione.
     if i_own_this_its_staging:
         console.print(
             "[dim]nota:[/] --i-own-this-its-staging è un no-op in M0 "
@@ -167,6 +168,7 @@ def scan(
             max_intrusion=level,
             resume=resume,
             accept_baseline=accept_baseline,
+            no_fix=no_fix,
         )
     except PreconditionDenied as exc:
         # Precondizione di LOAD non soddisfatta (produzione bloccata o ownership
@@ -523,19 +525,126 @@ def list_detectors() -> None:
     console.print(table)
 
 
-# ─── comandi §25 non ancora in M0 (stub espliciti) ───────────────────────────
+# ─── verify (§18-bis.8) ──────────────────────────────────────────────────────
+
+# Mappa lo status di un finding (post-baseline) sull'etichetta del loop di
+# verifica (§18-bis.8): un fix è chiuso SOLO quando il finding passa a FIXED.
+_VERIFY_LABEL = {
+    Status.FIXED: "FIXED",       # non più riscontrato → il fix ha chiuso il finding
+    Status.NEW: "new",           # comparso ora (non era in baseline): regressione/nuovo
+    Status.KNOWN: "still_open",   # già noto e ANCORA aperto: il fix non ha (ancora) chiuso
+    Status.ACCEPTED: "still_open",  # rumore noto silenziato, ma sempre presente sul target
+}
+
 
 @app.command()
-def verify() -> None:
-    """[M1] Verifica un finding specifico — non disponibile in M0."""
-    err_console.print("[yellow]verify[/]: disponibile a M1 (non implementato in M0).")
-    raise typer.Exit(code=1)
+def verify(
+    target: str = typer.Option(..., "--target", help="Nome del target (config in targets/)."),
+) -> None:
+    """Ri-scansiona il target (READ_ONLY) e mostra lo stato di ogni finding (§18-bis.8).
+
+    Il loop di verifica: un fix è chiuso SOLO quando il finding passa a **FIXED**.
+    La tabella mappa ogni `finding_id` su `{FIXED | still_open | new}` confrontando la
+    ri-scansione con la baseline/ultima run:
+      - presente in baseline ma non più riscontrato → **FIXED** (il fix ha funzionato);
+      - già noto e ancora presente (KNOWN/ACCEPTED) → **still_open** (non ancora chiuso);
+      - comparso ora (non in baseline) → **new** (nuovo/regressione).
+
+    PRECONDIZIONE (importante): lo stato **FIXED** si calcola per differenza contro la
+    BASELINE SALVATA. È quindi raggiungibile SOLO se la baseline è stata accettata
+    PRIMA della remediation, con `bastione scan --target <t> --accept-baseline`: così i
+    finding ancora aperti sono salvati come KNOWN e, una volta corretti, la ri-scansione
+    li riconosce come FIXED. SENZA una baseline accettata, un finding corretto sparisce
+    semplicemente dalla ri-scansione (non era in baseline → non può risultare FIXED) e
+    uno ancora presente compare come `new`, non `still_open`. Il flusso completo del
+    loop è dunque: `scan --accept-baseline` → applica i fix del bundle → `verify`.
+
+    READ_ONLY rispetto al target e senza generare bundle (`--no-fix`): è solo una
+    verifica. Errori gestiti come `scan` (niente stacktrace, §25): precondizione del
+    gate → exit 2, ownership challenge → exit 3, config target assente → exit 4."""
+    orch = Orchestrator()
+    try:
+        orch.run(
+            target,
+            max_intrusion=IntrusionLevel.READ_ONLY,
+            no_fix=True,   # verify è di sola lettura: non rigenera il bundle fix/
+        )
+    except PreconditionDenied as exc:
+        err_console.print(f"[bold red]Precondizione negata dal gate (§7):[/] {exc}")
+        raise typer.Exit(code=2)
+    except IntrusionDenied as exc:
+        err_console.print(f"[bold red]Run negata dal gate (§7):[/] {exc}")
+        raise typer.Exit(code=3)
+    except FileNotFoundError as exc:
+        err_console.print(f"[bold red]Config target non trovata:[/] {exc}")
+        raise typer.Exit(code=4)
+
+    _print_verify_table(target, orch._result)
+
+
+def _print_verify_table(target: str, result) -> None:
+    """Rende la tabella finding_id → stato della verifica (§18-bis.8).
+
+    Legge la `BaselineResult` dell'ultima run: i finding *emessi* (NEW/KNOWN/ACCEPTED)
+    e i `fixed` (in baseline ma non più riscontrati). Ordina i FIXED in fondo: ciò che
+    resta aperto (still_open/new) è ciò su cui agire."""
+    emitted = list(result.findings) if result is not None else []
+    fixed = list(result.fixed) if result is not None else []
+
+    console.print()
+    console.print(f"[bold]Bastione verify[/] — target [cyan]{target}[/] (§18-bis.8)")
+
+    table = Table(title="Stato dei finding", show_header=True, header_style="bold")
+    table.add_column("finding_id")
+    table.add_column("rule_id")
+    table.add_column("severità")
+    table.add_column("stato")
+
+    rows = 0
+    for f in emitted + fixed:
+        label = _VERIFY_LABEL.get(f.status, str(f.status.value))
+        table.add_row(
+            f.finding_id, f.rule_id, f.severity.name.lower(), label)
+        rows += 1
+
+    if rows == 0:
+        console.print("[green]Nessun finding[/]: il target risulta pulito in questa "
+                      "ri-scansione (§18-bis.8).")
+        return
+
+    console.print(table)
+
+    open_count = sum(1 for f in emitted if f.status in (Status.NEW, Status.KNOWN))
+    new_count = sum(1 for f in emitted if f.status is Status.NEW)
+    fixed_count = len(fixed)
+    console.print(
+        f"Riepilogo: [bold]{fixed_count}[/] FIXED, [bold]{open_count}[/] ancora aperti. "
+        f"Un fix è chiuso solo quando il finding risulta [bold]FIXED[/].")
+
+    # Precondizione del loop (§18-bis.8): FIXED si calcola per differenza contro la
+    # BASELINE SALVATA. Se NON c'è alcun FIXED ma ci sono finding `new`, è il sintomo
+    # tipico di una baseline mai accettata: un finding corretto sparirebbe dalla
+    # ri-scansione invece di risultare FIXED, e uno ancora presente compare come `new`.
+    # Lo segnaliamo per non far credere all'utente che "0 FIXED" significhi "fix
+    # falliti" quando in realtà la baseline non è stata accettata prima della
+    # remediation.
+    if fixed_count == 0 and new_count > 0:
+        console.print(
+            "[yellow]Nota:[/] nessun finding risulta FIXED e alcuni sono [bold]new[/]. "
+            "Lo stato FIXED si misura contro la baseline SALVATA: se non hai accettato "
+            "la baseline PRIMA della remediation "
+            "([italic]scan --accept-baseline[/]), un finding corretto sparisce dalla "
+            "ri-scansione invece di risultare FIXED. Flusso del loop: "
+            "[italic]scan --accept-baseline[/] → applica i fix → [italic]verify[/].")
 
 
 @app.command()
 def fix() -> None:
-    """[M1] Applica una remediation — non disponibile in M0."""
-    err_console.print("[yellow]fix[/]: disponibile a M1 (non implementato in M0).")
+    """[M1] Applica una remediation — il bundle fix/ è generato da `scan` (§18-bis)."""
+    err_console.print(
+        "[yellow]fix[/]: l'applicazione automatica non è ancora disponibile. Il "
+        "bundle di remediation è generato da [bold]scan[/] in runs/<target>/<ts>/fix/ "
+        "ed è destinato a un agente di coding (§18-bis).")
     raise typer.Exit(code=1)
 
 
