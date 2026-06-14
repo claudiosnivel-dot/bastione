@@ -266,6 +266,29 @@ def test_scan_ownership_challenge_denied_maps_to_exit_3(monkeypatch):
     assert "Traceback" not in result.output
 
 
+def test_scan_missing_target_maps_to_exit_4(monkeypatch):
+    # §22 (LOCKED): config target assente → exit 4 (errore esecuzione/interno).
+    _patch_run(monkeypatch, exc=FileNotFoundError("targets/g.toml"))
+    result = runner.invoke(app, ["scan", "--target", "g"])
+    assert result.exit_code == 4, result.output
+    assert "Traceback" not in result.output
+
+
+def test_scan_unexpected_internal_error_maps_to_exit_4_no_traceback(monkeypatch):
+    # §22/§25 (LOCKED): un'eccezione INATTESA durante la run (bug interno, tool
+    # esterno esploso) NON deve mostrare uno stacktrace all'utente — messaggio
+    # chiaro + exit 4 (errore esecuzione tool/interno). Il catch-all è l'ULTIMO
+    # ramo, dopo Precondition/Intrusion/FileNotFound, così non scavalca i mapping
+    # specifici 2/3/4-config.
+    _patch_run(monkeypatch, exc=RuntimeError("crash inatteso nel motore"))
+    result = runner.invoke(app, ["scan", "--target", "g"])
+    assert result.exit_code == 4, result.output
+    # niente stacktrace in faccia all'utente (§25)
+    assert "Traceback" not in result.output
+    # messaggio chiaro presente; l'eccezione non risale come crash non gestito
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
 # ─── --fail-on / --ci (gate CI minimale §22) ────────────────────────────────
 
 def test_scan_fail_on_high_with_high_finding_exits_1(monkeypatch):
@@ -433,6 +456,16 @@ def test_verify_missing_target_maps_to_exit_4(monkeypatch):
     assert "Traceback" not in out.output
 
 
+def test_verify_unexpected_internal_error_maps_to_exit_4_no_traceback(monkeypatch):
+    # §22/§25 (LOCKED): un'eccezione INATTESA in `verify` → exit 4, niente
+    # stacktrace (catch-all finale, come per `scan`).
+    _patch_verify_run(monkeypatch, exc=RuntimeError("crash inatteso in verify"))
+    out = runner.invoke(app, ["verify", "--target", "g"])
+    assert out.exit_code == 4, out.output
+    assert "Traceback" not in out.output
+    assert out.exception is None or isinstance(out.exception, SystemExit)
+
+
 def test_verify_no_findings_is_clean(monkeypatch):
     # Nessun finding e nessun fixed: tutto a posto, exit 0, niente crash.
     _patch_verify_run(monkeypatch, result=BaselineResult())
@@ -474,3 +507,129 @@ def test_verify_help_documenta_precondizione_accept_baseline():
     out = runner.invoke(app, ["verify", "--help"], color=False)
     assert out.exit_code == 0, out.output
     assert "accept-baseline" in out.output
+
+
+# ─── scan-all (portfolio mode §21) ──────────────────────────────────────────
+
+from bastione.portfolio import PortfolioConfig, PortfolioRow  # noqa: E402
+
+
+def test_scan_all_invokes_run_portfolio(monkeypatch, tmp_path):
+    # `scan-all` carica il portfolio e chiama run_portfolio; stampa la tabella e
+    # NON esplode. Monkeypatchiamo load_portfolio + run_portfolio (offline).
+    p = tmp_path / "portfolio.toml"
+    p.write_text('targets = ["gestionale", "numely"]\n', encoding="utf-8")
+
+    cap: dict = {}
+
+    def _fake_load(path):
+        cap["load_path"] = str(path)
+        return PortfolioConfig(targets=["gestionale", "numely"], defaults={})
+
+    def _fake_run(config, **kwargs):
+        cap["config"] = config
+        cap["kwargs"] = kwargs
+        rows = [
+            PortfolioRow(target="gestionale", score=73.5, critical_open=1, drift=0,
+                         new=2, known=0, fixed=0),
+            PortfolioRow(target="numely", score=91.0, critical_open=0, drift=2,
+                         new=0, known=1, fixed=0),
+        ]
+        return ("# Portfolio report\n", rows)
+
+    monkeypatch.setattr(cli_mod, "load_portfolio", _fake_load)
+    monkeypatch.setattr(cli_mod, "run_portfolio", _fake_run)
+
+    result = runner.invoke(app, ["scan-all", "--portfolio", str(p)], color=False)
+    assert result.exit_code == 0, result.output
+    # ha caricato il portfolio dal path passato e invocato run_portfolio.
+    assert cap["load_path"] == str(p)
+    assert cap["config"].targets == ["gestionale", "numely"]
+    # la tabella di postura del portfolio è stampata (score/#CRITICAL/#DRIFT visibili).
+    out = result.output
+    assert "gestionale" in out and "numely" in out
+    assert "73" in out and "91" in out
+
+
+def test_scan_all_default_portfolio_path(monkeypatch):
+    # Senza --portfolio il default è "portfolio.toml".
+    cap: dict = {}
+
+    def _fake_load(path):
+        cap["load_path"] = str(path)
+        return PortfolioConfig(targets=[], defaults={})
+
+    monkeypatch.setattr(cli_mod, "load_portfolio", _fake_load)
+    monkeypatch.setattr(
+        cli_mod, "run_portfolio",
+        lambda config, **kw: ("# vuoto\n", []))
+
+    result = runner.invoke(app, ["scan-all"], color=False)
+    assert result.exit_code == 0, result.output
+    assert cap["load_path"] == "portfolio.toml"
+
+
+def test_scan_all_missing_portfolio_is_clean_error(monkeypatch):
+    # --portfolio inesistente → errore chiaro (niente stacktrace), exit != 0.
+    def _fake_load(path):
+        raise FileNotFoundError(f"Portfolio non trovato: '{path}'.")
+
+    monkeypatch.setattr(cli_mod, "load_portfolio", _fake_load)
+
+    result = runner.invoke(
+        app, ["scan-all", "--portfolio", "non-esiste.toml"], color=False)
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    # messaggio chiaro che cita il portfolio mancante.
+    assert "portfolio" in result.output.lower() or "non trovato" in result.output.lower()
+
+
+def test_scan_all_reads_only_does_not_construct_real_orchestrator(monkeypatch):
+    # GUARDRAIL: scan-all passa una factory a run_portfolio; verifichiamo che la
+    # factory costruisca un Orchestrator (non lo invoca qui — run_portfolio è fake).
+    captured: dict = {}
+
+    monkeypatch.setattr(
+        cli_mod, "load_portfolio",
+        lambda path: PortfolioConfig(targets=["a"], defaults={}))
+
+    def _fake_run(config, *, orch_factory, **kwargs):
+        captured["factory"] = orch_factory
+        captured["kwargs"] = kwargs
+        # invochiamo la factory per assicurarci che produca un orchestratore valido
+        orch = orch_factory()
+        captured["orch"] = orch
+        return ("# report\n", [])
+
+    monkeypatch.setattr(cli_mod, "run_portfolio", _fake_run)
+
+    result = runner.invoke(app, ["scan-all"], color=False)
+    assert result.exit_code == 0, result.output
+    # la factory ha prodotto un Orchestrator (duck typing su .run).
+    assert hasattr(captured["orch"], "run")
+    # scan-all chiede a run_portfolio di scrivere il report consolidato.
+    assert captured["kwargs"].get("write") is True
+
+
+def test_scan_all_error_rows_are_shown(monkeypatch):
+    # Una riga d'errore nel portfolio viene mostrata nella tabella (resilienza §21).
+    monkeypatch.setattr(
+        cli_mod, "load_portfolio",
+        lambda path: PortfolioConfig(targets=["ok", "bad"], defaults={}))
+
+    def _fake_run(config, **kwargs):
+        rows = [
+            PortfolioRow(target="ok", score=88.0, critical_open=0, drift=0,
+                         new=0, known=0, fixed=0),
+            PortfolioRow.error_row("bad", "errore interno: boom"),
+        ]
+        return ("# report\n", rows)
+
+    monkeypatch.setattr(cli_mod, "run_portfolio", _fake_run)
+
+    result = runner.invoke(app, ["scan-all"], color=False)
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "bad" in out
+    # la riga d'errore è visibile come tale.
+    assert "error" in out.lower() or "errore" in out.lower()

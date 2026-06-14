@@ -1,0 +1,29 @@
+# portfolio.toml — Portfolio mode (§21)
+#
+# Elenca le tue app: `bastione scan-all` scansiona OGNI target (READ_ONLY di
+# default, riusando la pipeline di `scan`), raccoglie per ogni app score /
+# #CRITICAL aperti / #DRIFT e produce un REPORT CONSOLIDATO con la tabella di
+# postura del portfolio. Una sola occhiata per sapere quale app ha bisogno di
+# attenzione.
+#
+# Ogni nome in `targets` deve avere la sua config in targets/<nome>.toml (o
+# targets/<nome>.local.toml, §6 LOAD). Ogni target passa comunque dal gate (§7):
+# il portfolio non declassa e non aggira nulla. Un target che fallisce (config
+# assente, gate denial, errore) diventa una riga d'errore nella tabella e NON
+# interrompe gli altri (resiliente).
+
+# ─── Target del portfolio ───────────────────────────────────────────────────
+# Aggiungi qui i nomi delle app da scansionare (uno per ogni config in targets/).
+targets = ["gestionale", "numely", "chirsan"]
+
+# ─── Default applicati a ogni target ────────────────────────────────────────
+[defaults]
+# Tetto di intrusione del portfolio: "read-only" | "probe" | "mutating".
+# Default e raccomandato: "read-only" (nessuna scrittura sul target). Alzarlo
+# resta sotto l'autorità del gate (§7): per > read-only serve comunque
+# l'ownership challenge superato, e "mutating" richiede staging+ownership.
+max_intrusion = "read-only"
+
+# Canale di notifica suggerito per le app del portfolio (informativo a questo
+# livello: la notifica vera resta per-target, §19, dalla config del singolo target).
+notify_channel = "telegram"

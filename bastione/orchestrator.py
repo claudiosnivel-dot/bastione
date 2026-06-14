@@ -410,9 +410,12 @@ class Orchestrator:
 
     def _scan(self, state: RunState) -> None:
         """Esegue i moduli del piano in PARALLELO (ThreadPoolExecutor, O04 —
-        read-only). Ogni module.run gira in try/except: un'eccezione NON propaga,
-        viene loggata e tradotta in un meta-finding MODULE_ERROR (INFO, §6). Così
-        un modulo che fallisce non interrompe gli altri (resilienza)."""
+        read-only). Ogni module.run gira in try/except (vedi `_run_module`): una
+        eccezione GENERICA NON propaga, viene loggata e tradotta in un meta-finding
+        MODULE_ERROR (INFO, §6) — un modulo che fallisce non interrompe gli altri
+        (resilienza). ECCEZIONE alla resilienza: una `IntrusionDenied` del gate
+        (§7/§22) NON viene declassata: `_run_module` la rilancia, `future.result()`
+        la ripropaga qui e ABORTA la run (il gate aborta, non declassa)."""
         assert self._cfg is not None
         self._raw_findings = []
         self._raw_posture = []
@@ -439,19 +442,41 @@ class Orchestrator:
             futures = {pool.submit(self._run_module, module, ctx): module
                        for module in self._plan}
             for future, module in futures.items():
-                findings, posture = future.result()  # _run_module non rilancia mai
+                # _run_module rilancia SOLO le negazioni del gate (IntrusionDenied):
+                # qui propagano e abortiscono la run (§7/§22). Ogni altra eccezione è
+                # già stata declassata a MODULE_ERROR dentro _run_module.
+                findings, posture = future.result()
                 self._raw_findings.extend(findings)
                 self._raw_posture.extend(posture)
 
     def _run_module(self, module, ctx: RunContext) -> ModuleResult:
-        """Esegue un singolo modulo in modo resiliente (§6). Eccezione → meta-finding
-        MODULE_ERROR (INFO) invece di propagare. Mai un crash dal modulo."""
+        """Esegue un singolo modulo in modo resiliente (§6) — MA il gate aborta,
+        non declassa (§7/§22 LOCKED).
+
+        Ordine dei catch (cruciale):
+        1. `IntrusionDenied` (e la sua sottoclasse `PreconditionDenied`) NON va
+           declassata a MODULE_ERROR: una negazione del gate — es. il canary
+           §11.2 che chiama `authorize(MUTATING, ctx)` su un target non staging,
+           o ownership non superata — DEVE abortire la run. La RILANCIAMO: propaga
+           da qui → `future.result()` in `_scan` → `run()`, che salva lo stato e
+           la ripropaga, e la CLI la mappa all'exit code §22 (2/3). Declassarla a
+           MODULE_ERROR INFO violerebbe "il gate aborta, non declassa" e la tabella
+           exit-code LOCKED.
+        2. ogni ALTRA `Exception` → meta-finding MODULE_ERROR (INFO): resilienza,
+           il modulo che esplode non interrompe gli altri. Mai un crash generico
+           dal modulo."""
         try:
             result = module.run(ctx)
             return ModuleResult(
                 findings=list(result.findings),
                 posture_checks=list(result.posture_checks),
             )
+        except IntrusionDenied:
+            # Il gate aborta, non declassa (§7/§22): NON un MODULE_ERROR — propaga.
+            # PreconditionDenied è sottoclasse di IntrusionDenied → coperta qui.
+            log.error("SCAN: modulo %r negato dal gate — la run ABORTA (§7/§22)",
+                      getattr(module, "name", "?"), exc_info=True)
+            raise
         except Exception as err:  # noqa: BLE001 — resilienza (§6): isola il fallimento
             log.warning("SCAN: modulo %r ha sollevato — MODULE_ERROR emesso (§6)",
                         getattr(module, "name", "?"), exc_info=True)

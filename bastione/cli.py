@@ -49,10 +49,17 @@ from bastione.enums import IntrusionLevel, Severity, Status
 from bastione.gate import IntrusionDenied, PreconditionDenied
 from bastione.orchestrator import (
     DEFAULT_BASELINES_ROOT,
+    DEFAULT_RUNS_ROOT,
     REPORT_FILENAME,
     SARIF_FILENAME,
     Orchestrator,
     _ensure_modules_loaded,
+)
+from bastione.portfolio import (
+    DEFAULT_PORTFOLIO_FILE,
+    PortfolioRow,
+    load_portfolio,
+    run_portfolio,
 )
 from bastione.state import RunState
 
@@ -219,6 +226,17 @@ def scan(
     except FileNotFoundError as exc:
         # Config target assente (§6 LOAD): errore chiaro, non uno stacktrace.
         err_console.print(f"[bold red]Config target non trovata:[/] {exc}")
+        raise typer.Exit(code=4)
+    except Exception as exc:  # noqa: BLE001 — catch-all §22/§25 (LOCKED)
+        # Catch-all FINALE (dopo Precondition/Intrusion/FileNotFound): ogni altra
+        # eccezione inattesa (bug interno, tool esterno esploso) è per §22 un
+        # "errore esecuzione tool/interno" → exit 4. Messaggio chiaro, MAI uno
+        # stacktrace in faccia all'utente (§25). DEVE restare l'ultimo ramo: i
+        # mapping specifici 2/3/4-config lo precedono e non vanno scavalcati.
+        err_console.print(
+            f"[bold red]Errore interno durante la run:[/] {exc}\n"
+            "La run è stata interrotta da un errore inatteso (tool esterno o bug "
+            "interno). Riprova con --resume; se persiste, apri un'issue (§22/§25).")
         raise typer.Exit(code=4)
 
     _print_summary(state, orch._run_dir)
@@ -612,6 +630,15 @@ def verify(
     except FileNotFoundError as exc:
         err_console.print(f"[bold red]Config target non trovata:[/] {exc}")
         raise typer.Exit(code=4)
+    except Exception as exc:  # noqa: BLE001 — catch-all §22/§25 (LOCKED)
+        # Stesso catch-all finale di `scan` (§22): un'eccezione inattesa → exit 4,
+        # messaggio chiaro, niente stacktrace (§25). Ultimo ramo, dopo i mapping
+        # specifici 2/3/4-config.
+        err_console.print(
+            f"[bold red]Errore interno durante la verifica:[/] {exc}\n"
+            "La ri-scansione è stata interrotta da un errore inatteso (tool esterno "
+            "o bug interno). Se persiste, apri un'issue (§22/§25).")
+        raise typer.Exit(code=4)
 
     _print_verify_table(target, orch._result)
 
@@ -670,6 +697,100 @@ def _print_verify_table(target: str, result) -> None:
             "([italic]scan --accept-baseline[/]), un finding corretto sparisce dalla "
             "ri-scansione invece di risultare FIXED. Flusso del loop: "
             "[italic]scan --accept-baseline[/] → applica i fix → [italic]verify[/].")
+
+
+# ─── scan-all (portfolio mode §21) ───────────────────────────────────────────
+
+@app.command("scan-all")
+def scan_all(
+    portfolio: Path = typer.Option(
+        DEFAULT_PORTFOLIO_FILE, "--portfolio",
+        help="File del portfolio (default portfolio.toml): lista target + [defaults] (§21)."),
+) -> None:
+    """Esegue OGNI target del portfolio e stampa la tabella di postura (§21).
+
+    Portfolio mode: `portfolio.toml` elenca le tue app; `scan-all` le scansiona
+    tutte (READ_ONLY di default, riusando la pipeline di `scan`), raccoglie per ogni
+    app score / #CRITICAL aperti / #DRIFT e scrive un REPORT CONSOLIDATO. Stampa qui
+    la **tabella di postura del portfolio**: una sola occhiata per sapere quale app
+    ha bisogno di attenzione.
+
+    READ_ONLY e rispettoso dei guardrail: ogni target passa comunque dal gate (§7)
+    in fase LOAD, esattamente come una `scan` singola — il portfolio non declassa e
+    non aggira nulla. RESILIENTE: un target che fallisce (config assente, gate
+    denial, errore) diventa una riga d'errore nella tabella e NON interrompe gli
+    altri (§21). Niente stacktrace in faccia all'utente (§25)."""
+    try:
+        config = load_portfolio(portfolio)
+    except FileNotFoundError as exc:
+        # Portfolio assente: errore chiaro (niente stacktrace, §25), exit ≠ 0.
+        err_console.print(f"[bold red]Portfolio non trovato:[/] {exc}")
+        raise typer.Exit(code=4)
+
+    # Factory dell'orchestratore (§21): un closure che costruisce un `Orchestrator`
+    # con i path standard. run_portfolio lo invoca per OGNI target — la costruzione
+    # è qui (la CLI) così la pipeline reale resta cablata, ma run_portfolio è
+    # testabile con un fake offline iniettato al suo posto.
+    def _orch_factory() -> Orchestrator:
+        return Orchestrator()
+
+    report, rows = run_portfolio(
+        config,
+        orch_factory=_orch_factory,
+        runs_root=DEFAULT_RUNS_ROOT,
+        baselines_root=DEFAULT_BASELINES_ROOT,
+        write=True,   # scrive il report consolidato sotto runs/<ts>/portfolio-report.md
+    )
+
+    _print_portfolio_table(rows)
+
+
+def _print_portfolio_table(rows: list[PortfolioRow]) -> None:
+    """Stampa la tabella di postura del portfolio (§21): per ogni app score,
+    #CRITICAL aperti e #DRIFT. Le righe d'errore (target falliti) sono rese in
+    modo visibile, così non passano inosservate (resilienza §21)."""
+    console.print()
+    console.print("[bold]Bastione[/] — tabella di postura del portfolio (§21)")
+
+    if not rows:
+        console.print("[yellow]Portfolio vuoto:[/] nessun target in portfolio.toml.")
+        return
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("app")
+    table.add_column("score", justify="right")
+    table.add_column("#CRITICAL aperti", justify="right")
+    table.add_column("#DRIFT", justify="right")
+    table.add_column("NEW", justify="right")
+    table.add_column("KNOWN", justify="right")
+    table.add_column("FIXED", justify="right")
+    table.add_column("stato")
+
+    for r in rows:
+        if r.error is not None:
+            # Riga d'errore: numeri non disponibili, messaggio nello stato.
+            table.add_row(
+                r.target, "—", "—", "—", "—", "—", "—",
+                f"[red]error:[/] {r.error}")
+        else:
+            score = f"{r.score:.1f}" if r.score is not None else "—"
+            # Evidenzia in rosso le righe con CRITICAL aperti o DRIFT: sono le app
+            # su cui agire per prime (§21).
+            warn = (r.critical_open or 0) > 0 or (r.drift or 0) > 0
+            stato = "[red]attenzione[/]" if warn else "[green]ok[/]"
+            table.add_row(
+                r.target, score, str(r.critical_open), str(r.drift),
+                str(r.new), str(r.known), str(r.fixed), stato)
+
+    console.print(table)
+
+    n_error = sum(1 for r in rows if r.error is not None)
+    n_crit = sum(1 for r in rows if r.error is None and (r.critical_open or 0) > 0)
+    n_drift = sum(1 for r in rows if r.error is None and (r.drift or 0) > 0)
+    console.print(
+        f"Riepilogo: [bold]{len(rows)}[/] app "
+        f"({len(rows) - n_error} scansionate, {n_error} in errore), "
+        f"[bold]{n_crit}[/] con CRITICAL aperti, [bold]{n_drift}[/] con DRIFT.")
 
 
 @app.command()

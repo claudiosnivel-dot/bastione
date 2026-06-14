@@ -21,7 +21,7 @@ import pytest
 
 import bastione.orchestrator as orch_mod
 from bastione.enums import IntrusionLevel, Severity
-from bastione.gate import IntrusionDenied
+from bastione.gate import IntrusionDenied, PreconditionDenied
 from bastione.models import (
     Finding,
     Fingerprint,
@@ -97,20 +97,26 @@ def _patch_offline(monkeypatch, *, fingerprint=None, plan_modules=None):
 
 class _StubModule:
     """Modulo finto per i test: ritorna findings/posture predefiniti, oppure
-    solleva un'eccezione (per testare la resilienza/MODULE_ERROR)."""
+    solleva un'eccezione (per testare la resilienza/MODULE_ERROR). `raises`, se
+    dato, è l'eccezione *istanza* sollevata da run() — usato per distinguere
+    un'eccezione generica (→ MODULE_ERROR INFO) da una del gate (IntrusionDenied,
+    che deve abortire la run, NON essere declassata, §7/§22)."""
 
     max_intrusion = IntrusionLevel.READ_ONLY
 
-    def __init__(self, name, *, findings=None, posture=None, boom=False):
+    def __init__(self, name, *, findings=None, posture=None, boom=False, raises=None):
         self.name = name
         self._findings = findings or []
         self._posture = posture or []
         self._boom = boom
+        self._raises = raises
 
     def should_run(self, fp, cfg):
         return True
 
     def run(self, ctx):
+        if self._raises is not None:
+            raise self._raises
         if self._boom:
             raise RuntimeError(f"boom da {self.name}")
         return ModuleResult(findings=list(self._findings),
@@ -435,6 +441,73 @@ def test_module_error_does_not_crash_others_and_emits_meta_finding(tmp_path: Pat
     assert "SECRET_KEY" in rule_ids
     # il modulo fallito ha prodotto il meta-finding MODULE_ERROR
     assert "MODULE_ERROR" in rule_ids
+
+
+# ─── M2 step 4a: il gate ABORTA, non declassa (§7/§22) ───────────────────────
+
+def test_module_raising_intrusion_denied_aborts_run_not_module_error(tmp_path: Path, monkeypatch):
+    """HARDENING (§7/§22 LOCKED): un modulo che solleva IntrusionDenied dal gate
+    (es. il canary §11.2 negato) NON va declassato a MODULE_ERROR INFO — DEVE
+    abortire la run (il gate aborta, non declassa). L'eccezione propaga da
+    _run_module → future.result() → _scan → run(), che la rilancia salvando lo
+    stato per la ripartibilità. La CLI la mapperà poi all'exit code §22."""
+    bad = _StubModule("supabase", raises=IntrusionDenied(
+        "Canary write negato dal gate (§7): MUTATING consentito solo su staging"))
+    _patch_offline(monkeypatch, plan_modules=[bad])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    # la run NON deve completare con un MODULE_ERROR: deve PROPAGARE l'IntrusionDenied
+    with pytest.raises(IntrusionDenied, match="[Cc]anary"):
+        orch.run("g")
+
+    # lo stato è stato salvato (ripartibilità §6/§24): SCAN non risulta completata,
+    # la run è stata abortita lì.
+    run_dir = next((runs / "g").glob("*/"))
+    state = RunState.load(run_dir / "state.json")
+    assert "SCAN" not in state.phases_completed
+    # NESSUN report con MODULE_ERROR: la run non è arrivata a REPORT.
+    assert not (run_dir / "bastione.sarif").exists()
+
+
+def test_module_raising_precondition_denied_also_aborts_run(tmp_path: Path, monkeypatch):
+    """PreconditionDenied è sottoclasse di IntrusionDenied: catturare IntrusionDenied
+    in _run_module copre entrambe. Anche una PreconditionDenied sollevata da un
+    modulo in SCAN deve abortire la run (non declassare a MODULE_ERROR)."""
+    bad = _StubModule("supabase", raises=PreconditionDenied(
+        "Precondizione del gate negata durante SCAN"))
+    _patch_offline(monkeypatch, plan_modules=[bad])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    with pytest.raises(IntrusionDenied):
+        orch.run("g")
+
+
+def test_module_raising_generic_exception_still_becomes_module_error(tmp_path: Path, monkeypatch):
+    """CONTROPARTITA (resilienza §6): un'eccezione GENERICA (ValueError) resta
+    declassata a MODULE_ERROR INFO e NON aborta la run — solo le eccezioni del gate
+    abortiscono. Garantisce che l'hardening 4a non rompa la resilienza esistente."""
+    bad = _StubModule("supabase", raises=ValueError("errore interno del modulo"))
+    good = _StubModule(
+        "secrets",
+        findings=[_finding(module="secrets", rule_id="SECRET_KEY", endpoint="/app.js")])
+    _patch_offline(monkeypatch, plan_modules=[bad, good])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g")   # NON deve sollevare: la ValueError è declassata
+
+    assert "SCAN" in state.phases_completed
+    assert "PERSIST" in state.phases_completed
+    run_dir = next((runs / "g").glob("*/"))
+    sarif = json.loads((run_dir / "bastione.sarif").read_text(encoding="utf-8"))
+    rule_ids = {r["id"] for r in sarif["runs"][0]["tool"]["driver"]["rules"]}
+    assert "MODULE_ERROR" in rule_ids   # la ValueError è stata declassata
+    assert "SECRET_KEY" in rule_ids     # il modulo buono ha prodotto il suo finding
 
 
 def test_service_role_hidden_posture_added_in_normalize(tmp_path: Path, monkeypatch):
