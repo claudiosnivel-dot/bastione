@@ -22,12 +22,19 @@ Sezioni del documento:
 from __future__ import annotations
 
 import logging
-from textwrap import indent
+from typing import Callable
 
 from bastione.enums import Severity, Status
 from bastione.models import Finding, PostureCheck
+from bastione.remediation import playbooks
 
 log = logging.getLogger("bastione.report")
+
+# Tipo del seam iniettabile (§18): (rule_id, context) -> playbook Markdown | None.
+# Iniettarlo invece di importarlo "rigido" rende il render testabile in isolamento
+# (i test passano una fake deterministica) e mantiene l'I/O dei template DENTRO
+# remediation/playbooks.py — markdown.py si limita a chiamarlo.
+PlaybookRenderer = Callable[[str | None, dict], "str | None"]
 
 # Icone per la checklist posture (§23).
 _ICONA_PASSED = "✅"
@@ -43,6 +50,7 @@ def to_markdown(
     fixed: list[Finding],
     posture_checks: list[PostureCheck],
     counts: dict,
+    render_playbook: PlaybookRenderer = playbooks.render_playbook,
 ) -> str:
     """Genera il report Markdown di una scan (§23).
 
@@ -53,6 +61,10 @@ def to_markdown(
         fixed           — Finding risolti rispetto alla baseline (status FIXED).
         posture_checks  — PostureCheck con eventuale drift valorizzato.
         counts          — Shape §24: new/known/fixed/drift + by_severity.
+        render_playbook — Seam iniettabile (§18): dato un `rule_id`/`check_id` e un
+                          context, ritorna il playbook Markdown renderizzato o `None`.
+                          Default: il motore reale (`remediation.playbooks`). I test
+                          passano una fake deterministica.
 
     Ritorna:
         Stringa Markdown UTF-8 pronta per essere scritta su file o inviata.
@@ -66,14 +78,14 @@ def to_markdown(
     new_findings = [f for f in findings if f.status is Status.NEW]
     drift_checks = [c for c in posture_checks if c.drift]
 
-    sezioni.append(_sezione_new(new_findings, drift_checks))
+    sezioni.append(_sezione_new(new_findings, drift_checks, render_playbook))
 
     # ── 3. KNOWN (finding già noti: known + accepted) ─────────────────────────
     known_findings = [
         f for f in findings
         if f.status in (Status.KNOWN, Status.ACCEPTED)
     ]
-    sezioni.append(_sezione_known(known_findings))
+    sezioni.append(_sezione_known(known_findings, render_playbook))
 
     # ── 4. FIXED (vittorie — risolti rispetto alla baseline) ──────────────────
     sezioni.append(_sezione_fixed(fixed))
@@ -117,6 +129,7 @@ def _intestazione(target: str, posture_score: float, counts: dict) -> str:
 def _sezione_new(
     new_findings: list[Finding],
     drift_checks: list[PostureCheck],
+    render_playbook: PlaybookRenderer,
 ) -> str:
     """Sezione NEW e DRIFT — gli eventi che richiedono attenzione immediata (P7)."""
     blocchi: list[str] = ["## NEW & DRIFT — Attenzione immediata"]
@@ -128,19 +141,22 @@ def _sezione_new(
     if new_findings:
         blocchi.append("### Finding NEW")
         for f in new_findings:
-            blocchi.append(_render_finding(f))
+            blocchi.append(_render_finding(f, render_playbook))
 
     if drift_checks:
         blocchi.append("### Drift postura")
         for c in drift_checks:
-            blocchi.append(_render_posture_drift(c))
+            blocchi.append(_render_posture_drift(c, render_playbook))
 
     return "\n\n".join(blocchi)
 
 
 # ─── Sezione KNOWN ────────────────────────────────────────────────────────────
 
-def _sezione_known(known_findings: list[Finding]) -> str:
+def _sezione_known(
+    known_findings: list[Finding],
+    render_playbook: PlaybookRenderer,
+) -> str:
     """Sezione KNOWN — finding già noti (known o accepted), monitorati."""
     blocchi: list[str] = ["## KNOWN — Finding già noti"]
 
@@ -149,7 +165,7 @@ def _sezione_known(known_findings: list[Finding]) -> str:
         return "\n\n".join(blocchi)
 
     for f in known_findings:
-        blocchi.append(_render_finding(f))
+        blocchi.append(_render_finding(f, render_playbook))
 
     return "\n\n".join(blocchi)
 
@@ -165,9 +181,17 @@ def _sezione_fixed(fixed: list[Finding]) -> str:
         return "\n\n".join(blocchi)
 
     for f in fixed:
-        blocchi.append(_render_finding(f))
+        # Un finding FIXED è già risolto: iniettare il "come ripararlo" sarebbe
+        # rumore. Passiamo un renderer no-op → resta solo il riferimento testuale.
+        blocchi.append(_render_finding(f, _no_playbook))
 
     return "\n\n".join(blocchi)
+
+
+def _no_playbook(rule_id: str | None, context: dict) -> None:
+    """Renderer no-op (§18): per le sezioni dove il playbook non va iniettato
+    (es. FIXED, già risolti)."""
+    return None
 
 
 # ─── Checklist posture ────────────────────────────────────────────────────────
@@ -199,8 +223,12 @@ def _checklist_posture(posture_checks: list[PostureCheck]) -> str:
 
 # ─── Render di un singolo Finding ─────────────────────────────────────────────
 
-def _render_finding(f: Finding) -> str:
+def _render_finding(f: Finding, render_playbook: PlaybookRenderer) -> str:
     """Rappresentazione Markdown di un Finding (§23).
+
+    Se esiste un template per il `remediation_ref` del finding, il playbook
+    RENDERIZZATO viene iniettato sotto al finding (§18); altrimenti resta il
+    fallback testuale "**Playbook:** `<ref>`".
 
     GUARDRAIL: l'evidence viene mostrata esattamente così com'è — già redatta a
     monte. Questo renderer NON de-redatta né trasforma il valore (P8 — §23).
@@ -214,13 +242,16 @@ def _render_finding(f: Finding) -> str:
         else "_Nessun playbook associato._"
     )
 
-    return (
+    blocco = (
         f"#### [{sev}] {f.title} ({stato})\n\n"
         f"- **ID:** `{f.finding_id}`\n"
         f"- **Modulo:** {f.module} / `{f.rule_id}`\n"
         f"- **Posizione:** {loc}\n"
         f"- **Evidence:** `{f.evidence}`\n"
         f"- {remediation}"
+    )
+    return blocco + _playbook_block(
+        render_playbook, f.remediation_ref, playbooks.context_from_finding(f)
     )
 
 
@@ -240,8 +271,13 @@ def _render_location(f: Finding) -> str:
 
 # ─── Render di un PostureCheck in DRIFT ───────────────────────────────────────
 
-def _render_posture_drift(c: PostureCheck) -> str:
-    """Blocco descrittivo per un PostureCheck regredito (drift=True)."""
+def _render_posture_drift(c: PostureCheck, render_playbook: PlaybookRenderer) -> str:
+    """Blocco descrittivo per un PostureCheck regredito (drift=True).
+
+    Come per i finding, se esiste un template per il playbook del check (per chiave
+    `remediation_ref`, con fallback al `check_id`) il playbook renderizzato viene
+    iniettato sotto al drift (§18); altrimenti resta il fallback testuale.
+    """
     sev = (
         c.severity_if_failed.name
         if isinstance(c.severity_if_failed, Severity)
@@ -251,9 +287,34 @@ def _render_posture_drift(c: PostureCheck) -> str:
         f"**Playbook:** `{c.remediation_ref}`" if c.remediation_ref
         else "_Nessun playbook associato._"
     )
-    return (
+    blocco = (
         f"#### {_ICONA_DRIFT} [{sev}] {c.title} ({c.check_id})\n\n"
         f"- **Dettaglio:** {c.detail}\n"
         f"- {remediation}\n"
         f"- _In baseline era **passed**, ora è **failed** — regressione._"
     )
+    # La chiave del playbook è il remediation_ref se presente, altrimenti il check_id
+    # (i posture check usano il check_id come rule_id, es. POSTURE_HSTS — §18).
+    ref = c.remediation_ref or c.check_id
+    return blocco + _playbook_block(
+        render_playbook, ref, playbooks.context_from_posture(c)
+    )
+
+
+def _playbook_block(
+    render_playbook: PlaybookRenderer,
+    rule_id: str | None,
+    context: dict,
+) -> str:
+    """Renderizza e formatta il blocco playbook da iniettare sotto a un finding/drift.
+
+    Ritorna stringa vuota se non esiste un template (degrado §4.7): in quel caso il
+    finding mostra solo il fallback testuale già presente. Il render non solleva mai
+    (la resilienza vive in `remediation.playbooks.render_playbook`)."""
+    if not rule_id:
+        return ""
+    reso = render_playbook(rule_id, context)
+    if not reso:
+        return ""
+    # Separato dal blocco-finding da una riga vuota; il playbook è già Markdown.
+    return "\n\n" + reso

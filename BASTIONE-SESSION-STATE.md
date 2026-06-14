@@ -96,7 +96,7 @@ Se stai aprendo Bastione ora e non c'è ancora codice:
 [x] 1. TABLE-DISCOVERY dal bundle   §8 + §11.1    extract_table_names + Fingerprint.discovered_tables + RLS fallback su 401 (287 test, done 2026-06-14)
 [x] 2. LIVENESS segreti (PROBE)     §10.2 + §7.1  validate_liveness service_role gated PROBE + 1ª attivazione gate PROBE (319 test, done 2026-06-14)
 [x] 3. BASELINE/DRIFT completo      §16           comando `bastione baseline` (--show/--reset/--accept) gradino-2 KNOWN→ACCEPTED; kernel drift/first-last-seen era già completo (341 test, done 2026-06-14)
-[ ] 4. REMEDIATION playbooks        §18           template MD per rule_id, iniettati nel report
+[x] 4. REMEDIATION playbooks        §18           remediation/playbooks.py (Jinja2) + 9 template MD iniettati nel report (NEW/KNOWN/drift), fallback intatto (389 test, done 2026-06-14)
 [ ] 5. AGENT BUNDLE + `verify`      §18-bis       cartella fix/ + FIX-PLAN.md + loop `bastione verify`
 [ ] 6. MODULI black-box             §14           nuclei/ZAP passive/testssl/WPScan/trivy (indip., SKIP se assenti)
 [ ] 7. REPORT HTML + posture gauge  §17/§23 (O02) single-file dark + gauge; consuma tutto → per ultimo
@@ -149,7 +149,7 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
   "m0_done": true,
   "m0_validated_live": "asv-officina.pages.dev (owned, read-only, 2026-06-14)",
   "code_started": true,
-  "tests_green": 341,
+  "tests_green": 389,
   "build_steps_m0": {
     "total": 16,
     "done": 16,
@@ -157,8 +157,8 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
   },
   "build_steps_m1": {
     "total": 7,
-    "done": 3,
-    "next": "step 4 — remediation playbooks (§18): template MD per rule_id (Jinja2) iniettati nel report"
+    "done": 4,
+    "next": "step 5 — agent bundle + verify (§18-bis): FixBuilder registry, fase REMEDIATE scrive fix/ (FIX-PLAN.md+fix-plan.json+migrations/), comando bastione verify"
   },
   "m1_priority_1": "table-discovery dai nomi tabella nel bundle JS (.from('...')) per testare l'RLS quando l'introspezione OpenAPI e' chiusa (401) — emersa dalla run live — DONE (M1 step 1, 2026-06-14): extract_table_names + Fingerprint.discovered_tables + fallback sonda Supabase",
   "next_session_goal": "CHIUDERE M1 — step 2..7 (liveness PROBE, baseline/drift completo, remediation playbooks, agent bundle+verify, moduli black-box, report HTML+gauge) in task atomici via dynamic workflow (regola permanente di Claudio)",
