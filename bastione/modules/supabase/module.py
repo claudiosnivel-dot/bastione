@@ -422,8 +422,21 @@ class SupabaseModule(Module):
 
         rows = self._readable_rows(resp)
         if rows is not None and len(rows) > 0:
+            # RLS disabilitata/permissiva: l'anon LEGGE la tabella. Calcoliamo la
+            # severità UNA volta (CRITICAL se i nomi colonna suggeriscono dati
+            # personali, altrimenti HIGH; via_bundle → columns=[] → HIGH) e la
+            # usiamo sia per il Finding sia per il PostureCheck FALLITO, così il
+            # peso nello score (§17) è proporzionale e i due restano allineati.
+            severity = self._rls_disabled_severity(columns)
             findings.append(self._rls_disabled_finding(
-                table, columns, rows, supabase_url, endpoint, target, via_bundle))
+                table, columns, rows, supabase_url, endpoint, target, severity,
+                via_bundle))
+            # Mutua esclusione (§17): tabella esposta → PostureCheck passed=False.
+            # Senza, lo score si calcola dai PostureCheck e resterebbe 100/100
+            # pur con finding HIGH/CRITICAL aperti (fuorviante). drift resta al
+            # default False: lo valorizza la fase POSTURE/baseline (§16).
+            posture_checks.append(self._rls_exposed_posture(
+                table, endpoint, target, severity))
             return
 
         # protetto (vuoto / 401 / 403 / irraggiungibile) → posture positiva
@@ -446,6 +459,16 @@ class SupabaseModule(Module):
         return data if isinstance(data, list) else None
 
     @staticmethod
+    def _rls_disabled_severity(columns: list[str]) -> Severity:
+        """Severità LOCKED del caso RLS disabilitata (§11.1.2), calcolata UNA volta
+        e condivisa tra Finding e PostureCheck per evitare disallineamenti.
+
+        CRITICAL se i NOMI colonna suggeriscono dati personali (euristica §11.1),
+        altrimenti HIGH. Nel path via_bundle le colonne non sono note (columns=[])
+        → l'euristica non scatta → HIGH prudenziale."""
+        return Severity.CRITICAL if _has_personal_data(columns) else Severity.HIGH
+
+    @staticmethod
     def _rls_disabled_finding(
         table: str,
         columns: list[str],
@@ -453,17 +476,19 @@ class SupabaseModule(Module):
         supabase_url: str,
         endpoint: str,
         target: str,
+        severity: Severity,
         via_bundle: bool = False,
     ) -> Finding:
-        """Costruisce il Finding `RLS_DISABLED` (§11.1.2). Severità LOCKED e
-        evidence REDATTA (P8): mai i valori delle righe, solo conteggio + colonne.
+        """Costruisce il Finding `RLS_DISABLED` (§11.1.2). Severità LOCKED (passata
+        dal chiamante, calcolata da `_rls_disabled_severity` così da coincidere col
+        PostureCheck fallito) ed evidence REDATTA (P8): mai i valori delle righe,
+        solo conteggio + colonne.
 
         `via_bundle=True` (fallback §11.1): la tabella è stata scoperta dal bundle
         JS (`.from('...')`), NON dall'OpenAPI → le COLONNE non sono note (columns=[]).
         Senza colonne non si applica l'euristica GDPR → severità HIGH LOCKED, e la
         description lo NOTA esplicitamente."""
-        personal = _has_personal_data(columns)
-        severity = Severity.CRITICAL if personal else Severity.HIGH
+        personal = severity is Severity.CRITICAL
 
         # Evidence REDATTA (P8): SOLO conteggio righe + NOMI colonna — mai i valori.
         # In fallback le colonne non sono note (tabella dal bundle) → lo si dichiara.
@@ -528,6 +553,38 @@ class SupabaseModule(Module):
             detail=(
                 f"GET anonima a /rest/v1/{table}?limit=1 non ha restituito righe "
                 f"(vuoto/401/403): l'anon non legge la tabella → RLS protegge (§11.1)."
+            ),
+            remediation_ref="RLS_DISABLED",
+        )
+
+    @staticmethod
+    def _rls_exposed_posture(
+        table: str,
+        endpoint: str,
+        target: str,
+        severity: Severity,
+    ) -> PostureCheck:
+        """Costruisce il PostureCheck FALLITO `POSTURE_RLS_<tabella>` (§17): la GET
+        anonima ha restituito righe → l'anon LEGGE la tabella → RLS NON sta
+        proteggendo (esposizione). Mutuamente esclusivo con `_rls_protected_posture`:
+        per una tabella si emette O il passed=True (protetta) O questo passed=False
+        (esposta), MAI entrambi.
+
+        `severity_if_failed` coincide con la severità del Finding RLS_DISABLED (la
+        stessa `severity` calcolata da `_rls_disabled_severity`) → il peso nello
+        score (§17) è proporzionale: CRITICAL pesa 8, HIGH 5. `drift` resta al
+        default False: lo valorizza la fase POSTURE/baseline confrontando con la
+        baseline (passed→failed = DRIFT, §16) — NON lo impostiamo qui."""
+        return PostureCheck(
+            check_id=f"POSTURE_RLS_{table}",
+            title=f"RLS NON attiva sulla tabella '{table}' (esposta all'anon)",
+            passed=False,
+            severity_if_failed=severity,
+            target=target,
+            detail=(
+                f"GET anonima a {endpoint}?limit=1 ha restituito righe: l'anon "
+                f"LEGGE la tabella → RLS NON sta proteggendo (esposizione, §17). "
+                f"Vedi il Finding RLS_DISABLED per i dettagli."
             ),
             remediation_ref="RLS_DISABLED",
         )

@@ -562,6 +562,100 @@ def test_canary_write_stub_raises_not_implemented():
         mod._canary_write_test(make_ctx())
 
 
+# ─── §17 FIX: tabella esposta → PostureCheck FALLITO (oltre al Finding) ─────
+#
+# Bug emerso da una run live: con RLS disabilitata si emetteva il Finding
+# RLS_DISABLED ma NESSUN PostureCheck fallito → lo score (che si calcola dai
+# PostureCheck, non dai finding) restava 100/100 pur con HIGH/CRITICAL aperti.
+# Fix: il ramo "tabella leggibile dall'anon" emette ANCHE un PostureCheck
+# POSTURE_RLS_<tab> passed=False, con severity_if_failed = severità del finding.
+
+
+def test_rls_disabled_personal_emits_failed_posture_critical(monkeypatch):
+    # scenario TDD 1: tabella esposta (200+righe, OpenAPI, colonne personali) →
+    # 1 Finding RLS_DISABLED CRITICAL + 1 PostureCheck passed=False CRITICAL.
+    schema = openapi_schema({"clienti": ["id", "nome", "email"]})
+    rows = {"clienti": (200, [{"id": 1, "nome": "Mario", "email": "m@x.it"}])}
+    install_router(monkeypatch, schema=schema, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx())
+
+    findings = [f for f in res.findings if f.rule_id == "RLS_DISABLED"]
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.CRITICAL
+
+    pcs = [pc for pc in res.posture_checks if pc.check_id == "POSTURE_RLS_clienti"]
+    assert len(pcs) == 1
+    pc = pcs[0]
+    assert pc.passed is False
+    # severity_if_failed DEVE coincidere con la severità del finding (peso 8)
+    assert pc.severity_if_failed is Severity.CRITICAL
+    assert pc.target == "gestionale"
+    assert pc.remediation_ref == "RLS_DISABLED"
+    # drift resta al default False (lo valorizza la fase POSTURE/baseline, §16)
+    assert pc.drift is False
+    # mutua esclusione: NESSUN posture passed=True per la stessa tabella
+    assert not any(p.passed for p in res.posture_checks)
+
+
+def test_rls_disabled_via_bundle_emits_failed_posture_high(monkeypatch):
+    # scenario TDD 2: tabella esposta via_bundle (columns=[]) → finding HIGH +
+    # posture passed=False HIGH (no euristica GDPR senza colonne).
+    fp = make_fp(discovered_tables=["clienti"])
+    rows = {"clienti": (200, [{"id": 1, "email": "x@y.it"}])}
+    install_fallback_router(monkeypatch, surface_status=401, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx(fp=fp))
+
+    findings = [f for f in res.findings if f.rule_id == "RLS_DISABLED"]
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.HIGH
+
+    pcs = [pc for pc in res.posture_checks if pc.check_id == "POSTURE_RLS_clienti"]
+    assert len(pcs) == 1
+    assert pcs[0].passed is False
+    assert pcs[0].severity_if_failed is Severity.HIGH  # peso 5
+    assert pcs[0].drift is False
+
+
+def test_protected_table_emits_only_passing_posture(monkeypatch):
+    # scenario TDD 3 (INVARIANTE): tabella protetta → posture passed=True,
+    # nessun finding, nessun posture failed (mutua esclusione).
+    schema = openapi_schema({"clienti": ["id", "email"]})
+    rows = {"clienti": (401, None)}
+    install_router(monkeypatch, schema=schema, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx())
+
+    assert not [f for f in res.findings if f.rule_id == "RLS_DISABLED"]
+    pcs = [pc for pc in res.posture_checks if pc.check_id == "POSTURE_RLS_clienti"]
+    assert len(pcs) == 1
+    assert pcs[0].passed is True
+
+
+def test_exposed_rls_lowers_posture_score_below_100(monkeypatch):
+    # scenario TDD 4 (integrazione): una run con ≥1 RLS esposta → posture_score
+    # < 100 (prima del fix era 100, il bug di §17). Usa la formula reale.
+    from bastione.posture.checks import posture_score
+
+    schema = openapi_schema(
+        {"clienti": ["id", "email"], "listino": ["id", "prezzo"]})
+    # clienti esposta (RLS off), listino protetta
+    rows = {
+        "clienti": (200, [{"id": 1, "email": "x@y.it"}]),
+        "listino": (401, None),
+    }
+    install_router(monkeypatch, schema=schema, rows=rows)
+
+    res = supa.SupabaseModule().run(make_ctx())
+
+    # c'è almeno un posture fallito (clienti) e uno passato (listino)
+    assert any(not pc.passed for pc in res.posture_checks)
+    assert any(pc.passed for pc in res.posture_checks)
+    score = posture_score(res.posture_checks)
+    assert score < 100.0
+
+
 # ─── finding_id stabile (§16) deterministico per tabella ────────────────────
 
 def test_finding_id_is_stable_across_runs(monkeypatch):
