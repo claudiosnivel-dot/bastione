@@ -1,7 +1,7 @@
 # BASTIONE — SESSION-STATE
 
 > **Codename:** BAS · **Traccia blueprint:** v2.1 · **Milestone attiva:** **M1** · **M0:** ✅ **DONE (validata live)** · **Aggiornato:** 2026-06-14
-> **Stato (una riga):** **M0 chiusa** — step 1–16 + wiring, **267 test verdi**, **run live read-only eseguita** su `asv-officina.pages.dev` (owned): recon ha estratto anon key+supabase_url dal bundle, Cloudflare + tutti i security header → posture 100, nessuna service_role esposta, report SARIF+MD+state generati. La sonda Supabase ha rilevato che la root REST risponde **401 all'anon** (schema non introspezionabile) → emesso il finding onesto `SUPABASE_SCHEMA_NOT_ENUMERABLE` (RLS per-tabella non verificabile via introspezione). **Prossimo: M1.** Priorità M1 #1 emersa dalla run live: **table-discovery dai nomi tabella nel bundle JS** (`.from('...')`) per testare l'RLS quando l'introspezione OpenAPI è chiusa.
+> **Stato (una riga):** **M1 in corso** — **step 1/7 (table-discovery dal bundle) DONE**. Quando l'introspezione OpenAPI è chiusa (401), il recon ora estrae i nomi tabella dai `.from('...')` nei bundle same-host (`Fingerprint.discovered_tables`) e la sonda Supabase ci esegue l'RLS read test per nome (severità HIGH, colonne non note → no euristica GDPR, evidence redatta) + un finding onesto `SUPABASE_SCHEMA_VIA_BUNDLE` sulla copertura parziale; se non trova tabelle nemmeno nel bundle resta `SUPABASE_SCHEMA_NOT_ENUMERABLE`. Path felice (surface 200) invariato. **287 test verdi** (workflow dinamico: build TDD → blind-review 3D → fix, 2 finding INFO chiusi). **Prossimo: M1 step 2 — liveness segreti (PROBE, gated, §10.2/§7.1).**
 >
 > **⚠️ Due "stati" diversi — non confonderli:**
 > - **Questo file** (`SESSION-STATE.md`) = stato di *sviluppo del progetto*, handoff tra sessioni di coding. È ciò che Claude Code legge in testa a ogni sessione per sapere dove siamo.
@@ -26,9 +26,9 @@ Se stai aprendo Bastione ora e non c'è ancora codice:
 | Dimensione | Stato |
 |---|---|
 | Blueprint | **v2.1**, completo, decisioni bloccate. 31 sezioni (§0–§29 + §18-bis). |
-| Codice | **M0 completa** (step 1–16 + wiring): scaffold, enums/models, config, gate, state, recon, modules/base, secrets, supabase, headers/cloudflare, sarif, report, baseline, posture, orchestrator cablato, cli; **267 test verdi** + **run live eseguita**. |
-| Milestone attiva | **M1** — la difesa continua (baseline/drift completo, liveness segreti, moduli black-box, HTML report, …). M0 (vista read-only) ✅ chiusa e validata live. |
-| Focus immediato | **Kickoff M1**: derivare il build order M1 da §27 (roadmap) + blueprint. **Priorità #1 (dalla run live):** table-discovery dai nomi tabella nel bundle JS quando l'introspezione OpenAPI è chiusa (401), così l'RLS test gira anche su target hardened. |
+| Codice | **M0 completa** (step 1–16 + wiring) + **M1 step 1** (table-discovery dal bundle → RLS fallback su 401): scaffold, enums/models, config, gate, state, recon (+`extract_table_names`), modules/base, secrets, supabase (+fallback via-bundle), headers/cloudflare, sarif, report, baseline, posture, orchestrator, cli; **287 test verdi** + **run live M0 eseguita**. |
+| Milestone attiva | **M1** — la difesa continua (build order in §3-bis). Fatto: step 1 (table-discovery). M0 (vista read-only) ✅ chiusa e validata live. |
+| Focus immediato | **M1 step 2 — liveness segreti** (`PROBE` 🟡, gated da ownership challenge §7.1): `validate_liveness` per i detector che lo supportano (service_role/stripe/github), solo GET/identità, dietro `--max-intrusion ≥ probe` + ownership verificata. **1ª attivazione reale del gate PROBE.** |
 | Target di collaudo | Staging del **Gestionale Officina** (Supabase + Cloudflare). |
 | Decisioni OPEN | O01–O05 (§5 di questo file) — **nessuna blocca M0**. |
 | Tool esterni | Da verificare con `bastione doctor` una volta che la CLI esiste. M0 dipende solo da: `httpx`/`katana`/`whatweb` (degradano se assenti). |
@@ -84,7 +84,25 @@ Se stai aprendo Bastione ora e non c'è ancora codice:
 - [x] Tool esterni assenti → degradano, **mai** crash (`bastione doctor` lo riflette; live: whatweb/katana assenti, fallback `<script src>` ha comunque trovato il bundle).
 - [x] Le evidenze dei segreti/dati personali nel report sono **redatte** (P8).
 
-**M0 chiusa e validata live.** Milestone → **M1**. La sola verifica non esercitata sul campo è l'RLS-per-tabella, perché *questo* target blocca l'introspezione anon (401) — onestamente segnalato; lo sblocca la table-discovery dal bundle (priorità M1 #1).
+**M0 chiusa e validata live.** Milestone → **M1**. La sola verifica non esercitata sul campo è l'RLS-per-tabella, perché *questo* target blocca l'introspezione anon (401) — onestamente segnalato; lo sblocca la table-discovery dal bundle (priorità M1 #1, **fatta nello step 1 M1**).
+
+---
+
+## 3-bis · Build order M1 — checklist (da §27, dependency-correct)
+
+> Derivato dalla roadmap §27 + la priorità #1 emersa dalla run live M0. Value-first e dependency-aware. **Una sessione ≠ una milestone:** incrementi piccoli e rivedibili. Spunta `[x]` quando fatto + testato.
+
+```
+[x] 1. TABLE-DISCOVERY dal bundle   §8 + §11.1    extract_table_names + Fingerprint.discovered_tables + RLS fallback su 401 (287 test, done 2026-06-14)
+[ ] 2. LIVENESS segreti (PROBE)     §10.2 + §7.1  validate_liveness gated (ownership challenge); 1ª attivazione del gate PROBE
+[ ] 3. BASELINE/DRIFT completo      §16           accept-baseline 2-step (known→accepted), first/last_seen, kernel drift completo
+[ ] 4. REMEDIATION playbooks        §18           template MD per rule_id, iniettati nel report
+[ ] 5. AGENT BUNDLE + `verify`      §18-bis       cartella fix/ + FIX-PLAN.md + loop `bastione verify`
+[ ] 6. MODULI black-box             §14           nuclei/ZAP passive/testssl/WPScan/trivy (indip., SKIP se assenti)
+[ ] 7. REPORT HTML + posture gauge  §17/§23 (O02) single-file dark + gauge; consuma tutto → per ultimo
+```
+
+> Note di sequenza: lo **step 5 dipende dal 4** (il bundle agente consuma i playbook). Lo **step 6 è indipendente** (colla sottile attorno a binari, riordinabile/parallelizzabile). Lo **step 7 è presentazione** → per ultimo (rende il set più ricco di finding/playbook/posture). Gli step 1→5 sono il cuore difensivo.
 
 ---
 
@@ -131,13 +149,18 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
   "m0_done": true,
   "m0_validated_live": "asv-officina.pages.dev (owned, read-only, 2026-06-14)",
   "code_started": true,
-  "tests_green": 267,
+  "tests_green": 287,
   "build_steps_m0": {
     "total": 16,
     "done": 16,
-    "next": "M1 kickoff"
+    "next": "completato (milestone M0 chiusa)"
   },
-  "m1_priority_1": "table-discovery dai nomi tabella nel bundle JS (.from('...')) per testare l'RLS quando l'introspezione OpenAPI e' chiusa (401) — emersa dalla run live",
+  "build_steps_m1": {
+    "total": 7,
+    "done": 1,
+    "next": "step 2 — liveness segreti (PROBE, gated da ownership challenge §7.1, §10.2)"
+  },
+  "m1_priority_1": "table-discovery dai nomi tabella nel bundle JS (.from('...')) per testare l'RLS quando l'introspezione OpenAPI e' chiusa (401) — emersa dalla run live — DONE (M1 step 1, 2026-06-14): extract_table_names + Fingerprint.discovered_tables + fallback sonda Supabase",
   "dev_workflow": "dynamic workflow (builder Sonnet/Opus + verifier/fixer Opus); orchestratore=main loop fa commit/push",
   "decisions_locked": 13,
   "open_decisions": ["O01","O02","O03","O04","O05"],
@@ -152,6 +175,7 @@ Da §7 e §28 del blueprint. Valgono sia per Bastione in esecuzione sia per l'ag
 
 > Una riga per sessione: cosa è cambiato, cosa è stato deciso, dove riprendere.
 
+- **2026-06-14 — Sessione 5 (M1 step 1: table-discovery dal bundle).** Aperta M1 e derivato il build order M1 (7 step, §3-bis, da §27). Eseguito **step 1** via workflow dinamico (build TDD → blind-review adversariale su 3 dimensioni → fix): **(1)** `extract_table_names` pura in `recon/fingerprint.py` (§8) — estrae i nomi da `.from('NAME')`/`.from("NAME")` (identificatore relazione PostgREST, opz. prefisso schema), scarta i falsi positivi dei builtin JS (`Array.from`, typed-array…) via post-filtro per offset esatto del `.from(`, dedup+sort deterministico, zero I/O; **(2)** campo `Fingerprint.discovered_tables` (§5) popolato da `fingerprint()` aggregando su **tutti** i bundle same-host (rimosso l'early-break; **owned-only intatto**, nessun nuovo download verso host non dichiarati); **(3)** wiring **fallback** nella sonda Supabase (§11.1): surface 401/non-enumerabile + tabelle dal bundle → RLS read test per nome (severità **HIGH**, colonne non note → no euristica GDPR, **evidence redatta P8**, `intrusion_used=READ_ONLY`) + finding onesto **INFO/TENTATIVE `SUPABASE_SCHEMA_VIA_BUNDLE`** sulla copertura parziale (solo tabelle referenziate nel client JS); nessuna tabella nemmeno nel bundle → resta `SUPABASE_SCHEMA_NOT_ENUMERABLE` (description aggiornata). **Path felice (surface 200) invariato** (decisione LOCKED: solo fallback). Stub canary §11.2 intatto (`NotImplementedError("M2")`). Blind-review: **sicurezza/guardrail 0 finding**; 2 finding **INFO** (falso positivo builtin con spazio/commento prima di `.from(` — non realistico su bundle minificato; commento "negative lookbehind" stantio) → entrambi **fixati** con 2 test di regressione. Ground-truth orchestratore: **287 test verdi** (era 267, +20), tutto offline/read-only, **nessun target live puntato**. Tutto committato+pushato. **Prossimo: M1 step 2 — liveness segreti (PROBE 🟡, gated da ownership §7.1, §10.2): 1ª attivazione reale del gate PROBE.**
 - **2026-06-14 — Sessione 4 (cont.): run live + CHIUSURA M0 → M1.** Claudio ha fornito il target reale `asv-officina.pages.dev` (Cloudflare Pages) e l'autorizzazione owned-only. Creato `targets/gestionale.local.toml` (gitignored) e lanciata `bastione scan --target gestionale --max-intrusion read-only` **live, read-only**. Risultati reali: pipeline E2E senza crash; recon ha estratto **anon key (role:anon) + supabase_url (`ztfjrlpyfobtqsfqxfqh.supabase.co`) dal bundle** (fallback `<script src>` ha funzionato anche con whatweb/katana assenti); Cloudflare-fronted + **tutti i 6 security header presenti** → posture **100.0**; **nessuna service_role esposta** (POSTURE_SERVICE_ROLE_HIDDEN ✓); SARIF+MD+state generati. **La sonda Supabase ha scoperto che la root REST risponde 401 all'anon** (schema non introspezionabile) → la surface-map non enumera tabelle. Diagnosi: il mio probe *manuale* all'host supabase è stato **bloccato dal classificatore owned-only** (host non dichiarato) — guardrail che funziona; ho proceduto via tool dopo che Claudio ha dichiarato owned anche il backend. **Rifinitura M0 (workflow Opus, scelta da Claudio):** la sonda ora, quando la superficie non è enumerabile (401/irraggiungibile), emette un **finding onesto `SUPABASE_SCHEMA_NOT_ENUMERABLE` (INFO/TENTATIVE)** invece di tacere — dichiara che l'RLS per-tabella NON è verificata (verifica incompleta). **267 test verdi.** Re-run live → report con 1 finding INFO onesto + 8 posture check verdi. **M0 chiusa e validata live.** **Priorità M1 #1 (emersa qui):** table-discovery dai nomi tabella nel bundle JS (`.from('...')`) per testare l'RLS sui target che chiudono l'introspezione. Tutto committato/pushato.
 - **2026-06-14 — Sessione 4 (M0 code-complete via dynamic workflow).** Nuovo flusso di lavoro adottato (regola permanente di Claudio): ogni milestone in task atomici, chiusi via **dynamic workflow** — builder (Sonnet 4.6 o Opus 4.8 per complessità) → **blind-author review (Opus)** → **fixer (Opus)**; l'orchestratore (main loop, Opus 4.8) decompone, fa ground-truth coi test e committa/pusha. Commit/push automatici ai checkpoint. Decomposti ed eseguiti step **6→15 + wiring orchestratore** in 6 fasi: F1 `modules/base.py` (§9); F2 (parallela) `secrets`+`SECRET_SERVICE_ROLE` (§10) · `supabase` surface map+RLS read test (la gemma, §11.1, Opus) · `headers`/`cloudflare` (§12) · `baseline/diff` finding_id+NEW/KNOWN/FIXED/DRIFT (§16, Opus) · `posture/checks` score pesato (§17); F3 `normalize/sarif` SARIF 2.1.0 (§23) · `report/markdown` (§23); F4 **wiring orchestratore** RECON→PERSIST (§6: PLAN should_run · SCAN ThreadPoolExecutor read-only + MODULE_ERROR resiliente · NORMALIZE dedup + cross-check POSTURE_SERVICE_ROLE_HIDDEN §11.1.6 · BASELINE · POSTURE · REPORT, Opus); F5 `cli.py` typer scan/doctor/list-modules/list-detectors (§25, Opus); F6 capstone (cleanup + smoke E2E offline + review integrata). **Bug reali trovati dalle blind-review e corretti dai fixer (tutti con test di regressione):** (T-wire) REMEDIATE/NOTIFY saltati su run fresca perché `state.counts` letto prima di PERSIST → ora da `self._result.counts`; (CLI) exit-code non conformi §22 → `PreconditionDenied` (produzione→exit 2, ownership→exit 3) + CI gate su NEW≥soglia OPPURE drift (non più su KNOWN/ACCEPTED) con `new_by_severity`; (capstone) **resumability rotta dopo SCAN** → `_rehydrate_scan_chain` ricostruisce in memoria PLAN→SCAN→NORMALIZE prima di BASELINE. Cleanup: secrets niente doppio-fetch + `finding_id` allineato alla formula LOCKED §16 (rimosso `target`); cloudflare-fronted check → severity INFO (no inflazione score, §26); RunContext `ownership_verified` cablato. Scope M0 confermato (golden rule P5): supabase = solo surface map + RLS read test (storage/RPC/auth posture §11.1.3-6 → M1); headers TLS minimo + cloudflare origin-reachability → M1. **264 test verdi**, tutto offline/read-only, **nessun target live puntato**, tutto committato+pushato (8 commit). **M0 code-complete.** Resta lo **step 16 (E2E su staging reale)**: non automatizzabile (owned-only) — serve `targets/gestionale.local.toml` + ok di Claudio; poi si verifica la DoD sui dati reali e milestone → M1.
 - **2026-06-13 — Sessione 3 (step 6: recon / fingerprint read-only).** Implementato in TDD `recon/fingerprint.py` (§8). Funzioni pure (la *gemma*, testate con input reali, niente mock): `extract_script_srcs` (fallback bundle **obbligatorio senza katana**), `extract_supabase_url`, `extract_anon_key` (JWT `role:anon` — **ignora di proposito la service_role**, §8/§10), `detect_cloudflare`, `is_wordpress`. Orchestratore `fingerprint()` con confini I/O monkeypatchabili (`_fetch`/`_run_whatweb`/`_run_katana`, degrado grazioso L06) + scrittura `fingerprint.json`. Scelta M0 (flaggata a Claudio): passo 1 con httpx-**lib**, non il binario projectdiscovery (ridondante; la lib copre URL finale/header/redirect/Cloudflare per un singolo base_url). Revisione adversariale multi-agente (3 dimensioni: correctness · sicurezza/guardrail · robustezza/contratto; ogni finding ri-verificato/refutato): **4 fix applicati** — **(F1)** `is_supabase` legato all'URL PostgREST, non più OR con `anon_key` (eliminato lo stato incoerente `True`+`supabase_url=None` che avrebbe fatto partire il modulo supabase senza URL, §9/§11.1); **(F4)** **filtro same-host** sui bundle (owned-only §7: niente GET verso CDN di terzi non dichiarati); **(F3)** test del bundle `None` in mezzo a più bundle (path DoD-critico); **(F2)** `_parse_whatweb` tollerante per-riga (una riga malformata non scarta le valide). Confermati corretti e già testati: distinzione anon/service_role, no command-injection nei subprocess (argv-list), test 100% offline. Segnalato come **hardening futuro** (non M0-blocking — `runs/` è gitignored, artifact solo locale): redazione `Set-Cookie` in `fingerprint.json`. **77 test verdi**, tutto offline/read-only, nessun target puntato. Step 5 (state+orchestrator) committato+pushato a inizio sessione; da questa sessione commit/push automatici (regola di Claudio). Prossimo: **step 7** — `modules/base.py` (Module ABC + REGISTRY + should_run, §9). Nessuna OPEN blocca M0.
