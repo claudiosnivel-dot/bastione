@@ -1,0 +1,51 @@
+# ─────────────────────────────────────────────────────────────────────
+# TEMPLATE COMMITTABILE per il target "gestionale" (§29).
+#
+# COME USARLO:
+#   1. Copia questo file in  targets/gestionale.local.toml  (gitignored).
+#   2. Nel .local.toml metti i valori REALI (base_url dello staging, ecc.).
+#   3. Lancia:  bastione scan --target gestionale --max-intrusion read-only
+#
+# Risoluzione (§6 LOAD): `--target gestionale` usa gestionale.local.toml se
+# esiste, altrimenti questo gestionale.toml.
+# Questo file e' COMMITTATO: NON metterci segreti reali (token, chiavi).
+# Per M0 (read-only) bastano name/base_url/environment/ownership.
+# ─────────────────────────────────────────────────────────────────────
+
+# ─── Identita' target (OBBLIGATORI per M0) ──────────────────────────
+name        = "gestionale"
+base_url    = "https://REPLACE-ME.staging.example"   # <-- METTI l'URL reale dello STAGING nel .local.toml
+environment = "staging"                 # "staging" | "production" (production = BLOCCO ASSOLUTO, §7)
+ownership   = "owned"                   # "owned" | "authorized-written" — dichiari di possedere/essere autorizzato
+
+# ownership_token: NON serve per M0 (read-only): leggere cio' che e' pubblico
+# non e' intrusione (§7.1). Va dichiarato solo per run > read-only (PROBE/MUTATING),
+# pubblicandolo su /.well-known/bastione-ownership.txt o nel DNS TXT _bastione.<host>.
+# ownership_token = "<uuid>"            # (M2)
+
+# ─── Supabase (OPZIONALE: se assente, lo scopre il recon dal bundle) ─
+[supabase]
+# url = "https://<ref>.supabase.co"     # opzionale; il recon estrae url + anon_key (pubblica) dal bundle JS
+# anon_key: MAI qui — la estrae il recon (e' pubblica per design, §8)
+
+# ─── Notifiche (M1/M2: in M0 la fase NOTIFY e' uno stub no-op) ──────
+[notify]
+channel      = "none"                   # M0: "none". (M1: telegram | email | webhook)
+min_severity = "high"                   # soglia alert/CI (§19/§22)
+
+# ─── Override moduli (opzionale) ────────────────────────────────────
+[modules]
+disabled = []                           # es. ["cloudflare"] per saltarne uno
+
+# ─── Modo oracolo / matrice attese (OPZIONALE, M2 — §15) ────────────
+# Decommenta per dichiarare cosa l'anon DOVREBBE poter leggere/scrivere:
+# il modulo supabase confronta l'osservato con queste attese.
+# [expectations]
+# [[expectations.table]]
+# name = "clienti"
+# anon_select = false
+# anon_insert = false
+# [[expectations.table]]
+# name = "listino_pubblico"
+# anon_select = true
+# anon_insert = false
