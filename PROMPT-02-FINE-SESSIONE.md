@@ -43,3 +43,4 @@ Se una di queste è violata, **segnalalo in cima al riepilogo** come problema da
 - Non lasciare test rossi senza averli annotati nel log.
 
 Quando hai aggiornato il SESSION-STATE, dato il riepilogo, completato il self-audit e proposto il commit: la sessione è chiusa. Ci ritroviamo la prossima volta con `PROMPT-01-INIZIO-SESSIONE`.
+
