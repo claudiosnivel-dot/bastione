@@ -417,6 +417,80 @@ def test_rls_disabled_sql_solo_identificatori_validi():
     assert "<tabella>" not in fe.instructions["migration_sql"]
 
 
+# ─── M2 step 0: remediation RLS view-aware (tabella vs vista, security_invoker) ─
+
+def test_rls_disabled_migration_e_view_aware_security_invoker():
+    """Il problema reale: RLS_DISABLED colpisce spesso una VISTA, non una tabella.
+    Su una vista non si abilita RLS: si imposta `security_invoker = on` così la vista
+    rispetta la RLS delle tabelle sottostanti. Poiché Bastione è black-box e non sa
+    se la relazione sia tabella o vista, l'SQL deve gestire ENTRAMBI i casi a runtime
+    (ramo su pg_class.relkind). Il migration_sql deve quindi contenere sia il ramo
+    tabella (ALTER TABLE ... ENABLE ROW LEVEL SECURITY) sia il ramo vista
+    (ALTER VIEW ... SET (security_invoker = on))."""
+    fe = ab.FIX_BUILDERS["RLS_DISABLED"].build(
+        _finding(endpoint="/rest/v1/clienti"), _cfg())
+    sql = fe.instructions["migration_sql"]
+    # Ramo vista: la clausola corretta per una view (Postgres 15+/Supabase).
+    assert "security_invoker" in sql
+    assert "ALTER VIEW" in sql
+    assert "ALTER VIEW public.clienti SET (security_invoker = on)" in sql
+    # Ramo tabella: invariato (compatibilità coi test substring esistenti).
+    assert "ALTER TABLE public.clienti ENABLE ROW LEVEL SECURITY" in sql
+    assert "CREATE POLICY" in sql
+
+
+def test_rls_disabled_migration_ramifica_su_relkind_da_pg_class():
+    """La scelta tabella-vs-vista è fatta a RUNTIME in Postgres leggendo
+    pg_class.relkind ('r' tabella, 'v'/'m' vista/matview): il blocco DO deve
+    interrogare pg_class (JOIN pg_namespace) e ramificare sul relkind."""
+    fe = ab.FIX_BUILDERS["RLS_DISABLED"].build(
+        _finding(endpoint="/rest/v1/clienti"), _cfg())
+    sql = fe.instructions["migration_sql"]
+    # Lookup del tipo di relazione da pg_class.relkind.
+    assert "pg_class" in sql
+    assert "relkind" in sql
+    # È un blocco DO che ramifica (EXECUTE per ognuno dei rami).
+    assert "DO $$" in sql or "DO $do$" in sql
+    assert "EXECUTE" in sql
+    # Il ramo vista copre anche le matview ('m') oltre alle view ('v').
+    assert "'v'" in sql and "'m'" in sql
+
+
+def test_rls_disabled_rollback_e_view_aware_e_idempotente():
+    """Anche il rollback è view-aware: DROP POLICY (tabella) idempotente e RESET
+    della security_invoker (vista), guardato/idempotente — niente crash se non
+    applicabile."""
+    fe = ab.FIX_BUILDERS["RLS_DISABLED"].build(
+        _finding(endpoint="/rest/v1/clienti"), _cfg())
+    rollback = fe.instructions["rollback_sql"]
+    # Ramo tabella: DROP POLICY idempotente (compatibilità test esistenti).
+    assert "DROP POLICY" in rollback
+    assert "IF EXISTS" in rollback
+    # Ramo vista: RESET della security_invoker.
+    assert "RESET (security_invoker)" in rollback
+
+
+def test_rls_disabled_migration_ha_commento_tabella_vs_vista():
+    """Il blocco DO è corredato da un commento SQL che spiega tabella-vs-vista e
+    la ratio di security_invoker, così l'umano che applica capisce il branching."""
+    fe = ab.FIX_BUILDERS["RLS_DISABLED"].build(
+        _finding(endpoint="/rest/v1/clienti"), _cfg())
+    sql = fe.instructions["migration_sql"]
+    # Un commento SQL (-- ...) iniziale che menziona vista e security_invoker.
+    assert sql.lstrip().startswith("--")
+    assert "vista" in sql.lower() or "view" in sql.lower()
+    assert "security_invoker" in sql
+
+
+def test_rls_disabled_view_aware_non_interpola_nomi_non_validati():
+    """LOCKED: la validazione _is_valid_sql_identifier resta — un nome non valido
+    SOLLEVA (build_fix_plan lo salta), niente interpolazione injection-shaped nelle
+    stringhe EXECUTE del blocco DO view-aware."""
+    f = _finding(rule_id="RLS_DISABLED", endpoint="/rest/v1/My Table; DROP")
+    with pytest.raises(ValueError):
+        ab.FIX_BUILDERS["RLS_DISABLED"].build(f, _cfg())
+
+
 # ─── REGRESSIONE: instructions['file'] coincide col file scritto (§18-bis.4) ───
 
 def test_instructions_file_coincide_col_file_scritto_anche_con_separatori(tmp_path: Path):
@@ -502,3 +576,25 @@ def test_fix_plan_md_verifica_finale_cita_accept_baseline():
     md = ab._render_fix_plan_md(plan)
     assert "--accept-baseline" in md
     assert "baseline salvata" in md.lower()
+
+
+def test_fix_plan_md_rollback_multilinea_reso_in_fenced_block():
+    """Regressione M2-0: dallo step view-aware il rollback_sql di RLS_DISABLED è un
+    blocco DO multi-linea. Il render deve usare un fenced block ```sql (come la
+    migration), MAI un inline-span single-backtick con newline dentro — che
+    romperebbe il Markdown del FIX-PLAN.md (§18-bis.6)."""
+    plan = _plan_con_fix("runs/g/ts")
+    rls = next(fe for fe in plan.fixes if fe.rule_id == "RLS_DISABLED")
+    # precondizione del test: il rollback è effettivamente multi-linea (view-aware)
+    assert "\n" in rls.instructions["rollback_sql"]
+
+    md = ab._render_fix_plan_md(plan)
+    # la riga "Rollback:" non deve contenere SQL sulla stessa riga (niente inline
+    # span): l'SQL del rollback vive in un blocco fenced sottostante.
+    assert "  Rollback:\n" in md
+    assert "Rollback: `" not in md
+    # ogni riga del rollback compare indentata dentro un fenced block, non avvolta
+    # da backtick inline insieme alle newline.
+    for sql_line in rls.instructions["rollback_sql"].splitlines():
+        if sql_line.strip():
+            assert f"  {sql_line}" in md

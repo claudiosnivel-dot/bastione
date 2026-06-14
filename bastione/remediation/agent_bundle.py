@@ -190,12 +190,88 @@ class RlsDisabledFix(FixBuilder):
                 f"(§4.7/§18-bis.4)."
             )
         slug = _slug(table, fallback="rls")
+        # View-aware (M2 step 0): un finding RLS_DISABLED su Supabase colpisce spesso
+        # una VISTA, non una tabella base. Su una vista NON si abilita RLS: si imposta
+        # `security_invoker = on` (Postgres 15+/Supabase) così la vista esegue le query
+        # con i permessi del CHIAMANTE e quindi rispetta la RLS delle tabelle sottostanti
+        # (di default una view gira come il suo OWNER e bypasserebbe la RLS). Bastione è
+        # black-box: dall'endpoint /rest/v1/<rel> non sa se <rel> sia tabella o vista.
+        # Per emettere SQL corretto in ENTRAMBI i casi si ramifica a RUNTIME in Postgres
+        # sul tipo di relazione (pg_class.relkind: 'r'=tabella, 'v'=view, 'm'=matview),
+        # dentro un blocco DO. `table` è già validato da _is_valid_sql_identifier
+        # (^[a-z_][a-z0-9_]*$): è sicuro interpolarlo sia nel WHERE del lookup sia nelle
+        # stringhe EXECUTE — niente injection (LOCKED §18-bis.4).
+        #
+        # Le stringhe EXECUTE usano il dollar-quoting interno $q$...$q$ per non doversi
+        # preoccupare delle virgolette singole (es. in `auth.uid() = user_id`); il blocco
+        # esterno usa $do$...$do$ così i due dollar-quote non collidono.
         migration_sql = (
-            f"ALTER TABLE public.{table} ENABLE ROW LEVEL SECURITY;\n"
-            f"CREATE POLICY sel_own ON public.{table}\n"
-            f"  FOR SELECT USING (auth.uid() = user_id);"
+            f"-- RLS_DISABLED view-aware: la relazione public.{table} può essere una\n"
+            f"-- TABELLA (relkind='r') o una VISTA (relkind='v'/'m'). Su una tabella si\n"
+            f"-- abilita RLS + policy; su una vista si imposta security_invoker = on, così\n"
+            f"-- la vista rispetta la RLS delle tabelle sottostanti invece di bypassarla.\n"
+            f"-- Il ramo giusto è scelto a runtime leggendo pg_class.relkind.\n"
+            f"DO $do$\n"
+            f"DECLARE\n"
+            f"  v_relkind \"char\";\n"
+            f"BEGIN\n"
+            f"  SELECT c.relkind INTO v_relkind\n"
+            f"    FROM pg_class c\n"
+            f"    JOIN pg_namespace n ON n.oid = c.relnamespace\n"
+            f"   WHERE n.nspname = 'public' AND c.relname = '{table}';\n"
+            f"\n"
+            f"  IF v_relkind = 'r' THEN\n"
+            f"    -- Tabella base: abilita RLS e aggiungi una policy SELECT restrittiva.\n"
+            f"    EXECUTE $q$ALTER TABLE public.{table} ENABLE ROW LEVEL SECURITY$q$;\n"
+            f"    EXECUTE $q$CREATE POLICY sel_own ON public.{table} "
+            f"FOR SELECT USING (auth.uid() = user_id)$q$;\n"
+            f"  ELSIF v_relkind IN ('v', 'm') THEN\n"
+            f"    -- Vista/matview: niente RLS sulla relazione; si forza security_invoker\n"
+            f"    -- così la vista eredita la RLS delle tabelle sorgente. La clausola vale\n"
+            f"    -- su ALTER VIEW; per una matview ('m') si tenta la stessa forma e, se non\n"
+            f"    -- supportata dalla versione di Postgres, si degrada con un NOTICE invece\n"
+            f"    -- di crashare (no-op sicuro — la matview va valutata a mano).\n"
+            f"    BEGIN\n"
+            f"      EXECUTE $q$ALTER VIEW public.{table} SET (security_invoker = on)$q$;\n"
+            f"    EXCEPTION WHEN others THEN\n"
+            f"      RAISE NOTICE 'security_invoker non applicabile su public.{table} "
+            f"(relkind=%): verificare manualmente', v_relkind;\n"
+            f"    END;\n"
+            f"  ELSE\n"
+            f"    -- Relazione inesistente o tipo non gestito: no-op sicuro.\n"
+            f"    RAISE NOTICE 'public.{table} non trovata o relkind non gestito (%): "
+            f"nessuna modifica', v_relkind;\n"
+            f"  END IF;\n"
+            f"END\n"
+            f"$do$;"
         )
-        rollback_sql = f"DROP POLICY IF EXISTS sel_own ON public.{table};"
+        # Rollback view-aware e idempotente: anch'esso ramifica sul relkind. Per la
+        # tabella rimuove la policy (DROP POLICY IF EXISTS — no-op se assente); per la
+        # vista resetta la storage option security_invoker (RESET, guardato in un BEGIN
+        # con EXCEPTION così non crasha se non applicabile). Resta un blocco DO.
+        rollback_sql = (
+            f"-- Rollback RLS_DISABLED view-aware: simmetrico alla migration, idempotente.\n"
+            f"DO $do$\n"
+            f"DECLARE\n"
+            f"  v_relkind \"char\";\n"
+            f"BEGIN\n"
+            f"  SELECT c.relkind INTO v_relkind\n"
+            f"    FROM pg_class c\n"
+            f"    JOIN pg_namespace n ON n.oid = c.relnamespace\n"
+            f"   WHERE n.nspname = 'public' AND c.relname = '{table}';\n"
+            f"\n"
+            f"  IF v_relkind = 'r' THEN\n"
+            f"    EXECUTE $q$DROP POLICY IF EXISTS sel_own ON public.{table}$q$;\n"
+            f"  ELSIF v_relkind IN ('v', 'm') THEN\n"
+            f"    BEGIN\n"
+            f"      EXECUTE $q$ALTER VIEW public.{table} RESET (security_invoker)$q$;\n"
+            f"    EXCEPTION WHEN others THEN\n"
+            f"      RAISE NOTICE 'RESET security_invoker non applicabile su public.{table}';\n"
+            f"    END;\n"
+            f"  END IF;\n"
+            f"END\n"
+            f"$do$;"
+        )
         instructions = {
             "migration_sql": migration_sql,
             "rollback_sql": rollback_sql,
@@ -529,7 +605,16 @@ def _render_agent_entry(fe: FixEntry) -> str:
         for sql_line in ins.get("migration_sql", "").splitlines():
             lines.append(f"  {sql_line}")
         lines.append("  ```")
-        lines.append(f"  Rollback: `{ins.get('rollback_sql', '')}`")
+        # Rollback reso come fenced block come la migration: dallo step M2-0 il
+        # rollback_sql è un blocco DO multi-linea (view-aware), non più un
+        # one-liner. Un inline-span single-backtick con newline dentro romperebbe
+        # il Markdown del FIX-PLAN.md (deliverable §18-bis.6). Reso simmetrico.
+        rollback_sql = ins.get("rollback_sql", "")
+        lines.append("  Rollback:")
+        lines.append("  ```sql")
+        for sql_line in rollback_sql.splitlines():
+            lines.append(f"  {sql_line}")
+        lines.append("  ```")
     elif fe.fix_type in (FixType.CONFIG_CHANGE, FixType.INFRA_CHANGE):
         lines.append(
             f"- **Imposta** `{ins.get('key', '')}` = `{ins.get('value', '')}` "
