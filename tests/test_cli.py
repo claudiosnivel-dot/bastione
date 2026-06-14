@@ -131,13 +131,54 @@ def test_scan_prints_summary(monkeypatch):
     assert "report.md" in out
 
 
-def test_scan_m2_flag_is_noop_in_m0(monkeypatch):
-    # --i-own-this-its-staging è accettato (no-op in M0/M1 read-only).
+def test_scan_m2_flag_is_noop_in_read_only(monkeypatch):
+    # --i-own-this-its-staging è accettato anche in read-only (no-op lì: il gate
+    # runtime non richiede ownership per read-only). Non blocca, non declassa.
     cap: dict = {}
     _patch_run(monkeypatch, capture=cap)
     result = runner.invoke(
         app, ["scan", "--target", "g", "--i-own-this-its-staging"])
     assert result.exit_code == 0, result.output
+
+
+# ─── §7/§25: --i-own-this-its-staging è REALE per --max-intrusion mutating ───
+
+def test_scan_mutating_without_flag_is_exit_2(monkeypatch):
+    # §7/§25: --max-intrusion mutating SENZA --i-own-this-its-staging (non
+    # interattivo) → precondizione non soddisfatta → errore chiaro + exit 2.
+    # Orchestrator.run NON deve nemmeno essere invocato (blocco a monte).
+    cap: dict = {}
+    _patch_run(monkeypatch, capture=cap)
+    result = runner.invoke(
+        app, ["scan", "--target", "g", "--max-intrusion", "mutating"])
+    assert result.exit_code == 2, result.output
+    # messaggio chiaro che cita il flag richiesto, niente stacktrace
+    assert "i-own-this-its-staging" in result.output
+    assert "Traceback" not in result.output
+    # il blocco è a monte: orch.run non è stato chiamato
+    assert cap == {}
+
+
+def test_scan_mutating_with_flag_proceeds(monkeypatch):
+    # §7/§25: con il flag, mutating PROSEGUE: orch.run è invocato con MUTATING.
+    # Il gate runtime (authorize/ownership) resta comunque l'autorità sul target.
+    cap: dict = {}
+    _patch_run(monkeypatch, capture=cap)
+    result = runner.invoke(
+        app, ["scan", "--target", "g", "--max-intrusion", "mutating",
+              "--i-own-this-its-staging"])
+    assert result.exit_code == 0, result.output
+    assert cap["max_intrusion"] == IntrusionLevel.MUTATING
+
+
+def test_scan_probe_without_flag_proceeds(monkeypatch):
+    # Il flag è richiesto SOLO per mutating: probe (e read-only) procedono senza.
+    cap: dict = {}
+    _patch_run(monkeypatch, capture=cap)
+    result = runner.invoke(
+        app, ["scan", "--target", "g", "--max-intrusion", "probe"])
+    assert result.exit_code == 0, result.output
+    assert cap["max_intrusion"] == IntrusionLevel.PROBE
 
 
 def test_scan_no_fix_is_propagated_to_orchestrator(monkeypatch):

@@ -17,7 +17,9 @@ Vincoli (LOCKED):
   - `--unsafe-show-secrets` è INCOMPATIBILE con `--ci` (un CI non deve mai stampare
     segreti in chiaro): combinazione → errore, exit ≠ 0 (P8/§25);
   - `--no-fix` (M1) salta la generazione del bundle di remediation `fix/` (§18-bis);
-    `--i-own-this-its-staging` (M2) è ACCETTATO ma resta **no-op** in read-only;
+    `--i-own-this-its-staging` (M2) è **RICHIESTO** per `--max-intrusion mutating`
+    (scritture canary §11.2, non interattivo): senza → exit 2 (precondizione). NON
+    declassa né aggira il gate (§7), che resta l'autorità su staging+ownership;
   - `--fail-on` / `--ci`: dopo la run, se ≥1 finding emesso ha severity ≥ soglia →
     exit 1 (gate CI minimale §22); altrimenti 0.
 
@@ -135,7 +137,10 @@ def scan(
         help="Disabilita la remediation: salta la generazione del bundle fix/ (§18-bis)."),
     i_own_this_its_staging: bool = typer.Option(
         False, "--i-own-this-its-staging",
-        help="[M2] Conferma ownership per scritture su staging. In M0 è no-op."),
+        help="[M2] RICHIESTO per --max-intrusion mutating (scritture canary, §11.2): "
+             "conferma esplicita ownership+staging per esecuzioni non interattive "
+             "(CI/cron). Autodescrittivo, finisce nei log. Il gate runtime (§7) "
+             "resta comunque l'autorità che impone staging+ownership."),
 ) -> None:
     """Esegue una scansione difensiva del target e ne stampa il sommario (§6/§25).
 
@@ -149,17 +154,37 @@ def scan(
             "un'esecuzione CI non deve mai stampare segreti in chiaro (P8/§25).")
         raise typer.Exit(code=2)
 
-    # Flag M2: accettato ma no-op in M0/M1 (read-only). Nota esplicita, non azione.
+    level = _CLI_TO_INTRUSION[max_intrusion]
+
+    # §7/§25 (LOCKED): per --max-intrusion mutating (scritture canary 🔴) in modo
+    # NON interattivo serve la conferma esplicita --i-own-this-its-staging. Senza,
+    # è una PRECONDIZIONE non soddisfatta → errore chiaro + exit 2 (come le altre
+    # precondizioni di LOAD, §22). Questo NON declassa e NON aggira il gate: il
+    # gate runtime (authorize/ownership, §7) resta l'autorità che impone
+    # staging+ownership sul target — questa è solo la conferma d'intento dell'utente
+    # (autodescrittiva, finisce nei log). Il flag su read-only/probe è un no-op
+    # innocuo (non richiesto, non rifiutato).
+    if level >= IntrusionLevel.MUTATING and not i_own_this_its_staging:
+        err_console.print(
+            "[bold red]Errore:[/] --max-intrusion mutating richiede la conferma "
+            "esplicita [bold]--i-own-this-its-staging[/] (scritture canary §11.2, "
+            "🔴). Aggiungi il flag SOLO se il target è uno staging che possiedi: il "
+            "gate (§7) verificherà comunque staging+ownership e aborterà se non lo "
+            "sono.")
+        raise typer.Exit(code=2)
+
     if i_own_this_its_staging:
         console.print(
-            "[dim]nota:[/] --i-own-this-its-staging è un no-op in M0 "
-            "(le scritture canary arrivano a M2).")
+            "[dim]nota:[/] --i-own-this-its-staging confermato: per --max-intrusion "
+            "mutating il canary write (§11.2) può procedere; il gate (§7) impone "
+            "comunque staging+ownership."
+            if level >= IntrusionLevel.MUTATING else
+            "[dim]nota:[/] --i-own-this-its-staging è ininfluente sotto "
+            "--max-intrusion mutating (nessuna scrittura sotto MUTATING).")
     if unsafe_show_secrets:
         console.print(
             "[dim]nota:[/] --unsafe-show-secrets: la de-redazione dell'evidence è "
             "M1; in M0 i segreti restano redatti nei file (P8).")
-
-    level = _CLI_TO_INTRUSION[max_intrusion]
 
     orch = Orchestrator()
     try:
