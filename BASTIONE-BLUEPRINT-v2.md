@@ -67,9 +67,9 @@ v1.2 trovava problemi *una volta*. Questo è un atto offensivo travestito da dif
 - **L13** L'**Agent Remediation Bundle** (§18-bis) è parte della pipeline (fase `REMEDIATE`), non un extra. Contratti LOCKED: divisione netta **artefatto letterale** (SQL/header/config → pronti all'uso) vs **intent+hint** (fix di codice → l'agente li localizza nel sorgente, perché il black-box non ha il repo); campo `applicable_by` (agente/umano/misto); la **rotazione segreti** è sempre `priority=1` e ha un passo umano obbligatorio; ogni fix ha un **criterio di accettazione verificabile** (`bastione verify`).
 
 ### OPEN (da decidere insieme prima di toccarli)
-- **O01** Notifier prioritario per te: Telegram, email SMTP, o webhook generico? (default proposto: **Telegram**, perché bot+chat_id è il setup più rapido e già lo usi per i progetti.)
+- **O01** ✅ **RISOLTA (M2, 2026-06-14): Telegram (solo).** Notifier prioritario = **Telegram** (token+chat_id da env `BASTIONE_TELEGRAM_BOT_TOKEN`/`BASTIONE_TELEGRAM_CHAT_ID`). Implementato in §19 (package `notify/`): `Notifier` ABC + registry + `dispatch` resiliente → **email SMTP e webhook restano drop-in futuri**, non costruiti in M2. *(Originale: Telegram, email SMTP o webhook? → scelto Telegram, bot+chat_id è il setup più rapido e già lo usi.)*
 - **O02** HTML report: tema scuro/chiaro, e se includere un *posture score gauge*. (Proposta: single-file, dark, con gauge.)
-- **O03** Soglia di default del CI gate: `HIGH` o `CRITICAL`? (Proposta: `HIGH`.)
+- **O03** ✅ **RISOLTA (M2, 2026-06-14): `HIGH`.** Soglia di default del CI gate = **`HIGH`** (`_CI_DEFAULT_THRESHOLD`, §22): `--ci` senza `--fail-on` fa fallire il gate su ≥1 finding NEW ≥ `HIGH` **oppure** ≥1 `DRIFT`. Il flag `--fail-on` ha precedenza (soglia unica per run, §19/§22). *(Originale: `HIGH` o `CRITICAL`? → scelto `HIGH`.)*
 - **O04** Concorrenza moduli read-only: `asyncio` o `ThreadPoolExecutor`? (Proposta: `ThreadPoolExecutor`, più semplice da ragionare; i mutating sono comunque serializzati.)
 - **O05** L'Agent Remediation Bundle (§18-bis) si genera **sempre** a fine run o solo con `--emit-fix` / `bastione fix`? (Proposta: **sempre** quando ci sono finding aperti — è leggero e a costo zero, e il valore percepito è alto. Disattivabile con `--no-fix`.) *Nota di confine con L13:* L13 blocca **che** il bundle sia parte della pipeline (fase `REMEDIATE`); questa OPEN decide **solo** il default sempre/opt-in. Le menzioni in §6 e §25 riportano la proposta, non una decisione presa.
 
@@ -840,7 +840,7 @@ class Notifier(ABC):
 NOTIFIERS = {"telegram": TelegramNotifier, "email": EmailNotifier, "webhook": WebhookNotifier}
 ```
 - **Trigger (fase NOTIFY):** `≥1 finding NEW con severity ≥ soglia` **oppure** `≥1 DRIFT`. Altrimenti silenzio (no rumore).
-- **Telegram** (proposto default, O01): `BOT_TOKEN`+`CHAT_ID` da `.env`. Messaggio compatto: target, score, #NEW per severità, #DRIFT, link al report HTML.
+- **Telegram** (O01 LOCKED — l'unico canale costruito in M2): env `BASTIONE_TELEGRAM_BOT_TOKEN`+`BASTIONE_TELEGRAM_CHAT_ID`. Messaggio compatto: target, score, #NEW per severità, #DRIFT, link al report HTML. Token solo da env, **mai** loggato/incluso nel messaggio (P8).
 - **Email** (SMTP) / **Webhook** (POST JSON con il `RunSummary`) come alternative.
 - Config per-target: `[notify] channel="telegram" min_severity="high"`. **Precedenza soglia (LOCKED):** il flag CLI `--fail-on` vince sul TOML; `min_severity` è il default quando il flag è assente. Una sola soglia effettiva per run, usata sia dal gate (§22) sia dal notify.
 
@@ -933,7 +933,7 @@ bastione scan       --target <nome>
                     [--max-intrusion read-only|probe|mutating]   (default: read-only)
                     [--i-own-this-its-staging]                    (richiesto per mutating non-interattivo)
                     [--accept-baseline]                           (promuove i NEW correnti a baseline)
-                    [--fail-on info|low|medium|high|critical]     (soglia gate/notify; ha precedenza su [notify].min_severity; default proposto high = O03)
+                    [--fail-on info|low|medium|high|critical]     (soglia gate/notify; ha precedenza su [notify].min_severity; default high = O03 LOCKED)
                     [--ci]                                        (non-interattivo, exit codes §22; incompatibile con --unsafe-show-secrets)
                     [--resume]                                    (riprende dalla prima fase né completata né saltata, §24)
                     [--no-fix]                                    (salta la generazione del bundle fix/ §18-bis; default "genera sempre" = proposta O05)
