@@ -291,13 +291,38 @@ class SupabaseModule(Module):
                     base, headers, discovered, supabase_url, detail, target,
                     findings, posture_checks, ctx.target_cfg, read_open,
                 )
-                # CANARY (§11.2): nel path via_bundle le COLONNE sono ignote →
-                # passiamo tables=None. Il canary si auto-gata su ctx.max_intrusion
-                # ed emette CANARY_SKIPPED_NO_SCHEMA (invariante 4): senza schema
-                # non si costruisce un INSERT mirato cleanup-safe, quindi NON scrive.
+                # CANARY (§11.2) nel path via_bundle — colonne IGNOTE ma scrittura
+                # ABILITATA in modo SICURO. La superficie SINTETICA deve coprire
+                # ENTRAMBI i rami dell'invariante 3 (superficie LIMITATA = UNIONE di):
+                #   (a) tabelle con anon_insert=True nella matrice §15 (opt-in
+                #       ESPLICITO dell'owner al write-test, ANCHE se read-protette),
+                #       MA solo quelle effettivamente presenti tra le tabelle scoperte
+                #       dal bundle (`discovered`): solo lì abbiamo una superficie reale
+                #       da sondare. Una tabella solo-in-matrice ma non scoperta non
+                #       avrebbe alcun endpoint enumerato da bersagliare.
+                #   (b) tabelle GIÀ PROVATE LEGGIBILI dall'anon (`read_open`, popolata
+                #       QUI SOPRA da `_rls_test_via_bundle` → `_rls_read_test`).
+                # Per ognuna colonne=[] (ignote). Downstream: `_canary_targets` fa
+                # l'unione `(read_open | matrix_insert) & schema` (qui = chiavi del
+                # sintetico), `_canary_one_table` riceve columns=[] → body {} (soli
+                # default), e il cleanup usa la PK dalla rappresentazione del POST; se
+                # manca, è CANARY_CLEANUP_FAILED (mai una riga orfana silenziosa,
+                # §11.2 inv. 2). Includere il ramo (a) nel sintetico EVITA il gap di
+                # copertura silenzioso: senza, una tabella opt-in read-protetta
+                # sparirebbe perché le chiavi del sintetico erano ESATTAMENTE read_open
+                # (intersezione che la elimina). read_open E matrice ENTRAMBI vuoti →
+                # nessuna tabella su cui testare la scrittura → skip ONESTO (vedi
+                # `_canary_write_test`), NON una scrittura cieca.
+                matrix_insert_in_discovered = {
+                    exp.name for exp in ctx.target_cfg.expectations
+                    if exp.anon_insert
+                } & set(discovered)
+                synthetic: dict[str, list[str]] = {
+                    tbl: [] for tbl in (read_open | matrix_insert_in_discovered)
+                }
                 self._maybe_canary(
-                    ctx, base, headers, target, None, read_open,
-                    findings, posture_checks)
+                    ctx, base, headers, target, synthetic, read_open,
+                    findings, posture_checks, via_bundle=True)
                 return ModuleResult(findings, posture_checks)
             # Nessun nome tabella NEMMENO nel bundle: NON tacere (sarebbe
             # fuorviante). Emettiamo UN segnale onesto — Supabase rilevato ma RLS
@@ -841,23 +866,26 @@ class SupabaseModule(Module):
         base: str,
         headers: dict[str, str],
         target: str,
-        tables: dict[str, list[str]] | None,
+        tables: dict[str, list[str]],
         read_open: set[str],
         findings: list[Finding],
         posture_checks: list[PostureCheck],
+        via_bundle: bool = False,
     ) -> None:
         """SELF-GATE (§11.2 invariante 1): il canary parte SOLO se il tetto della
         run è MUTATING. Con un tetto inferiore NON facciamo NULLA — il modulo si
         comporta esattamente come read-only (M1). Questo è ciò che rende il bump di
         `max_intrusion` a MUTATING innocuo finché la run non è esplicitamente 🔴.
 
-        `tables` None ⇒ path via_bundle (colonne ignote): il canary delega comunque
-        a `_canary_write_test`, che emetterà CANARY_SKIPPED_NO_SCHEMA senza scrivere."""
+        `via_bundle=True` ⇒ path FALLBACK con OpenAPI chiusa: `tables` è la superficie
+        SINTETICA derivata da `read_open` (colonne=[] per ogni tabella read-aperta).
+        Il canary scrive a body VUOTO (soli default) e fa cleanup per PK dalla
+        rappresentazione; se `read_open` è vuoto NON scrive (skip onesto)."""
         if ctx.max_intrusion < IntrusionLevel.MUTATING:
             return  # read-only: canary INTERAMENTE saltato (NON-REGRESSIONE)
         self._canary_write_test(
             ctx, base, headers, target, tables, read_open,
-            findings, posture_checks)
+            findings, posture_checks, via_bundle=via_bundle)
 
     def _canary_write_test(
         self,
@@ -865,10 +893,11 @@ class SupabaseModule(Module):
         base: str,
         headers: dict[str, str],
         target: str,
-        tables: dict[str, list[str]] | None,
+        tables: dict[str, list[str]],
         read_open: set[str],
         findings: list[Finding],
         posture_checks: list[PostureCheck],
+        via_bundle: bool = False,
     ) -> None:
         """Canary write test (§11.2) — MUTATING 🔴, staging-only + ownership.
 
@@ -877,23 +906,29 @@ class SupabaseModule(Module):
         l'ownership non è verificata, `authorize` solleva `IntrusionDenied` e il
         canary ABORTA prima di qualsiasi scrittura. NON la catturiamo qui: deve
         propagare (l'orchestratore la gestisce) — meglio abortire che scrivere
-        senza autorizzazione."""
+        senza autorizzazione.
+
+        `via_bundle=True`: superficie SINTETICA da `read_open` (colonne ignote). La
+        scrittura È abilitata, ma cleanup-safe: body VUOTO + cleanup per PK; se la
+        rappresentazione non dà una PK e col è None il cleanup non confermato →
+        CANARY_CLEANUP_FAILED (mai una riga orfana, §11.2 inv. 2)."""
         # ── INVARIANTE 1 (GATE): authorize PRIMA di tutto, niente scritture senza ──
         authorize(IntrusionLevel.MUTATING, ctx)
-
-        # ── INVARIANTE 4 (SCHEMA NOTO): via_bundle = colonne ignote → NON scrivere ──
-        if tables is None:
-            # Segnale ONESTO INFO: §11.2 richiede cleanup garantito; senza schema
-            # colonne non è possibile un INSERT mirato cleanup-safe → non scriviamo.
-            findings.append(self._canary_skipped_no_schema_finding(
-                ctx, target))
-            return
 
         # ── INVARIANTE 3 (SUPERFICIE LIMITATA): unione delle due liste, mai a caso ──
         targets = self._canary_targets(tables, read_open, ctx.target_cfg)
         if not targets:
-            log.info("canary: nessuna tabella bersaglio (né read-aperta né in "
-                     "matrice anon_insert) → nessuna scrittura (§11.2)")
+            if via_bundle:
+                # Path via_bundle senza alcuna tabella anon-leggibile: NON c'è una
+                # superficie già provata leggibile su cui testare la scrittura in
+                # modo cleanup-safe. Lo si DICHIARA (segnale onesto nel NUOVO
+                # significato), invece di tacere — 'nessun finding di scrittura' non
+                # significa 'scrittura testata'.
+                findings.append(self._canary_skipped_no_schema_finding(
+                    ctx, target))
+            else:
+                log.info("canary: nessuna tabella bersaglio (né read-aperta né in "
+                         "matrice anon_insert) → nessuna scrittura (§11.2)")
             return
 
         supabase_url = (ctx.fingerprint.supabase_url
@@ -1215,27 +1250,33 @@ class SupabaseModule(Module):
     def _canary_skipped_no_schema_finding(
         self, ctx: RunContext, target: str,
     ) -> Finding:
-        """Segnale ONESTO INFO `CANARY_SKIPPED_NO_SCHEMA` (§11.2 invariante 4):
-        nel path via_bundle le COLONNE sono ignote → non è possibile un INSERT
-        mirato con cleanup deterministico, quindi NON si scrive. Lo si dichiara
-        invece di tacere (sarebbe fuorviante: 'nessun finding di scrittura' non
-        significa 'scrittura testata')."""
+        """Segnale ONESTO INFO `CANARY_SKIPPED_NO_SCHEMA` (§11.2): nel path
+        FALLBACK via_bundle (OpenAPI chiusa) il canary scrive sulla superficie GIÀ
+        PROVATA LEGGIBILE dall'anon (`read_open`) — ma se NESSUNA tabella è
+        risultata anon-leggibile non c'è una superficie cleanup-safe su cui testare
+        la scrittura, quindi NON si scrive. Lo si DICHIARA invece di tacere (sarebbe
+        fuorviante: 'nessun finding di scrittura' non significa 'scrittura
+        testata')."""
         location = Location(endpoint="/rest/v1/", url=ctx.fingerprint.supabase_url
                             or ctx.target_cfg.supabase_url)
-        evidence = "canary write saltato: schema colonne non disponibile (via bundle)"
+        evidence = ("canary write saltato (via bundle): nessuna tabella "
+                    "anon-leggibile su cui testare la scrittura")
         description = (
             "Il canary write (§11.2) è stato SALTATO per questa superficie: le "
-            "tabelle sono state enumerate dal bundle JS (OpenAPI chiusa) e quindi "
-            "le COLONNE non sono note. §11.2 richiede un cleanup garantito: senza "
-            "schema colonne non è possibile costruire un INSERT mirato cleanup-safe, "
-            "perciò NON si scrive. La verifica delle policy INSERT resta INCOMPLETA "
-            "per questa superficie (verifica onesta, non un via libera)."
+            "tabelle sono state enumerate dal bundle JS (OpenAPI chiusa) e NESSUNA "
+            "di esse è risultata anon-leggibile in questa run. La scrittura canary "
+            "via bundle viene testata SOLO sulle tabelle già provate leggibili "
+            "dall'anon (`read_open`) — le più probabilmente anche write-aperte e le "
+            "uniche su cui un cleanup è realisticamente verificabile. Senza alcuna "
+            "tabella anon-leggibile non c'è una superficie cleanup-safe su cui "
+            "scrivere, perciò NON si scrive. La verifica delle policy INSERT resta "
+            "INCOMPLETA per questa superficie (verifica onesta, non un via libera)."
         )
         return Finding(
             finding_id=_finding_id("supabase", "CANARY_SKIPPED_NO_SCHEMA", location),
             module="supabase",
             rule_id="CANARY_SKIPPED_NO_SCHEMA",
-            title="Canary write saltato: schema colonne non disponibile (via bundle)",
+            title="Canary write saltato: nessuna tabella anon-leggibile (via bundle)",
             severity=Severity.INFO,
             confidence=Confidence.TENTATIVE,
             target=target,

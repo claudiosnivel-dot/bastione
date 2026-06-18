@@ -644,6 +644,61 @@ def mutating_ctx(*, fp=None, cfg=None):
                     max_intrusion=IntrusionLevel.MUTATING, ownership_verified=True)
 
 
+# ── router VIA_BUNDLE per il canary: surface 401 (OpenAPI chiusa) + POST/DELETE ─
+
+def install_via_bundle_canary_router(
+    monkeypatch, *, rows, post=None, delete=None, surface_status=401,
+):
+    """Router OFFLINE per il path FALLBACK via_bundle (M2: canary su superficie
+    SINTETICA `read_open`). La root REST risponde `surface_status` (≠200 → OpenAPI
+    NON enumerabile → fallback via bundle, colonne IGNOTE → superficie sintetica
+    con colonne=[]). Gli altri tre confini di I/O sono gli stessi di
+    `install_canary_router`:
+
+    `rows`  : nome tabella → (status, payload) per la GET RLS read (popola read_open
+              quando 200+righe).
+    `post`  : nome tabella → (status, payload) per il POST canary (default 401).
+    `delete`: nome tabella → esito del DELETE di cleanup (int status o (status,
+              payload)). Default: 200 + rappresentazione non vuota (1 riga rimossa)."""
+    post = post or {}
+    delete = delete or {}
+    calls: list[tuple] = []
+
+    def _delete_outcome(spec):
+        if isinstance(spec, tuple):
+            return spec
+        return (spec, [{"id": 0}])
+
+    def get_router(url, headers):
+        calls.append(("GET", url))
+        if url.rstrip("/").endswith("/rest/v1"):
+            return fake_resp(status_code=surface_status, payload=None)
+        for tbl, (status, payload) in rows.items():
+            if f"/rest/v1/{tbl}?" in url or url.rstrip("/").endswith(f"/rest/v1/{tbl}"):
+                return fake_resp(status_code=status, payload=payload)
+        return None
+
+    def post_router(url, headers, json):
+        calls.append(("POST", url, json))
+        for tbl, (status, payload) in post.items():
+            if url.rstrip("/").endswith(f"/rest/v1/{tbl}"):
+                return fake_resp(status_code=status, payload=payload)
+        return fake_resp(status_code=401, payload=None)  # default: INSERT protetto
+
+    def delete_router(url, headers):
+        calls.append(("DELETE", url))
+        for tbl, spec in delete.items():
+            if f"/rest/v1/{tbl}" in url:
+                status, payload = _delete_outcome(spec)
+                return fake_resp(status_code=status, payload=payload)
+        return fake_resp(status_code=200, payload=[{"id": 0}])
+
+    monkeypatch.setattr(supa, "_get", get_router)
+    monkeypatch.setattr(supa, "_post", post_router)
+    monkeypatch.setattr(supa, "_delete", delete_router)
+    return calls
+
+
 # ── INVARIANTE 1: GATE — il canary è il self-gate su ctx.max_intrusion ──────
 
 def test_canary_skipped_when_max_intrusion_below_mutating(monkeypatch):
@@ -789,39 +844,28 @@ def test_canary_targets_matrix_insert_table_even_if_read_protected(monkeypatch):
     assert any(u.rstrip("/").endswith("/rest/v1/inbox") for u in post_urls)
 
 
-# ── INVARIANTE 4: SOLO con SCHEMA NOTO — via_bundle non scrive ──────────────
+# ── VIA_BUNDLE: colonne IGNOTE → scrittura cleanup-safe sulla superficie read_open ─
 
-def test_canary_via_bundle_skips_no_schema(monkeypatch):
-    """INVARIANTE 4: nel path via_bundle (colonne IGNOTE) il canary NON scrive:
-    emette UN segnale onesto INFO CANARY_SKIPPED_NO_SCHEMA e NESSUN POST."""
+def test_canary_via_bundle_writes_on_read_open_surface(monkeypatch):
+    """M2: nel path via_bundle (OpenAPI chiusa, colonne IGNOTE) il canary NON viene
+    più saltato in cieco — scrive sulla superficie GIÀ PROVATA LEGGIBILE dall'anon
+    (`read_open`) con body VUOTO ({}, soli default) e cleanup per PK. Qui la tabella
+    è read-aperta → ci DEVE essere un POST verso di essa (e nessun
+    CANARY_SKIPPED_NO_SCHEMA: c'è una superficie su cui testare la scrittura)."""
     fp = make_fp(discovered_tables=["clienti"])
-    rows = {"clienti": (200, [{"id": 1, "email": "x@y.it"}])}
-    calls = install_canary_router(
-        monkeypatch, schema=None, rows=rows, post={"clienti": (201, None)})
-    # surface 401 → via_bundle: sovrascriviamo il get_router perché la root REST
-    # risponda 401 (schema non enumerabile).
-
-    def get_401(url, headers):
-        calls.append(("GET", url))
-        if url.rstrip("/").endswith("/rest/v1"):
-            return fake_resp(status_code=401, payload=None)
-        for tbl, (status, payload) in rows.items():
-            if f"/rest/v1/{tbl}?" in url or url.rstrip("/").endswith(f"/rest/v1/{tbl}"):
-                return fake_resp(status_code=status, payload=payload)
-        return None
-
-    monkeypatch.setattr(supa, "_get", get_401)
+    rows = {"clienti": (200, [{"id": 1, "email": "x@y.it"}])}  # read-open
+    calls = install_via_bundle_canary_router(
+        monkeypatch, rows=rows,
+        post={"clienti": (201, [{"id": 5}])}, delete={"clienti": 200})
 
     res = supa.SupabaseModule().run(mutating_ctx(fp=fp))
 
-    # NESSUN POST nel path via_bundle (schema colonne ignoto)
-    assert not any(c[0] == "POST" for c in calls)
-    skipped = [f for f in res.findings if f.rule_id == "CANARY_SKIPPED_NO_SCHEMA"]
-    assert len(skipped) == 1
-    f = skipped[0]
-    assert f.severity is Severity.INFO
-    # onesto sul perché: cleanup garantito richiede schema colonne noto
-    assert "schema" in f.description.lower() or "colonne" in f.description.lower()
+    posts = [c for c in calls if c[0] == "POST"]
+    assert any(c[1].rstrip("/").endswith("/rest/v1/clienti") for c in posts)
+    # body VUOTO: senza schema colonne si inserisce coi soli default
+    assert any(c[2] == {} for c in posts)
+    # NON più lo skip "no schema": la superficie read-aperta è testabile
+    assert not any(f.rule_id == "CANARY_SKIPPED_NO_SCHEMA" for f in res.findings)
 
 
 # ── ESITO: POST protetto (401/403) → posture write passed ───────────────────
@@ -1302,6 +1346,259 @@ def test_canary_personal_columns_accepted_is_critical(monkeypatch):
     writes = [f for f in res.findings if f.rule_id == "RLS_WRITE_OPEN"]
     assert len(writes) == 1
     assert writes[0].severity is Severity.CRITICAL
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CANARY VIA_BUNDLE (M2) — canary write ABILITATO sulla superficie SINTETICA
+# read_open quando l'OpenAPI è chiusa (caso reale: il Supabase hosted moderno
+# blocca GET /rest/v1/ all'anon). Colonne IGNOTE → body {} (soli default),
+# cleanup per PK dalla rappresentazione. Tutto OFFLINE: _get/_post/_delete
+# monkeypatchati. Le 5 INVARIANTI §11.2 restano LOCKED.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_canary_via_bundle_read_open_post_201_writes_and_cleans(monkeypatch):
+    """VIA_BUNDLE + read_open={'canary'} + MUTATING + POST 201 (rappresentazione
+    con PK) + DELETE conferma 1 riga → Finding RLS_WRITE_OPEN (written=True) su
+    'canary', cleanup CONFERMATO (NESSUN CANARY_CLEANUP_FAILED). NON più
+    CANARY_SKIPPED_NO_SCHEMA: la scrittura sulla superficie read-aperta è ora
+    eseguita anche senza schema colonne (body {} = soli default)."""
+    fp = make_fp(discovered_tables=["canary"])
+    rows = {"canary": (200, [{"id": 1, "x": 1}])}  # read-open → entra in read_open
+    calls = install_via_bundle_canary_router(
+        monkeypatch, rows=rows,
+        post={"canary": (201, [{"id": 42}])},  # rappresentazione con PK
+        delete={"canary": 200})
+
+    res = supa.SupabaseModule().run(mutating_ctx(fp=fp))
+
+    # il POST è stato eseguito sulla tabella read-aperta, con body VUOTO ({})
+    posts = [c for c in calls if c[0] == "POST"]
+    assert any(c[1].rstrip("/").endswith("/rest/v1/canary") for c in posts)
+    assert any(c[2] == {} for c in posts), "body del POST via_bundle deve essere {}"
+    # RLS_WRITE_OPEN written=True (FIRM, MUTATING) su 'canary'
+    writes = [f for f in res.findings if f.rule_id == "RLS_WRITE_OPEN"]
+    assert len(writes) == 1
+    f = writes[0]
+    assert f.confidence is Confidence.FIRM
+    assert f.intrusion_used is IntrusionLevel.MUTATING
+    assert f.location.endpoint == "/rest/v1/canary"
+    # cleanup CONFERMATO (DELETE chiamato + 1 riga rimossa) → nessun fallimento
+    assert any(c[0] == "DELETE" for c in calls)
+    assert not any(f.rule_id == "CANARY_CLEANUP_FAILED" for f in res.findings)
+    # NON c'è più lo skip "no schema" su questa superficie
+    assert not any(f.rule_id == "CANARY_SKIPPED_NO_SCHEMA" for f in res.findings)
+
+
+def test_canary_via_bundle_201_no_pk_col_none_is_cleanup_failed(monkeypatch):
+    """PUNTO DI SICUREZZA CRITICO: VIA_BUNDLE → col=None (colonne ignote). POST 201
+    ma la rappresentazione NON contiene una PK utilizzabile → non è costruibile né
+    un DELETE per PK né un filtro `?col=eq.marker` mirato → la verifica DEVE
+    risolvere in CANARY_CLEANUP_FAILED (CRITICAL), MAI un successo silenzioso, MAI
+    una riga orfana. Qui il DELETE 'ultima spiaggia' (?marker=eq.…) non rimuove
+    nulla (la colonna non esiste / 0 righe) → non confermato → CRITICAL."""
+    fp = make_fp(discovered_tables=["canary"])
+    rows = {"canary": (200, [{"id": 1, "x": 1}])}
+    calls = install_via_bundle_canary_router(
+        monkeypatch, rows=rows,
+        post={"canary": (201, [])},          # 201 SENZA PK nella rappresentazione
+        delete={"canary": (204, [])})        # il DELETE non rimuove nulla (0 righe)
+
+    res = supa.SupabaseModule().run(mutating_ctx(fp=fp))
+
+    # il POST è avvenuto (riga canary scritta) e il DELETE è stato TENTATO…
+    assert any(c[0] == "POST" for c in calls)
+    assert any(c[0] == "DELETE" for c in calls)
+    # …ma il cleanup NON è confermato → CANARY_CLEANUP_FAILED CRITICAL con marker.
+    failed = [f for f in res.findings if f.rule_id == "CANARY_CLEANUP_FAILED"]
+    assert len(failed) == 1
+    f = failed[0]
+    assert f.severity is Severity.CRITICAL
+    assert f.confidence is Confidence.FIRM
+    assert "canary" in f.evidence
+    assert "__bastione_canary_" in f.evidence
+    # nessun successo silenzioso: la riga orfana è SEGNALATA, non taciuta.
+
+
+def test_canary_via_bundle_delete_2xx_zero_rows_is_cleanup_failed(monkeypatch):
+    """VIA_BUNDLE + POST 201 (con PK) ma DELETE 2xx con 0 righe rimosse (RLS che
+    filtra il DELETE) → CANARY_CLEANUP_FAILED: lo status 2xx da solo NON conferma,
+    la riga canary resterebbe orfana (invariante 2)."""
+    fp = make_fp(discovered_tables=["canary"])
+    rows = {"canary": (200, [{"id": 1, "x": 1}])}
+    calls = install_via_bundle_canary_router(
+        monkeypatch, rows=rows,
+        post={"canary": (201, [{"id": 7}])},  # PK presente → DELETE per id
+        delete={"canary": (204, [])})         # 2xx ma 0 righe rimosse
+
+    res = supa.SupabaseModule().run(mutating_ctx(fp=fp))
+
+    assert any(c[0] == "DELETE" for c in calls)
+    failed = [f for f in res.findings if f.rule_id == "CANARY_CLEANUP_FAILED"]
+    assert len(failed) == 1
+    assert failed[0].severity is Severity.CRITICAL
+    assert "__bastione_canary_" in failed[0].evidence
+
+
+def test_canary_via_bundle_post_protected_no_finding_no_cleanup(monkeypatch):
+    """VIA_BUNDLE + POST 401/403 → INSERT protetto → posture write 'protected'
+    passed=True, NESSUN finding di scrittura, NESSUN cleanup (niente riga scritta)."""
+    fp = make_fp(discovered_tables=["canary"])
+    rows = {"canary": (200, [{"id": 1, "x": 1}])}
+    calls = install_via_bundle_canary_router(
+        monkeypatch, rows=rows, post={"canary": (403, None)})
+
+    res = supa.SupabaseModule().run(mutating_ctx(fp=fp))
+
+    pcs = [pc for pc in res.posture_checks
+           if pc.check_id == "POSTURE_RLS_WRITE_canary"]
+    assert len(pcs) == 1
+    assert pcs[0].passed is True
+    assert not any(f.rule_id == "RLS_WRITE_OPEN" for f in res.findings)
+    # niente da pulire → nessun DELETE
+    assert not any(c[0] == "DELETE" for c in calls)
+
+
+def test_canary_via_bundle_empty_read_open_no_write_honest_signal(monkeypatch):
+    """VIA_BUNDLE con read_open VUOTO (nessuna tabella anon-leggibile): NESSUNA
+    scrittura (nessun POST), e UN segnale ONESTO nel nuovo significato — non
+    'nessuno schema' ma 'nessuna tabella anon-leggibile su cui testare la
+    scrittura'."""
+    fp = make_fp(discovered_tables=["protetta"])
+    rows = {"protetta": (401, None)}  # NON read-open → read_open resta vuoto
+    calls = install_via_bundle_canary_router(
+        monkeypatch, rows=rows, post={"protetta": (201, [{"id": 1}])})
+
+    res = supa.SupabaseModule().run(mutating_ctx(fp=fp))
+
+    # NESSUNA scrittura: nessuna tabella read-aperta su cui agire
+    assert not any(c[0] == "POST" for c in calls)
+    assert not any(f.rule_id == "RLS_WRITE_OPEN" for f in res.findings)
+    # segnale onesto nel NUOVO significato: niente "no schema", ma "nessuna tabella
+    # anon-leggibile su cui testare la scrittura".
+    skip = [f for f in res.findings if f.rule_id == "CANARY_SKIPPED_NO_SCHEMA"]
+    assert len(skip) == 1
+    msg = (skip[0].description + " " + skip[0].evidence).lower()
+    assert "legg" in msg  # "leggibile"/"anon-leggibile": il NUOVO significato onesto
+
+
+def test_canary_via_bundle_read_only_run_skips_canary_entirely(monkeypatch):
+    """NON-REGRESSIONE (self-gate, INVARIANTE 1): VIA_BUNDLE ma run READ-ONLY (non
+    MUTATING) → il canary è INTERAMENTE saltato: nessun POST, nessun DELETE, nessun
+    finding/posture di scrittura, nessun CANARY_*."""
+    fp = make_fp(discovered_tables=["canary"])
+    rows = {"canary": (200, [{"id": 1, "x": 1}])}
+    calls = install_via_bundle_canary_router(
+        monkeypatch, rows=rows, post={"canary": (201, [{"id": 1}])})
+
+    # max_intrusion=READ_ONLY (default make_ctx) → self-gate chiude il canary
+    res = supa.SupabaseModule().run(make_ctx(fp=fp))
+
+    assert not any(c[0] == "POST" for c in calls)
+    assert not any(c[0] == "DELETE" for c in calls)
+    assert not any(f.rule_id == "RLS_WRITE_OPEN" for f in res.findings)
+    assert not any(f.rule_id.startswith("CANARY") for f in res.findings)
+    assert not any(pc.check_id.startswith("POSTURE_RLS_WRITE_")
+                   for pc in res.posture_checks)
+
+
+def test_canary_via_bundle_matrix_anon_insert_true_suppressed(monkeypatch):
+    """ORACOLO §15: VIA_BUNDLE + read_open={'t'} + cfg dichiara anon_insert=True per
+    't' + POST 201 → finding RLS_WRITE_OPEN SOPPRESSO, posture write 'expected'
+    (passed=True) conforme a §15. Il cleanup va comunque eseguito (riga rimossa)."""
+    cfg = make_cfg(expectations=[TableExpectation(name="t", anon_insert=True)])
+    fp = make_fp(discovered_tables=["t"])
+    rows = {"t": (200, [{"id": 1, "x": 1}])}  # read-open
+    calls = install_via_bundle_canary_router(
+        monkeypatch, rows=rows,
+        post={"t": (201, [{"id": 9}])}, delete={"t": 200})
+
+    res = supa.SupabaseModule().run(mutating_ctx(fp=fp, cfg=cfg))
+
+    # finding di scrittura SOPPRESSO (scrittura ATTESA by design)
+    assert not any(f.rule_id == "RLS_WRITE_OPEN" for f in res.findings)
+    # posture write 'expected' passed=True che cita §15
+    pcs = [pc for pc in res.posture_checks
+           if pc.check_id == "POSTURE_RLS_WRITE_t"]
+    assert len(pcs) == 1
+    assert pcs[0].passed is True
+    assert "§15" in pcs[0].detail
+    # la riga canary è comunque stata rimossa → nessun cleanup fallito
+    assert any(c[0] == "DELETE" for c in calls)
+    assert not any(f.rule_id == "CANARY_CLEANUP_FAILED" for f in res.findings)
+
+
+def test_canary_via_bundle_matrix_insert_read_protected_is_write_tested(monkeypatch):
+    """REGRESSIONE (INVARIANTE 3, ramo a, gap LOW chiuso): nel path VIA_BUNDLE una
+    tabella con anon_insert=True nella matrice §15 (opt-in ESPLICITO dell'owner al
+    write-test) DEVE essere write-testata ANCHE se è read-PROTETTA — esattamente
+    come nel path OpenAPI (test_canary_targets_matrix_insert_table_even_if_read_
+    protected). Prima del fix la superficie sintetica era {t: [] for t in read_open}:
+    le sue chiavi erano ESATTAMENTE read_open, quindi `_canary_targets` (che interseca
+    `(read_open|matrix_insert) & schema`) eliminava ogni tabella matrice NON read-
+    aperta → l'opt-in read-protetto spariva SENZA segnale onesto specifico (lo skip
+    'no schema' scatta solo a read_open interamente vuoto). 'pub' read-aperta NON
+    deve mascherare il gap: read_open è non-vuoto e il ramo (a) era disabilitato."""
+    cfg = make_cfg(expectations=[
+        TableExpectation(name="inbox", anon_insert=True),
+    ])
+    # inbox e pub scoperte dal bundle; inbox è read-PROTETTA (401), pub read-aperta.
+    fp = make_fp(discovered_tables=["inbox", "pub"])
+    rows = {"inbox": (401, None), "pub": (200, [{"id": 1}])}
+    calls = install_via_bundle_canary_router(
+        monkeypatch, rows=rows,
+        # inbox: write APERTA (201) → opt-in conforme; pub: write protetta (401).
+        post={"inbox": (201, [{"id": 5}]), "pub": (401, None)},
+        delete={"inbox": 200})
+
+    res = supa.SupabaseModule().run(mutating_ctx(fp=fp, cfg=cfg))
+
+    # il POST su 'inbox' (matrice opt-in, read-protetta) È stato eseguito (ramo a)…
+    post_urls = [c[1] for c in calls if c[0] == "POST"]
+    assert any(u.rstrip("/").endswith("/rest/v1/inbox") for u in post_urls), \
+        "la tabella matrice anon_insert=True read-protetta DEVE essere write-testata"
+    # …con body VUOTO ({}, colonne ignote) come tutta la superficie via_bundle.
+    inbox_posts = [c for c in calls
+                   if c[0] == "POST" and c[1].rstrip("/").endswith("/rest/v1/inbox")]
+    assert all(c[2] == {} for c in inbox_posts)
+    # anon_insert=True → scrittura ATTESA by design → finding SOPPRESSO, posture
+    # write 'expected' passed=True (oracolo §15), e la riga canary è stata rimossa.
+    assert not any(f.rule_id == "RLS_WRITE_OPEN"
+                   and f.location.endpoint == "/rest/v1/inbox"
+                   for f in res.findings)
+    pcs = [pc for pc in res.posture_checks
+           if pc.check_id == "POSTURE_RLS_WRITE_inbox"]
+    assert len(pcs) == 1 and pcs[0].passed is True
+    assert any(c[0] == "DELETE" for c in calls)
+    assert not any(f.rule_id == "CANARY_CLEANUP_FAILED" for f in res.findings)
+    # NON c'è lo skip onesto: read_open era non-vuoto E il ramo (a) NON è più muto.
+    assert not any(f.rule_id == "CANARY_SKIPPED_NO_SCHEMA" for f in res.findings)
+
+
+def test_canary_via_bundle_matrix_insert_not_discovered_is_not_targeted(monkeypatch):
+    """INVARIANTE 3 (mai blind-write): una tabella con anon_insert=True nella matrice
+    ma NON presente tra le tabelle scoperte dal bundle (`discovered`) NON è
+    bersagliata — non c'è alcuna superficie reale enumerata da sondare. Il ramo (a)
+    è limitato a `matrix_insert & discovered`. Con read_open vuoto e nessuna tabella
+    matrice scoperta, NON si scrive: skip ONESTO."""
+    cfg = make_cfg(expectations=[
+        TableExpectation(name="fantasma", anon_insert=True),  # NON in discovered
+    ])
+    fp = make_fp(discovered_tables=["protetta"])
+    rows = {"protetta": (401, None)}  # read-protetta → read_open vuoto
+    calls = install_via_bundle_canary_router(
+        monkeypatch, rows=rows,
+        post={"fantasma": (201, [{"id": 1}]), "protetta": (201, [{"id": 1}])})
+
+    res = supa.SupabaseModule().run(mutating_ctx(fp=fp, cfg=cfg))
+
+    # nessun POST: 'fantasma' non scoperta (no surface), 'protetta' non in matrice
+    # e read-protetta → nessun bersaglio.
+    assert not any(c[0] == "POST" for c in calls)
+    assert not any(f.rule_id == "RLS_WRITE_OPEN" for f in res.findings)
+    # con superficie write VUOTA (né ramo a né ramo b) il segnale onesto scatta.
+    skip = [f for f in res.findings if f.rule_id == "CANARY_SKIPPED_NO_SCHEMA"]
+    assert len(skip) == 1
 
 
 # ── evidence redatta (P8): il POST non perde i valori delle righe ───────────
