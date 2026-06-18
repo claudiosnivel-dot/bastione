@@ -7,6 +7,8 @@
 >
 > **Rev. 2026-06-12 (v2.1, stessa versione):** chiarimenti post-audit di coerenza — gate vs declassamento (§6/§7), semantica `known`/`accepted` (§16/§25), baseline committabile per il CI gate (L05/§22), normalizzazione content-hash nel `finding_id` (§5.2/§16), fasi saltate e `--resume` (§24), risoluzione `<n>.local.toml` (§6/§29), contratti mancanti (§5.6), confine headers/cloudflare (§12), criterio severità RLS (§11.1), fallback bundle senza katana (§8), Appendice A allineata al dev-state. **Nota sul nome file:** resta `BASTIONE-BLUEPRINT-v2.md` per ogni revisione 2.x (i riferimenti incrociati citano il filename); la versione vera è in questa intestazione.
 >
+> **Metodo di sviluppo (workflow-first):** Bastione si costruisce con i **Dynamic Workflows** — **una milestone = un dynamic workflow** (strumento `Workflow` di Claude Code): builder ‖ blind-review adversariale ‖ fixer, con l'orchestratore (sessione Opus 4.8) che fa ground-truth coi test e committa. Il **come** è normato in **`BASTIONE-WORKFLOWS.md`**; questo blueprint resta il **cosa**.
+>
 > **Tesi (una riga):** Bastione non è uno scanner che lanci una volta. È una **sentinella** che conosce la *baseline* delle tue app, **simula un attaccante esterno** contro infrastruttura che possiedi, **urla quando compare qualcosa di nuovo e pericoloso**, e ti dice **esattamente come ripararlo** — convergendo sempre in SARIF + report + alert.
 
 ---
@@ -975,6 +977,8 @@ L'onestà qui *è* una feature: il posture score non gonfia, e un finding `TENTA
 
 > **Ordine d'oro per Claude Code:** non saltare avanti. M0 deve girare end-to-end (anche con un solo detector e la sola RLS read) **prima** di toccare M1. La tentazione di implementare tutto il catalogo o le scritture subito è l'over-engineering contro cui questo blueprint mette in guardia (P5).
 
+> **Esecuzione (il *come*):** ogni milestone si chiude con **un dynamic workflow** (non uno per step) — task-graph, ondate parallele per ownership di file, blind-review Opus, ground-truth coi test. La metodologia è normata in **`BASTIONE-WORKFLOWS.md`** (§7 mappa milestone→workflow; §8 il task-graph forward di M3).
+
 ---
 
 ## 28 · Workflow Claude Code — permission matrix operativa
@@ -991,6 +995,8 @@ Regole per l'agente che implementa/esegue. Mappano la matrice §7 sulle azioni d
 | installare tool esterni di sistema (nuclei, ZAP…) | 🟡 conferma | proponi comandi, lascia decidere a te |
 
 **Stop rules (LOCKED):** se `environment` non è dichiarato, o il target non risolve, o manca `ownership_token` **per una run che chiede > read-only** → **fermati e chiedi**, non assumere. (Per il read-only puro — tutto M0 — il token non è richiesto: §7.1. La sua assenza non blocca.) Mai puntare un target che non sia esplicitamente tuo nel TOML.
+
+> **Dentro un dynamic workflow** questa matrice vale per **OGNI agente**, e i guardrail vanno **iniettati in ogni prompt**: i builder scrivono file + girano test **offline**, **non** eseguono git, toccano **solo** i file in-scope, **non** puntano target live e **non** superano `READ_ONLY`. I confini operativi del builder (con le lezioni apprese in M1/M2 su enforcement git e scoping) sono dettagliati in **`BASTIONE-WORKFLOWS.md` §6**.
 
 ---
 

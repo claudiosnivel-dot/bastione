@@ -1,6 +1,8 @@
 # PROMPT 00 — INIZIO PROGETTO (Bastione)
 
 > **Come usare questo file:** incollalo in Claude Code **una sola volta**, al primissimo avvio del progetto (repo vuota). Bootstrappa Bastione e produce il primo incremento di M0. Da lì in poi userai `PROMPT-01-INIZIO-SESSIONE` e `PROMPT-02-FINE-SESSIONE` a ogni giro.
+>
+> **Nota (storica):** questo bootstrap è **già stato eseguito** — M0/M1/M2 sono fatte (vedi `BASTIONE-SESSION-STATE.md`). Resta qui come riferimento del primo avvio. Dallo step M0 in poi lo sviluppo è **workflow-first**: una milestone = **un dynamic workflow** (builder ‖ blind-review ‖ fixer). Il metodo è normato in **`BASTIONE-WORKFLOWS.md`**.
 
 ---
 
