@@ -11,6 +11,10 @@ targets/*.local.toml
 # id/status/date (nessuna evidenza) ed è committata apposta per il diff in CI (§22).
 # Non aggiungere `baselines/` qui sotto.
 
+# Sandbox-site da deployare (materiale di deploy locale, non codice del tool;
+# contiene la anon key pubblica del sandbox usa-e-getta) → mai nel repo.
+bozza/
+
 # Ambiente / cache Python
 .venv/
 venv/
