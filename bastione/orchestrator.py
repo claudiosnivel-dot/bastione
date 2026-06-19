@@ -111,7 +111,9 @@ def _ensure_modules_loaded() -> None:
     import bastione.modules.nuclei.module  # noqa: F401  (§14 black-box esterno)
     import bastione.modules.secrets.detectors  # noqa: F401  (popola DETECTORS)
     import bastione.modules.secrets.module  # noqa: F401
+    import bastione.modules.semgrep.module  # noqa: F401  (§14 white-box SAST, gated su source_path)
     import bastione.modules.supabase.module  # noqa: F401
+    import bastione.modules.trivy.module  # noqa: F401  (§14 white-box SCA, gated su source_path)
     import bastione.modules.zap.module  # noqa: F401  (§14 black-box esterno)
 
 
@@ -135,6 +137,11 @@ class Orchestrator:
         self._max_intrusion: IntrusionLevel = IntrusionLevel.READ_ONLY
         self._accept_baseline: bool = False
         self._no_fix: bool = False
+        # NOTIFY abilitata? (contratto outward-facing, §7/§19): le ri-scansioni di
+        # sola verifica (verify / export-defectdojo, via _rescan_read_only) passano
+        # notify=False per sopprimere la fase NOTIFY — nessuna azione outward-facing
+        # (POST Telegram) in un comando dichiarato READ_ONLY e di sola lettura.
+        self._notify_enabled: bool = True
         # Soglia effettiva del trigger NOTIFY (§19): se passata da --fail-on vince
         # sul TOML (notify_min_severity). None → si usa cfg.notify_min_severity.
         self._fail_on: Severity | None = None
@@ -155,6 +162,7 @@ class Orchestrator:
         resume: bool = False,
         accept_baseline: bool = False,
         no_fix: bool = False,
+        notify: bool = True,
         fail_on: Severity | None = None,
     ) -> RunState:
         self._target = target
@@ -162,6 +170,11 @@ class Orchestrator:
         self._max_intrusion = max_intrusion
         self._accept_baseline = accept_baseline
         self._no_fix = no_fix
+        # NOTIFY abilitata? (§7/§19, contratto outward-facing): di default sì (la
+        # `scan` può avvisare). Le ri-scansioni di sola verifica passano notify=False
+        # per sopprimere la fase NOTIFY — un comando READ_ONLY/di sola lettura non
+        # deve mai compiere un'azione outward-facing (es. POST Telegram).
+        self._notify_enabled = notify
         # Soglia del trigger NOTIFY (§19 LOCKED): --fail-on vince sul TOML. La CLI
         # passa qui la severità già risolta da --fail-on (o None se assente).
         self._fail_on = fail_on
@@ -265,6 +278,12 @@ class Orchestrator:
                     return False
                 return counts.get("new", 0) + counts.get("known", 0) > 0
             # NOTIFY (§19): notifier configurato E (≥1 NEW ≥ soglia OPPURE ≥1 DRIFT).
+            # Sopravvento del contratto outward-facing (§7): una ri-scansione di sola
+            # verifica (verify / export-defectdojo) passa notify=False — la fase
+            # NOTIFY è soppressa del tutto, nessun POST Telegram da un comando
+            # dichiarato READ_ONLY e di sola lettura, a prescindere dai counts.
+            if not self._notify_enabled:
+                return False
             channel = self._cfg.notify_channel if self._cfg else "none"
             if channel == "none":
                 return False

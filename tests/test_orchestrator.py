@@ -790,6 +790,58 @@ def test_notify_dispatches_when_trigger_fires(tmp_path: Path, monkeypatch):
     assert summary.report_path.endswith("report.html")
 
 
+def test_run_notify_false_suppresses_notify_even_when_trigger_fires(
+        tmp_path: Path, monkeypatch):
+    """REGRESSIONE (§7/§19): con `notify=False` la fase NOTIFY è SOPPRESSA del tutto,
+    anche se il trigger sarebbe soddisfatto ([notify].channel='telegram' + NEW HIGH ≥
+    soglia). È il parametro che `_rescan_read_only` passa per verify/export-defectdojo:
+    una ri-scansione di sola lettura non deve compiere azioni outward-facing (POST
+    Telegram). `notify.dispatch` è armato per esplodere se invocato: NON deve partire."""
+    def _boom_dispatch(cfg, summary):
+        raise AssertionError(
+            "notify.dispatch invocato con notify=False: azione outward-facing vietata (§7/§19)")
+
+    monkeypatch.setattr(orch_mod.notify, "dispatch", _boom_dispatch, raising=True)
+
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    stub = _StubModule("supabase", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING_NOTIFY), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g", notify=False)   # NON deve sollevare
+
+    # il trigger sarebbe soddisfatto (NEW HIGH), ma NOTIFY è soppressa → skipped.
+    assert state.counts["new_by_severity"]["high"] == 1
+    assert "NOTIFY" in state.phases_skipped
+    assert "NOTIFY" not in state.phases_completed
+    # le altre fasi obbligatorie restano completate (la run è andata fino in fondo).
+    for ph in MANDATORY:
+        assert ph in state.phases_completed, f"{ph} non completata"
+
+
+def test_run_notify_default_true_still_dispatches(tmp_path: Path, monkeypatch):
+    """Controprova: il default `notify=True` (es. `scan`) lascia scattare NOTIFY con
+    lo stesso trigger — la soppressione è opt-in, non cambia il comportamento di scan."""
+    captured: dict = {}
+    monkeypatch.setattr(
+        orch_mod.notify, "dispatch",
+        lambda cfg, summary: captured.setdefault("called", True), raising=True)
+
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    stub = _StubModule("supabase", findings=[finding])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING_NOTIFY), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g")   # notify=True di default
+
+    assert "NOTIFY" in state.phases_completed
+    assert captured.get("called") is True
+
+
 def test_notify_dispatch_raising_does_not_crash_run(tmp_path: Path, monkeypatch):
     """INVARIANTE chiave (§19): un dispatch che solleva NON deve far fallire la run.
     NOTIFY resta in phases_completed e la run arriva a PERSIST."""

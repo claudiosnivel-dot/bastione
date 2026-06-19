@@ -29,6 +29,7 @@ un exit code ≠ 0 — MAI uno stacktrace in faccia all'utente.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -47,9 +48,16 @@ from bastione.baseline.diff import (
 )
 from bastione.enums import IntrusionLevel, Severity, Status
 from bastione.gate import IntrusionDenied, PreconditionDenied
+from bastione.models import Fingerprint
+from bastione.normalize.defectdojo import (
+    push_to_defectdojo,
+    to_defectdojo,
+    write_defectdojo_export,
+)
 from bastione.orchestrator import (
     DEFAULT_BASELINES_ROOT,
     DEFAULT_RUNS_ROOT,
+    FINGERPRINT_FILENAME,
     REPORT_FILENAME,
     SARIF_FILENAME,
     Orchestrator,
@@ -62,6 +70,12 @@ from bastione.portfolio import (
     run_portfolio,
 )
 from bastione.state import RunState
+from bastione.surface.inventory import (
+    build_snapshot,
+    diff_snapshots,
+    load_surface_baseline,
+    save_surface_baseline,
+)
 
 log = logging.getLogger("bastione.cli")
 
@@ -75,7 +89,7 @@ err_console = Console(stderr=True)
 
 # Tool esterni opzionali sondati da `doctor` (§24): l'assenza degrada il recon
 # (§8), non è un errore — è proprio lo scopo del comando rilevarla.
-_EXTERNAL_TOOLS = ["whatweb", "katana", "testssl.sh", "nuclei", "zap"]
+_EXTERNAL_TOOLS = ["whatweb", "katana", "testssl.sh", "nuclei", "zap", "semgrep", "trivy"]
 
 
 class IntrusionChoice(str, Enum):
@@ -589,6 +603,51 @@ _VERIFY_LABEL = {
 }
 
 
+def _rescan_read_only(target: str) -> Orchestrator:
+    """Ri-scansione READ_ONLY del target, riusabile da `verify` ed `export-defectdojo`.
+
+    Esegue l'orchestratore con il tetto READ_ONLY, `--no-fix` (nessun bundle) e
+    `notify=False`: è SOLO una ri-scansione di sola lettura del target — nessuna
+    scrittura sul target, nessuna azione outward-facing. Ritorna l'`Orchestrator`
+    (da cui i chiamanti leggono `_result` e `_run_dir`).
+
+    `notify=False` è il punto CHIAVE del contratto outward-facing (§7/§19): `run()`
+    esegue l'INTERA pipeline, NOTIFY inclusa, e la precondizione NOTIFY non dipende
+    da `max_intrusion` né da `no_fix`. Senza sopprimerla, un target con
+    `[notify].channel='telegram'` e finding NEW ≥ soglia farebbe partire un POST
+    Telegram REALE anche da `verify`/`export-defectdojo` — in diretta contraddizione
+    col docstring "nessuna azione outward-facing". Con `notify=False`
+    l'orchestratore salta la fase NOTIFY del tutto (vedi `_should_run`).
+
+    Gli errori sono mappati ai medesimi exit code di `scan` (§22/§25): precondizione
+    del gate → exit 2, ownership challenge → exit 3, config target assente → exit 4,
+    ogni altra eccezione inattesa → exit 4 (catch-all finale, niente stacktrace)."""
+    orch = Orchestrator()
+    try:
+        orch.run(
+            target,
+            max_intrusion=IntrusionLevel.READ_ONLY,
+            no_fix=True,   # ri-scansione di sola lettura: non rigenera il bundle fix/
+            notify=False,  # contratto outward-facing (§7/§19): nessun POST Telegram
+        )
+    except PreconditionDenied as exc:
+        err_console.print(f"[bold red]Precondizione negata dal gate (§7):[/] {exc}")
+        raise typer.Exit(code=2)
+    except IntrusionDenied as exc:
+        err_console.print(f"[bold red]Run negata dal gate (§7):[/] {exc}")
+        raise typer.Exit(code=3)
+    except FileNotFoundError as exc:
+        err_console.print(f"[bold red]Config target non trovata:[/] {exc}")
+        raise typer.Exit(code=4)
+    except Exception as exc:  # noqa: BLE001 — catch-all §22/§25 (LOCKED)
+        err_console.print(
+            f"[bold red]Errore interno durante la ri-scansione:[/] {exc}\n"
+            "La ri-scansione è stata interrotta da un errore inatteso (tool esterno "
+            "o bug interno). Se persiste, apri un'issue (§22/§25).")
+        raise typer.Exit(code=4)
+    return orch
+
+
 @app.command()
 def verify(
     target: str = typer.Option(..., "--target", help="Nome del target (config in targets/)."),
@@ -614,32 +673,7 @@ def verify(
     READ_ONLY rispetto al target e senza generare bundle (`--no-fix`): è solo una
     verifica. Errori gestiti come `scan` (niente stacktrace, §25): precondizione del
     gate → exit 2, ownership challenge → exit 3, config target assente → exit 4."""
-    orch = Orchestrator()
-    try:
-        orch.run(
-            target,
-            max_intrusion=IntrusionLevel.READ_ONLY,
-            no_fix=True,   # verify è di sola lettura: non rigenera il bundle fix/
-        )
-    except PreconditionDenied as exc:
-        err_console.print(f"[bold red]Precondizione negata dal gate (§7):[/] {exc}")
-        raise typer.Exit(code=2)
-    except IntrusionDenied as exc:
-        err_console.print(f"[bold red]Run negata dal gate (§7):[/] {exc}")
-        raise typer.Exit(code=3)
-    except FileNotFoundError as exc:
-        err_console.print(f"[bold red]Config target non trovata:[/] {exc}")
-        raise typer.Exit(code=4)
-    except Exception as exc:  # noqa: BLE001 — catch-all §22/§25 (LOCKED)
-        # Stesso catch-all finale di `scan` (§22): un'eccezione inattesa → exit 4,
-        # messaggio chiaro, niente stacktrace (§25). Ultimo ramo, dopo i mapping
-        # specifici 2/3/4-config.
-        err_console.print(
-            f"[bold red]Errore interno durante la verifica:[/] {exc}\n"
-            "La ri-scansione è stata interrotta da un errore inatteso (tool esterno "
-            "o bug interno). Se persiste, apri un'issue (§22/§25).")
-        raise typer.Exit(code=4)
-
+    orch = _rescan_read_only(target)
     _print_verify_table(target, orch._result)
 
 
@@ -697,6 +731,247 @@ def _print_verify_table(target: str, result) -> None:
             "([italic]scan --accept-baseline[/]), un finding corretto sparisce dalla "
             "ri-scansione invece di risultare FIXED. Flusso del loop: "
             "[italic]scan --accept-baseline[/] → applica i fix → [italic]verify[/].")
+
+
+# ─── surface (attack-surface inventory & diff, M3) ────────────────────────────
+
+# Nome del file di baseline della superficie (M3): vive accanto alla baseline dei
+# finding, in baselines/<target>.surface.json. Stesso stile/root della baseline §16.
+SURFACE_BASELINE_SUFFIX = ".surface.json"
+
+
+def _surface_baseline_path(baselines_dir: Path | None, target: str) -> Path:
+    """Path della surface baseline del target (M3): baselines/<target>.surface.json.
+    `--baselines-dir` (nascosto) la redirige a una dir temporanea nei test, come per
+    la baseline dei finding (§16)."""
+    root = baselines_dir if baselines_dir is not None else DEFAULT_BASELINES_ROOT
+    return root / f"{target}{SURFACE_BASELINE_SUFFIX}"
+
+
+def _latest_fingerprint(target: str) -> Fingerprint:
+    """Carica l'ultimo `fingerprint.json` prodotto da una run di RECON (§8) per il
+    target: cerca runs/<target>/<ts>/fingerprint.json e prende la run più recente
+    (i timestamp ordinano lessicograficamente). READ-ONLY rispetto al target:
+    legge SOLO un artefatto locale, nessuna rete.
+
+    Errore ONESTO (niente stacktrace, §25): se non c'è alcuna run con fingerprint
+    → messaggio chiaro + exit 4 (suggerisce di lanciare `scan` prima)."""
+    target_root = DEFAULT_RUNS_ROOT / target
+    candidates: list[Path] = []
+    if target_root.exists():
+        for run_dir in sorted(p for p in target_root.iterdir() if p.is_dir()):
+            fp_path = run_dir / FINGERPRINT_FILENAME
+            if fp_path.exists():
+                candidates.append(fp_path)
+    if not candidates:
+        err_console.print(
+            f"[bold red]Nessun fingerprint per[/] [cyan]{target}[/]: atteso in "
+            f"runs/{target}/<ts>/{FINGERPRINT_FILENAME}. Lancia prima "
+            f"[bold]bastione scan --target {target}[/] per generare il recon (§8).")
+        raise typer.Exit(code=4)
+
+    latest = candidates[-1]   # la run più recente (i timestamp ordinano)
+    try:
+        data = json.loads(latest.read_text(encoding="utf-8"))
+        return Fingerprint.model_validate(data)
+    except Exception as exc:  # noqa: BLE001 — errore onesto, niente stacktrace (§25)
+        err_console.print(
+            f"[bold red]Fingerprint illeggibile[/] ({latest}): {exc}. "
+            f"Rigenera il recon con [bold]bastione scan --target {target}[/].")
+        raise typer.Exit(code=4)
+
+
+def _print_surface_diff(diff) -> None:
+    """Stampa il delta della superficie d'attacco (M3) come tabella deterministica:
+    una riga per ogni elemento aggiunto/rimosso, per categoria. Le liste sono già
+    ordinate a monte (`diff_snapshots`), quindi l'output è deterministico."""
+    if diff.unchanged:
+        console.print("[green]Superficie invariata[/]: nessun add/remove rispetto allo "
+                      "snapshot precedente (M3).")
+        return
+
+    table = Table(title="Delta superficie d'attacco (M3)", show_header=True,
+                  header_style="bold")
+    table.add_column("categoria")
+    table.add_column("delta")
+    table.add_column("elemento")
+    # Ordine FISSO delle categorie e di added-prima-di-removed → tabella deterministica.
+    rows = (
+        ("table", "added", diff.added_tables),
+        ("table", "removed", diff.removed_tables),
+        ("endpoint", "added", diff.added_endpoints),
+        ("endpoint", "removed", diff.removed_endpoints),
+        ("url", "added", diff.added_urls),
+        ("url", "removed", diff.removed_urls),
+    )
+    for category, delta, items in rows:
+        marker = "[green]+[/]" if delta == "added" else "[red]-[/]"
+        for item in items:
+            table.add_row(category, f"{marker} {delta}", item)
+    console.print(table)
+
+
+def _print_surface_snapshot(snapshot, target: str) -> None:
+    """Stampa lo snapshot della superficie d'attacco (M3): id deterministico e le
+    tre categorie (tabelle/endpoint/url), ordinate."""
+    console.print()
+    console.print(f"[bold]Superficie d'attacco[/] di [cyan]{target}[/] "
+                  f"(snapshot_id: {snapshot.snapshot_id})  taken_at: "
+                  f"{snapshot.taken_at or '—'}")
+    table = Table(title="Superficie d'attacco (M3)", show_header=True, header_style="bold")
+    table.add_column("categoria")
+    table.add_column("elemento")
+    for item in snapshot.tables:
+        table.add_row("table", item)
+    for item in snapshot.endpoints:
+        table.add_row("endpoint", item)
+    for item in snapshot.urls:
+        table.add_row("url", item)
+    console.print(table)
+
+
+@app.command()
+def surface(
+    target: str = typer.Option(..., "--target", help="Nome del target (config in targets/)."),
+    snap: bool = typer.Option(
+        False, "--snap",
+        help="Salva il nuovo snapshot della superficie come baseline (mostra il diff col precedente)."),
+    diff: bool = typer.Option(
+        False, "--diff",
+        help="Mostra il diff superficie vs baseline SENZA salvare."),
+    show: bool = typer.Option(
+        False, "--show",
+        help="Stampa lo snapshot baseline corrente (default se nessuna opzione)."),
+    baselines_dir: Path | None = typer.Option(
+        None, "--baselines-dir", hidden=True,
+        help="Override della root delle baseline (uso interno/test)."),
+) -> None:
+    """Inventario e diff della superficie d'attacco del target (M3).
+
+    Il gemello della baseline, ma per la SUPERFICIE esposta (tabelle, endpoint, URL)
+    invece che per i finding. Costruisce lo snapshot dall'ULTIMO fingerprint del
+    recon (runs/<target>/<ts>/fingerprint.json) e lo confronta con la baseline
+    salvata (baselines/<target>.surface.json).
+
+    Le tre azioni sono mutuamente esclusive (default `--show`):
+      - `--snap` : salva il nuovo snapshot come baseline (e mostra il diff col precedente, se c'è);
+      - `--diff` : mostra il diff vs baseline SENZA salvare;
+      - `--show` : stampa lo snapshot baseline corrente.
+
+    READ-ONLY rispetto al target: legge SOLO artefatti locali (il fingerprint già
+    prodotto da una run), MAI rete, MAI il target. La tabella added/removed è
+    deterministica. Errore onesto (niente stacktrace, §25) se manca il fingerprint."""
+    # Mutua esclusione (come `baseline`, §25): al più UNA delle tre opzioni.
+    chosen = [name for name, on in
+              (("--snap", snap), ("--diff", diff), ("--show", show)) if on]
+    if len(chosen) > 1:
+        err_console.print(
+            f"[bold red]Errore:[/] {', '.join(chosen)} sono mutuamente esclusive: "
+            "scegline una sola (M3).")
+        raise typer.Exit(code=2)
+
+    # Guardia path-traversal (GUARDRAIL LOCKED): la surface baseline è scritta/letta
+    # per path, come la baseline dei finding — rifiuta target che evaderebbero la root.
+    _validate_target_name(target)
+
+    path = _surface_baseline_path(baselines_dir, target)
+
+    # --show: stampa la baseline salvata, senza toccare il fingerprint. Se assente →
+    # nota amichevole + exit 0 (la baseline si crea con `surface --snap`).
+    if show or not chosen:
+        baseline_snapshot = load_surface_baseline(path)
+        if baseline_snapshot is None:
+            console.print(
+                f"[yellow]Nessuna surface baseline per[/] [cyan]{target}[/] "
+                f"(atteso in {path}). Creala con [bold]surface --snap[/].")
+            return
+        _print_surface_snapshot(baseline_snapshot, target)
+        return
+
+    # --snap / --diff: costruisci lo snapshot corrente dall'ultimo fingerprint e
+    # confrontalo con la baseline (READ-ONLY: nessuna rete, solo artefatti locali).
+    fp = _latest_fingerprint(target)
+    new_snapshot = build_snapshot(fp, taken_at=datetime.now(timezone.utc))
+    old_snapshot = load_surface_baseline(path)
+    delta = diff_snapshots(old_snapshot, new_snapshot)
+
+    if diff:
+        # --diff: mostra il delta SENZA salvare.
+        console.print()
+        console.print(f"[bold]Bastione surface[/] — diff [cyan]{target}[/] "
+                      f"(snapshot_id: {new_snapshot.snapshot_id})")
+        if old_snapshot is None:
+            console.print("[dim]nota:[/] nessuna surface baseline precedente: l'intera "
+                          "superficie risulta [green]added[/] (prima rilevazione).")
+        _print_surface_diff(delta)
+        return
+
+    # --snap: salva il nuovo snapshot come baseline, mostrando il diff col precedente.
+    console.print()
+    console.print(f"[bold]Bastione surface[/] — snapshot [cyan]{target}[/] salvato "
+                  f"(snapshot_id: {new_snapshot.snapshot_id})")
+    if old_snapshot is None:
+        console.print("[dim]nota:[/] nessuna surface baseline precedente: l'intera "
+                      "superficie risulta [green]added[/] (prima rilevazione).")
+    _print_surface_diff(delta)
+    saved = save_surface_baseline(path, new_snapshot)
+    console.print(f"Surface baseline scritta in [cyan]{saved}[/].")
+
+
+# ─── export-defectdojo (§T4) ──────────────────────────────────────────────────
+
+# Nome del file di export DefectDojo nella run dir (§T4).
+DEFECTDOJO_FILENAME = "defectdojo.json"
+
+
+@app.command("export-defectdojo")
+def export_defectdojo(
+    target: str = typer.Option(..., "--target", help="Nome del target (config in targets/)."),
+) -> None:
+    """Esporta i finding correnti nel formato DefectDojo e (gated) li pusha (§T4).
+
+    Ottiene i finding correnti con lo STESSO meccanismo di `verify`: una
+    ri-scansione READ_ONLY del target (`--no-fix`, nessun bundle, nessuna scrittura
+    sul target). Converte i finding emessi in "Generic Findings Import" (`to_defectdojo`),
+    scrive il payload in runs/<target>/<ts>/defectdojo.json (`write_defectdojo_export`)
+    e tenta il push (`push_to_defectdojo`).
+
+    Il push è GATED sull'ambiente (BASTIONE_DEFECTDOJO_URL/TOKEN): se non configurato
+    riporta onestamente [bold]skipped[/] SENZA toccare la rete. Guardrail P8:
+    l'evidence non finisce mai nel payload (omessa a monte).
+
+    Errori gestiti come `scan`/`verify` (niente stacktrace, §25): precondizione del
+    gate → exit 2, ownership challenge → exit 3, config target assente → exit 4."""
+    orch = _rescan_read_only(target)
+
+    result = orch._result
+    findings = list(result.findings) if result is not None else []
+
+    payload = to_defectdojo(findings, target=target)
+    out_path = orch._run_dir / DEFECTDOJO_FILENAME
+    write_defectdojo_export(out_path, payload)
+
+    # Push GATED + RESILIENTE (§T4): "skipped" se l'env non è configurato; "pushed"
+    # se la POST è andata (qualunque status HTTP); "error:<msg>" se ha sollevato.
+    outcome = push_to_defectdojo(payload)
+
+    console.print()
+    console.print(f"[bold]Bastione export-defectdojo[/] — target [cyan]{target}[/] (§T4)")
+    console.print(f"Finding esportati: [bold]{len(findings)}[/]")
+    console.print(f"Export DefectDojo scritto in: [cyan]{out_path}[/]")
+    if outcome == "skipped":
+        console.print(
+            "Push: [yellow]skipped[/] — env "
+            "[bold]BASTIONE_DEFECTDOJO_URL[/]/[bold]BASTIONE_DEFECTDOJO_TOKEN[/] non "
+            "configurato. Il file di export è comunque pronto da importare a mano.")
+    elif outcome == "pushed":
+        console.print("Push: [green]pushed[/] — payload inviato all'istanza DefectDojo.")
+    else:
+        # "error:<msg>": il push è best-effort (§19), non fa fallire il comando.
+        msg = outcome.split(":", 1)[1] if ":" in outcome else outcome
+        console.print(
+            f"Push: [red]error[/] — {msg}. Il file di export è comunque pronto da "
+            "importare a mano (il push è best-effort §19).")
 
 
 # ─── scan-all (portfolio mode §21) ───────────────────────────────────────────
