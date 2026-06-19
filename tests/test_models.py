@@ -28,6 +28,8 @@ from bastione.models import (
     RawSecret,
     RunContext,
     RunSummary,
+    SurfaceDiff,
+    SurfaceSnapshot,
     TableExpectation,
     TargetConfig,
     TextAsset,
@@ -223,6 +225,96 @@ def test_fixplan_schema_version_default():
     )
     assert plan.schema_version == "bastione-fixplan/1"
     assert plan.fixes == []
+
+
+# ─── TargetConfig.source_path (M3 T0) ────────────────────────────────────────
+
+def test_targetconfig_source_path_defaults_none():
+    cfg = TargetConfig(
+        name="g", base_url="https://x", environment="staging", ownership="owned"
+    )
+    assert cfg.source_path is None
+
+
+def test_targetconfig_source_path_accepted():
+    cfg = TargetConfig(
+        name="g", base_url="https://x", environment="staging",
+        ownership="owned", source_path="/srv/repos/myapp",
+    )
+    assert cfg.source_path == "/srv/repos/myapp"
+
+
+# ─── SurfaceSnapshot (M3 T0) ─────────────────────────────────────────────────
+
+def test_surface_snapshot_build_deduplicates_and_sorts():
+    s = SurfaceSnapshot.build(
+        target="g",
+        tables=["b", "a", "a"],
+        endpoints=["/z", "/a"],
+        urls=["https://x", "https://a"],
+    )
+    assert s.tables == ["a", "b"]
+    assert s.endpoints == ["/a", "/z"]
+    assert s.urls == ["https://a", "https://x"]
+
+
+def test_surface_snapshot_id_is_deterministic_regardless_of_input_order():
+    s1 = SurfaceSnapshot.build(
+        target="g", tables=["b", "a"], endpoints=["/z", "/a"], urls=["https://x"]
+    )
+    s2 = SurfaceSnapshot.build(
+        target="g", tables=["a", "b"], endpoints=["/a", "/z"], urls=["https://x"]
+    )
+    assert s1.snapshot_id == s2.snapshot_id
+    assert len(s1.snapshot_id) == 16
+
+
+def test_surface_snapshot_id_changes_on_different_content():
+    s1 = SurfaceSnapshot.build(target="g", tables=["a"], endpoints=[], urls=[])
+    s2 = SurfaceSnapshot.build(target="g", tables=["b"], endpoints=[], urls=[])
+    assert s1.snapshot_id != s2.snapshot_id
+
+
+def test_surface_snapshot_empty_build():
+    s = SurfaceSnapshot.build(target="g", tables=[], endpoints=[], urls=[])
+    assert s.tables == [] and s.endpoints == [] and s.urls == []
+    assert len(s.snapshot_id) == 16
+
+
+def test_surface_snapshot_schema_name_default():
+    s = SurfaceSnapshot.build(target="g", tables=[], endpoints=[], urls=[])
+    assert s.schema_name == "bastione-surface/1"
+
+
+def test_surface_snapshot_taken_at_stored():
+    ts = datetime(2026, 6, 20, 12, 0, 0)
+    s = SurfaceSnapshot.build(target="g", tables=[], endpoints=[], urls=[], taken_at=ts)
+    assert s.taken_at == ts
+
+
+# ─── SurfaceDiff (M3 T0) ─────────────────────────────────────────────────────
+
+def test_surface_diff_defaults_empty_lists():
+    d = SurfaceDiff(target="g", unchanged=True)
+    assert d.added_tables == []
+    assert d.removed_tables == []
+    assert d.added_endpoints == []
+    assert d.removed_endpoints == []
+    assert d.added_urls == []
+    assert d.removed_urls == []
+    assert d.unchanged is True
+
+
+def test_surface_diff_with_changes():
+    d = SurfaceDiff(
+        target="g",
+        added_tables=["nuova"],
+        removed_endpoints=["/vecchio"],
+        unchanged=False,
+    )
+    assert d.added_tables == ["nuova"]
+    assert d.removed_endpoints == ["/vecchio"]
+    assert d.unchanged is False
 
 
 def test_fixplan_roundtrip_json_reloadable():

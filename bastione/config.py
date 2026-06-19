@@ -78,4 +78,7 @@ def _flatten(data: dict) -> dict:
     if "disabled" in modules:
         kwargs["modules_disabled"] = modules["disabled"]
 
+    if "source_path" in data:
+        kwargs["source_path"] = data["source_path"]
+
     return kwargs

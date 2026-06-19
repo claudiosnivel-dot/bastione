@@ -11,13 +11,15 @@ loro sezione dedicata (§18-bis.3).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from bastione.enums import (
     Confidence,
@@ -103,6 +105,60 @@ class Fingerprint(BaseModel):          # output di RECON (§8)
     response_headers: dict[str, str] = {}
 
 
+class SurfaceSnapshot(BaseModel):      # contratto persistito dell'attack-surface inventory (M3)
+    schema_name: str = Field(default="bastione-surface/1", alias="schema")
+    target: str
+    taken_at: datetime | None = None
+    tables: list[str] = []
+    endpoints: list[str] = []
+    urls: list[str] = []
+    snapshot_id: str = ""
+
+    model_config = {"populate_by_name": True}
+
+    @classmethod
+    def build(
+        cls,
+        target: str,
+        tables: list[str],
+        endpoints: list[str],
+        urls: list[str],
+        taken_at: datetime | None = None,
+    ) -> "SurfaceSnapshot":
+        """Costruisce uno snapshot ordinando e deduplicando le liste, poi calcola
+        lo snapshot_id deterministico: stesso contenuto → stesso id, a prescindere
+        dall'ordine di input."""
+        t = sorted(set(tables))
+        e = sorted(set(endpoints))
+        u = sorted(set(urls))
+        # Payload JSON *strutturato* per categoria, non un flat "\n".join(t+e+u):
+        # il naive flat-join appiattiva le tre liste senza delimitatore di
+        # categoria, così superfici diverse ma con lo stesso insieme totale di
+        # stringhe collidevano (es. tables=['a','b'] vs tables=['a'],endpoints=['b']),
+        # e un valore contenente '\n' collideva con due valori separati
+        # (tables=['a\nb'] vs tables=['a','b']). Il JSON dà un confine inequivocabile
+        # tra categorie e fa l'escape dei newline nei valori, eliminando entrambe le
+        # collisioni; vedi i test di regressione in tests/test_surface.py.
+        payload = json.dumps(
+            {"tables": t, "endpoints": e, "urls": u},
+            separators=(",", ":"),
+        )
+        sid = hashlib.sha256(payload.encode()).hexdigest()[:16]
+        return cls(target=target, taken_at=taken_at, tables=t, endpoints=e, urls=u,
+                   snapshot_id=sid)
+
+
+class SurfaceDiff(BaseModel):          # delta tra due SurfaceSnapshot (M3)
+    target: str
+    added_tables: list[str] = []
+    removed_tables: list[str] = []
+    added_endpoints: list[str] = []
+    removed_endpoints: list[str] = []
+    added_urls: list[str] = []
+    removed_urls: list[str] = []
+    unchanged: bool
+
+
 class TextAsset(BaseModel):            # input ai detector di segreti (§10)
     source: str                        # url o path del file
     content: str
@@ -148,6 +204,7 @@ class TargetConfig(BaseModel):         # prodotto da config.py: parse+validate d
     notify_min_severity: Severity = Severity.HIGH   # [notify].min_severity (--fail-on ha precedenza, §25)
     expectations: list[TableExpectation] = []       # §15 (M2)
     modules_disabled: list[str] = []   # [modules].disabled
+    source_path: str | None = None     # path locale del sorgente (white-box: semgrep/trivy)
 
     @field_validator("notify_min_severity", mode="before")
     @classmethod

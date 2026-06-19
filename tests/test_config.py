@@ -124,3 +124,26 @@ def test_example_toml_is_valid():
     by_name = {t.name: t for t in cfg.expectations}
     assert by_name["clienti"].anon_select is False
     assert by_name["listino_pubblico"].anon_select is True
+
+
+# ─── source_path (M3 T0) ────────────────────────────────────────────────────
+
+SOURCE_PATH_TOML = """\
+name = "g"
+base_url = "https://staging.example"
+environment = "staging"
+ownership = "owned"
+source_path = "/srv/repos/myapp"
+"""
+
+
+def test_load_source_path_when_present(tmp_path: Path):
+    _write(tmp_path, "g.toml", SOURCE_PATH_TOML)
+    cfg = load_target("g", tmp_path)
+    assert cfg.source_path == "/srv/repos/myapp"
+
+
+def test_source_path_defaults_to_none_when_absent(tmp_path: Path):
+    _write(tmp_path, "g.toml", MINIMAL)
+    cfg = load_target("g", tmp_path)
+    assert cfg.source_path is None
