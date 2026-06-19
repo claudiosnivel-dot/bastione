@@ -76,6 +76,8 @@ I task si organizzano in un **grafo di dipendenze**; gli indipendenti girano in 
 
 > **Vincolo Bastione (LOCKED):** working tree **CONDIVISO**. I builder che editano lo **STESSO** file (es. `cli.py`) vanno **SEQUENZIATI** dentro il workflow — editi paralleli sullo stesso file confliggono, e un builder che lancia `pytest` mentre un altro edita vede stati a metà. **Builder su file disgiunti + tutte le review (k dimensioni) girano in parallelo.**
 >
+> **Lo stesso vale per i FIXER (LOCKED, lezione Sessione 10):** in O4 i fixer per-area possono toccare **gli stessi file** (es. un fix "surface" e un fix "completeness" entrambi su `models.py`/`tests/test_surface.py`; o l'area "integration" su `cli.py`/`orchestrator.py` mentre un'altra area li importa). Parallelizzarli alla cieca = **race**: lo strumento li esegue concorrenti, ciascuno rilancia `pytest` su uno stato a metà e i self-report risultano **incoerenti** (in M3: "831" vs "826+3fail"). Decomponi i fixer **per ownership di file** come i builder: paralleli solo se gli insiemi di file sono **disgiunti**, altrimenti **sequenziali**. In ogni caso il verdetto è dell'**orchestratore** che rilancia `python -m pytest -q` sull'albero **stabile** a workflow concluso (mai i self-report dei fixer concorrenti).
+>
 > *Pattern reale (M2 steps 4–6):* `Track A` step4→step5 **sequenziali** su `cli.py` ‖ `Track B` step6 docs/yaml; poi **4 blind-review per-area in parallelo**. *Pattern reale (M1 §18-bis):* **2 builder sequenziali** (core → wiring) nello stesso workflow, poi review.
 
 ## 5 · Model policy (LOCKED da Claudio)
@@ -112,25 +114,25 @@ I task si organizzano in un **grafo di dipendenze**; gli indipendenti girano in 
 
 ## 7 · Milestone → workflow (fan-out reale)
 
-> Conteggi presi da `BASTIONE-SESSION-STATE.md` — fatti, non stime. Stato attuale: **629 test verdi**, tutto offline.
+> Conteggi presi da `BASTIONE-SESSION-STATE.md` — fatti, non stime. Stato attuale: **831 test verdi**, tutto offline.
 
 | Milestone | Stato | Task/step | Gate di milestone | File di dettaglio |
 |---|---|---|---|---|
 | **M0 · Vista dell'attaccante (read-only)** | ✅ **done** (validata live read-only) | ~16 step (build-order) | scan E2E read-only senza crash + **DoD §3** (SARIF+MD+state reali) | SESSION-STATE §2/§3 |
 | **M1 · Profondità + difesa di base** | ✅ **done** (validata live read-only) | 7 step | profondità + difesa: table-discovery, liveness PROBE, baseline/drift, playbook, agent-bundle, black-box, report HTML | SESSION-STATE §3-bis |
 | **M2 · Sistema di difesa continuo** | ✅ **code-complete (offline)** · capstone live pendente | 7 step | **629 test verdi** + canary §11.2 offline + oracolo/notifier/CI-gate/portfolio/monitoring | SESSION-STATE §3-ter |
-| **M3 · Espansioni** | 🟡 **prossima** (deferred, trigger-based) | task-graph in **§8** | ogni GATE = test offline + which-absent→`SKIPPED` INFO (mai crash) | §8 (questo file) |
+| **M3 · Espansioni** | ✅ **code-complete (offline)** · esecuzioni live trigger-gated | 5 step (T0 + 4 corsie + integraz.) | **831 test verdi** + semgrep/trivy §14 + attack-surface §16 (`surface`) + DefectDojo §19 exporter+push gated (`export-defectdojo`) | SESSION-STATE §3-quater |
 
-## 8 · Task-graph FORWARD (solo ciò che è prossimo)
+## 8 · Task-graph M3 — ✅ COSTRUITO (Sessione 10), esecuzioni live trigger-gated
 
-> **Premessa:** **M3 è DEFERRED, trigger-based.** Regola d'oro **P5** del blueprint: *non saltare avanti*. Questo è un **PIANO da attivare quando il trigger scatta**, non lavoro da iniziare ora. Le corsie derivano da §27 del blueprint. Ogni GATE = **test offline** + binario assente → **`SKIPPED` INFO onesto** (mai crash), sul modello della colla sottile §14 (nuclei/ZAP).
+> **Premessa (aggiornata Sessione 10):** **M3 è stata COSTRUITA offline** in un solo dynamic workflow (semgrep, trivy, attack-surface, DefectDojo). Il *"deferred/trigger-based"* del canone riguardava l'**esecuzione live/outward-facing** (trigger: *sorgente disponibile* / *1° cliente*), **non** il codice: ogni GATE è un **test offline** + binario/sorgente assente → **`SKIPPED` INFO onesto** (mai crash), sul modello della colla sottile §14 (nuclei/ZAP). Le 4 corsie sotto sono quindi **fatte** (✅ dettaglio in SESSION-STATE §3-quater); restano gated **solo gli usi live** (girare semgrep/trivy su sorgente owned via `TargetConfig.source_path`; POST a un DefectDojo reale). Regola d'oro **P5** rispettata: non si è "saltato avanti" a caso — il deferral è stato sollevato da Claudio (owner), che resta il decisore.
 
 | id | dipende_da | output | GATE | modello |
 |---|---|---|---|---|
-| **M3.1** | — | Corsia white-box **Semgrep** (colla sottile drop-in §14: self-gate PROBE, `which`→`SKIPPED` INFO se assente, JSON in `run_dir/raw/`, parse→`Finding[]`) | test offline su JSON Semgrep campione → `Finding[]` corretti; **`which` assente → `SKIPPED` INFO**, nessun crash | **Sonnet** |
-| **M3.2** | — | Corsia white-box **trivy** (filesystem/repo, **solo se sorgente disponibile**) | test offline su output trivy campione → `Finding[]`; sorgente assente → no-op/SKIPPED; `which` assente → `SKIPPED` INFO | **Sonnet** |
-| **M3.3** | — | **Attack-surface inventory** tracciato nel tempo (subdomain / endpoint / bucket) | test offline: due snapshot → diff stabile e deterministico (nuovo/rimosso); nessuna scrittura, nessun target live | **Opus** |
-| **M3.4** | — | **DefectDojo exporter** (trigger = **1° cliente pagante**) | test offline: `Finding[]` → payload DefectDojo valido (schema); endpoint assente/non configurato → `SKIPPED` INFO | **Sonnet** |
+| **M3.1** ✅ | — | Corsia white-box **Semgrep** (colla sottile drop-in §14: self-gate PROBE, `which`→`SKIPPED` INFO se assente, JSON in `run_dir/raw/`, parse→`Finding[]`) | test offline su JSON Semgrep campione → `Finding[]` corretti; **`which` assente → `SKIPPED` INFO**, nessun crash | **Sonnet** |
+| **M3.2** ✅ | — | Corsia white-box **trivy** (filesystem/repo, **solo se sorgente disponibile**) | test offline su output trivy campione → `Finding[]`; sorgente assente → no-op/SKIPPED; `which` assente → `SKIPPED` INFO | **Sonnet** |
+| **M3.3** ✅ | — | **Attack-surface inventory** tracciato nel tempo (subdomain / endpoint / bucket) | test offline: due snapshot → diff stabile e deterministico (nuovo/rimosso); nessuna scrittura, nessun target live | **Opus** |
+| **M3.4** ✅ | — | **DefectDojo exporter + push gated** (push live trigger = **1° cliente pagante**) | test offline: `Finding[]` → payload DefectDojo valido (schema); endpoint assente/non configurato → `SKIPPED` INFO | **Sonnet** |
 
 ---
 
