@@ -117,7 +117,7 @@ I task si organizzano in un **grafo di dipendenze**; gli indipendenti girano in 
 
 ## 7 · Milestone → workflow (fan-out reale)
 
-> Conteggi presi da `BASTIONE-SESSION-STATE.md` — fatti, non stime. Stato attuale: **859 test verdi**, tutto offline.
+> Conteggi presi da `BASTIONE-SESSION-STATE.md` — fatti, non stime. Stato attuale: **900 test verdi**, tutto offline.
 
 | Milestone | Stato | Task/step | Gate di milestone | File di dettaglio |
 |---|---|---|---|---|
@@ -125,6 +125,7 @@ I task si organizzano in un **grafo di dipendenze**; gli indipendenti girano in 
 | **M1 · Profondità + difesa di base** | ✅ **done** (validata live read-only) | 7 step | profondità + difesa: table-discovery, liveness PROBE, baseline/drift, playbook, agent-bundle, black-box, report HTML | SESSION-STATE §3-bis |
 | **M2 · Sistema di difesa continuo** | ✅ **code-complete (offline)** · capstone live pendente | 7 step | **629 test verdi** + canary §11.2 offline + oracolo/notifier/CI-gate/portfolio/monitoring | SESSION-STATE §3-ter |
 | **M3 · Espansioni** | ✅ **code-complete** · ✅ **corsie validate live** (S11) · ✅ **O06/O07 risolte** (S12) · push DefectDojo trigger-gated | 5 step (T0 + 4 corsie + integraz.) + O06/O07 | **859 test verdi** + semgrep/trivy §14 (incl. trivy Secrets→Finding INFO P8 + scanner misconfig) + attack-surface §16 (`surface`) + DefectDojo §19 exporter+push gated (`export-defectdojo`) | SESSION-STATE §3-quater/§7 |
+| **M4 · Bastione autenticato** (NUOVO, oltre il canone §27) | 🔨 **M4.0 + M4.1 code-complete (offline)** (S12-cont) · M4.2/4.3/4.4 deferred · esecuzione live IDOR gated | 5 step (M4.0 fondamenta + M4.1 IDOR + 3 deferred) | **900 test verdi** + auth/session §7 + api_surface §8 + IDOR cross-tenant §11.2/§15 (`modules/idor/`, READ a PROBE + WRITE canary a MUTATING + cleanup garantito) | SESSION-STATE §3-quinquies · spec/plan in `docs/superpowers/` |
 
 ## 8 · Task-graph M3 — ✅ COSTRUITO (Sessione 10), esecuzioni live trigger-gated
 
