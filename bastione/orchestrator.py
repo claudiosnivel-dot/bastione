@@ -108,6 +108,7 @@ def _ensure_modules_loaded() -> None:
     vuoto. Ripetere l'import è un no-op (il modulo è già in sys.modules)."""
     import bastione.modules.cloudflare.module  # noqa: F401
     import bastione.modules.headers.module  # noqa: F401
+    import bastione.modules.idor.module  # noqa: F401  (M4.1 IDOR autenticato)
     import bastione.modules.nuclei.module  # noqa: F401  (§14 black-box esterno)
     import bastione.modules.secrets.detectors  # noqa: F401  (popola DETECTORS)
     import bastione.modules.secrets.module  # noqa: F401
