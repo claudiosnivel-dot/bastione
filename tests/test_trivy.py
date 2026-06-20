@@ -811,3 +811,481 @@ def test_run_results_null_returns_empty(monkeypatch, tmp_path):
     result = TrivyModule().run(ctx)
     assert result.findings == []
     assert result.posture_checks == []
+
+
+@pytest.mark.parametrize("scalar", [42, 3.14, True])
+def test_run_results_scalar_returns_empty_no_crash(monkeypatch, tmp_path, scalar):
+    """REGRESSIONE (difetto reale §4.7): report con 'Results' SCALARE (numero/bool)
+    invece di lista. Col vecchio `result.get('Results') or []` lo scalare truthy
+    NON veniva coalesciato → `for … in 42` sollevava 'TypeError: int object is
+    not iterable' fuori da run() (la chiamata _parse NON è in try/except). Atteso
+    ora: findings == [] senza eccezioni, via _as_list."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    monkeypatch.setattr(trivy_mod, "_run_trivy",
+                        lambda src, out_path: {"Results": scalar})
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)
+    assert result.findings == []
+    assert result.posture_checks == []
+
+
+@pytest.mark.parametrize("field", ["Vulnerabilities", "Misconfigurations", "Secrets"])
+@pytest.mark.parametrize("scalar", [42, 3.14])
+def test_parse_scalar_result_field_no_crash(monkeypatch, tmp_path, field, scalar):
+    """REGRESSIONE (difetto reale §4.7): un campo a livello Result
+    (Vulnerabilities/Misconfigurations/Secrets) come SCALARE numerico non deve
+    crashare il modulo (prima: `for … in 42` => TypeError propagato fuori da
+    run()). _as_list lo coalesce a [] → findings == [], nessuna eccezione. Un
+    record valido in un Result accanto resta parsato."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    report = {
+        "Results": [
+            {"Target": "degenere", field: scalar},   # campo scalare → niente crash
+            {
+                "Target": "pkg",
+                "Vulnerabilities": [
+                    {"VulnerabilityID": "CVE-OK", "Severity": "LOW", "PkgName": "p"},
+                ],
+            },
+        ]
+    }
+    monkeypatch.setattr(trivy_mod, "_run_trivy", lambda src, out_path: report)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)  # NON deve sollevare
+
+    rule_ids = {f.rule_id for f in result.findings}
+    assert "CVE-OK" in rule_ids
+
+
+def test_parse_scalar_field_returns_none_branch_direct():
+    """REGRESSIONE (difetto reale §4.7): chiamata diretta a _parse con campi
+    scalari (riproduzione minimale del crash segnalato:
+    `TrivyModule()._parse({'Results':[{'Target':'t','Secrets':42}]},'tgt')`).
+    Atteso: lista vuota, nessuna eccezione."""
+    from bastione.modules.trivy.module import TrivyModule
+    mod = TrivyModule()
+    assert mod._parse({"Results": [{"Target": "t", "Secrets": 42}]}, "tgt") == []
+    assert mod._parse({"Results": [{"Target": "t", "Vulnerabilities": 3.14}]}, "tgt") == []
+    assert mod._parse({"Results": [{"Target": "t", "Misconfigurations": 1}]}, "tgt") == []
+    # Results stesso scalare
+    assert mod._parse({"Results": 42}, "tgt") == []
+
+
+# ─── (9) O07 — scanner misconfig nell'argv (vuln,secret,misconfig) ──────────
+
+def test_run_trivy_argv_has_misconfig_scanner(monkeypatch):
+    """O07: l'argv DEVE contenere '--scanners' e il valore subito dopo deve
+    includere 'misconfig' (oltre a 'vuln' e 'secret'), così trivy esegua anche
+    la scansione misconfig (di default `trivy fs` fa solo vuln,secret → il
+    parser _misconf_to_finding non verrebbe mai esercitato su dati reali §14)."""
+    import bastione.modules.trivy.module as trivy_mod
+
+    captured: dict = {}
+
+    class FakeProc:
+        stdout = '{"Results": []}'
+        returncode = 0
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return FakeProc()
+
+    monkeypatch.setattr(trivy_mod.subprocess, "run", fake_run)
+    trivy_mod._run_trivy("/some/path", "out.json")
+
+    argv = captured["argv"]
+    assert "--scanners" in argv
+    scanners_value = argv[argv.index("--scanners") + 1]
+    assert "misconfig" in scanners_value
+    assert "vuln" in scanners_value
+    assert "secret" in scanners_value
+
+
+def test_run_trivy_argv_misconfig_after_fs_still_json_quiet(monkeypatch):
+    """O07 (regressione): l'argv resta argv-list (mai shell=True), argv[0]=='trivy',
+    argv[1]=='fs'; --format json e --quiet restano presenti (test esistenti verdi)."""
+    import bastione.modules.trivy.module as trivy_mod
+
+    captured: dict = {}
+
+    class FakeProc:
+        stdout = '{"Results": []}'
+        returncode = 0
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(trivy_mod.subprocess, "run", fake_run)
+    trivy_mod._run_trivy("/some/path", "out.json")
+
+    argv = captured["argv"]
+    assert isinstance(argv, list)
+    assert argv[0] == "trivy"
+    assert argv[1] == "fs"
+    assert "--format" in argv
+    assert argv[argv.index("--format") + 1] == "json"
+    assert "--quiet" in argv
+    assert captured["kwargs"].get("shell", False) is False
+
+
+# ─── (10) O06 — parsing dei Secrets (Finding PER-SECRET a severità INFO) ─────
+
+def _trivy_secret_report(
+    *,
+    target: str = "config/.env",
+    rule_id: str = "aws-access-key-id",
+    category: str = "AWS",
+    severity: str = "CRITICAL",
+    title: str = "AWS Access Key ID",
+    start_line: int = 7,
+    match: str = "AKIAIOSFODNN7EXAMPLE",
+) -> dict:
+    """Report JSON sintetico con una voce Secrets come la emette `trivy fs` (§14)."""
+    return {
+        "Results": [
+            {
+                "Target": target,
+                "Secrets": [
+                    {
+                        "RuleID": rule_id,
+                        "Category": category,
+                        "Severity": severity,
+                        "Title": title,
+                        "StartLine": start_line,
+                        "Match": match,
+                        "Code": {"Lines": [{"Content": match}]},
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_run_parses_secrets_into_findings_info(monkeypatch, tmp_path):
+    """O06 base: ogni Secret → un Finding con rule_id==RuleID, severity SEMPRE
+    INFO (NON la severità di trivy), module=='trivy', confidence FIRM,
+    intrusion PROBE (§14 — design LOCKED: per-secret a INFO)."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    report = _trivy_secret_report(rule_id="aws-access-key-id", severity="CRITICAL")
+    monkeypatch.setattr(trivy_mod, "_run_trivy", lambda src, out_path: report)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)
+
+    secret_findings = [f for f in result.findings if f.rule_id == "aws-access-key-id"]
+    assert len(secret_findings) == 1
+    f = secret_findings[0]
+    assert f.severity == Severity.INFO  # NON CRITICAL
+    assert f.module == "trivy"
+    assert f.confidence == Confidence.FIRM
+    assert f.intrusion_used == IntrusionLevel.PROBE
+    assert "TRIVY_SKIPPED" not in {x.rule_id for x in result.findings}
+
+
+def test_run_secret_p8_value_never_leaks(monkeypatch, tmp_path):
+    """O06 P8 (CRITICO): il valore del segreto (Match/Code) NON deve MAI comparire
+    in evidence, title o description del Finding — solo metadati di regola (§7/P8)."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    secret_value = "AKIAIOSFODNN7EXAMPLE"
+    report = _trivy_secret_report(match=secret_value)
+    monkeypatch.setattr(trivy_mod, "_run_trivy", lambda src, out_path: report)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)
+
+    f = next(f for f in result.findings if f.module == "trivy")
+    assert secret_value not in f.evidence
+    assert secret_value not in f.title
+    assert secret_value not in f.description
+    # difesa in profondità: nemmeno in remediation_ref
+    assert secret_value not in (f.remediation_ref or "")
+
+
+def test_run_secret_location_file_and_line(monkeypatch, tmp_path):
+    """O06 location: location.file==result_target e location.line==StartLine (§16)."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    report = _trivy_secret_report(target="config/.env", start_line=42)
+    monkeypatch.setattr(trivy_mod, "_run_trivy", lambda src, out_path: report)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)
+
+    f = next(f for f in result.findings if f.module == "trivy")
+    assert f.location.file == "config/.env"
+    assert f.location.line == 42
+
+
+@pytest.mark.parametrize("tool_sev", ["CRITICAL", "HIGH", "LOW", "MEDIUM", "UNKNOWN"])
+def test_run_secret_severity_always_info(monkeypatch, tmp_path, tool_sev):
+    """O06: la severità di trivy sul secret è IGNORATA — il Finding resta SEMPRE
+    INFO (design LOCKED: i secret trivy includono falsi positivi by-design)."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    report = _trivy_secret_report(severity=tool_sev)
+    monkeypatch.setattr(trivy_mod, "_run_trivy", lambda src, out_path: report)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)
+
+    secret_findings = [f for f in result.findings if f.module == "trivy"]
+    assert len(secret_findings) == 1
+    assert secret_findings[0].severity == Severity.INFO
+
+
+def test_run_secret_per_line_distinct_findings(monkeypatch, tmp_path):
+    """O06 per-riga (§16): due secret stessa RuleID, stesso file, ma StartLine
+    diverse → 2 Finding con finding_id DISTINTI (la line entra nella location)."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    report = {
+        "Results": [
+            {
+                "Target": "config/.env",
+                "Secrets": [
+                    {"RuleID": "generic-api-key", "Category": "general",
+                     "Severity": "HIGH", "Title": "API key", "StartLine": 3,
+                     "Match": "secret-on-line-3"},
+                    {"RuleID": "generic-api-key", "Category": "general",
+                     "Severity": "HIGH", "Title": "API key", "StartLine": 9,
+                     "Match": "secret-on-line-9"},
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(trivy_mod, "_run_trivy", lambda src, out_path: report)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)
+
+    secret_findings = [f for f in result.findings if f.rule_id == "generic-api-key"]
+    assert len(secret_findings) == 2
+    ids = {f.finding_id for f in secret_findings}
+    assert len(ids) == 2
+
+
+def test_run_secret_dedup_same_rule_file_line(monkeypatch, tmp_path):
+    """O06 dedup (§16): due secret identici (stessa RuleID+file+line) → 1 Finding."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    dup = {"RuleID": "generic-api-key", "Category": "general", "Severity": "HIGH",
+           "Title": "API key", "StartLine": 5, "Match": "dup-secret"}
+    report = {
+        "Results": [
+            {"Target": "config/.env", "Secrets": [dup, dup]},
+        ],
+    }
+    monkeypatch.setattr(trivy_mod, "_run_trivy", lambda src, out_path: report)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)
+
+    secret_findings = [f for f in result.findings if f.rule_id == "generic-api-key"]
+    assert len(secret_findings) == 1
+
+
+def test_run_secret_malformed_skipped_no_crash(monkeypatch, tmp_path):
+    """O06 §4.7: input degenere (Secrets null, voce non-dict, secret senza RuleID)
+    → nessun crash, record saltato; i secret validi restano."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    report = {
+        "Results": [
+            {"Target": "a", "Secrets": None},          # Secrets null
+            {
+                "Target": "config/.env",
+                "Secrets": [
+                    None,                               # voce non-dict
+                    "not a dict",                       # voce non-dict (scalare)
+                    {},                                 # senza RuleID — saltato
+                    {"RuleID": "", "StartLine": 1},     # RuleID vuoto — saltato
+                    {"RuleID": "valid-rule", "Category": "AWS",
+                     "Severity": "HIGH", "Title": "ok", "StartLine": 4,
+                     "Match": "x"},                     # valido
+                ],
+            },
+        ],
+    }
+    monkeypatch.setattr(trivy_mod, "_run_trivy", lambda src, out_path: report)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)
+
+    rule_ids = [f.rule_id for f in result.findings if f.module == "trivy"]
+    assert "valid-rule" in rule_ids
+    assert "" not in rule_ids
+    assert None not in rule_ids
+
+
+def test_secret_to_finding_returns_none_on_malformed():
+    """O06 §4.7: _secret_to_finding ritorna None su input malformato (non-dict,
+    RuleID assente/non-str/vuoto) — esattamente come _vuln_to_finding."""
+    from bastione.modules.trivy.module import TrivyModule
+    mod = TrivyModule()
+    assert mod._secret_to_finding(None, "t", "tgt") is None
+    assert mod._secret_to_finding("not a dict", "t", "tgt") is None
+    assert mod._secret_to_finding(42, "t", "tgt") is None
+    assert mod._secret_to_finding({}, "t", "tgt") is None
+    assert mod._secret_to_finding({"RuleID": ""}, "t", "tgt") is None
+    assert mod._secret_to_finding({"RuleID": 123}, "t", "tgt") is None
+
+
+def test_run_secret_title_absent_no_double_prefix(monkeypatch, tmp_path):
+    """O06 single prefix: secret senza Title → 'trivy: <RuleID>',
+    NON 'trivy: trivy: <RuleID>' (un solo prefisso)."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    report = {
+        "Results": [
+            {
+                "Target": "config/.env",
+                "Secrets": [
+                    {"RuleID": "no-title-rule", "Category": "AWS",
+                     "Severity": "HIGH", "StartLine": 2, "Match": "x"},  # NESSUN Title
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(trivy_mod, "_run_trivy", lambda src, out_path: report)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)
+
+    f = next(f for f in result.findings if f.rule_id == "no-title-rule")
+    assert f.title == "trivy: no-title-rule"
+    assert "trivy: trivy:" not in f.title
+
+
+def test_run_secret_title_present_single_prefix(monkeypatch, tmp_path):
+    """O06 single prefix: secret con Title → 'trivy: <Title>' (un solo prefisso,
+    e il Title di trivy è il nome-regola umano, non il segreto → P8-safe)."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    report = _trivy_secret_report(rule_id="aws-access-key-id", title="AWS Access Key ID")
+    monkeypatch.setattr(trivy_mod, "_run_trivy", lambda src, out_path: report)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)
+
+    f = next(f for f in result.findings if f.rule_id == "aws-access-key-id")
+    assert f.title == "trivy: AWS Access Key ID"
+    assert "trivy: trivy:" not in f.title
+
+
+def test_run_secret_non_int_startline_line_none(monkeypatch, tmp_path):
+    """O06: StartLine non-int (assente o non numerico) → location.line is None,
+    nessun crash (§4.7)."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    report = {
+        "Results": [
+            {
+                "Target": "config/.env",
+                "Secrets": [
+                    {"RuleID": "r1", "Category": "AWS", "Severity": "HIGH",
+                     "Title": "t", "StartLine": "not-an-int", "Match": "x"},
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(trivy_mod, "_run_trivy", lambda src, out_path: report)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)
+
+    f = next(f for f in result.findings if f.rule_id == "r1")
+    assert f.location.line is None
+
+
+def test_run_mixed_vuln_misconf_secret(monkeypatch, tmp_path):
+    """O06 regressione misto: report con Vulnerabilities + Misconfigurations +
+    Secrets insieme → tutti e tre i tipi compaiono nei finding (§14)."""
+    import bastione.modules.trivy.module as trivy_mod
+    from bastione.modules.trivy.module import TrivyModule
+
+    monkeypatch.setattr(trivy_mod.shutil, "which", lambda name: "/usr/bin/trivy")
+    report = {
+        "Results": [
+            {
+                "Target": "config/.env",
+                "Vulnerabilities": [
+                    {"VulnerabilityID": "CVE-MIX-1", "Severity": "HIGH", "PkgName": "p"},
+                ],
+                "Misconfigurations": [
+                    {"ID": "MIX-MISCONF", "Severity": "HIGH", "Title": "m"},
+                ],
+                "Secrets": [
+                    {"RuleID": "mix-secret", "Category": "AWS", "Severity": "CRITICAL",
+                     "Title": "s", "StartLine": 1, "Match": "x"},
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(trivy_mod, "_run_trivy", lambda src, out_path: report)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    ctx = _make_ctx(source_path=str(src_dir))
+    result = TrivyModule().run(ctx)
+
+    rule_ids = {f.rule_id for f in result.findings}
+    assert {"CVE-MIX-1", "MIX-MISCONF", "mix-secret"} <= rule_ids
+    # il secret resta INFO, non CRITICAL
+    secret_f = next(f for f in result.findings if f.rule_id == "mix-secret")
+    assert secret_f.severity == Severity.INFO

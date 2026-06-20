@@ -78,6 +78,11 @@ def _run_trivy(source_path: str, out_path: str) -> dict | None:
     argv = [
         "trivy",
         "fs",
+        # O07: di default `trivy fs` esegue solo vuln,secret → il parser
+        # _misconf_to_finding non verrebbe mai esercitato su dati reali. Forziamo
+        # esplicitamente i tre scanner (vuln,secret,misconfig) così che il report
+        # includa anche le Misconfigurations (§14). Resta argv-list, mai shell=True.
+        "--scanners", "vuln,secret,misconfig",
         "--format", "json",
         "--quiet",
         source_path,
@@ -127,6 +132,18 @@ def _map_severity(raw: object) -> Severity:
     if isinstance(raw, str):
         return _SEVERITY_MAP.get(raw.strip().lower(), Severity.INFO)
     return Severity.INFO
+
+
+def _as_list(value: object) -> list:
+    """Coalesce difensivo (§4.7): ritorna `value` SOLO se è davvero una lista,
+    altrimenti `[]`. Protegge i `for … in …` di `_parse` dai casi degeneri di
+    trivy reale o malformato — `Results`/`Vulnerabilities`/`Misconfigurations`/
+    `Secrets` esplicitamente null (None → []) ma anche scalari (es. 42, 3.14) che
+    con il vecchio `x or []` restavano truthy e facevano esplodere il `for`
+    (`TypeError: 'int' object is not iterable`). Una stringa NON è una lista →
+    [] (non iteriamo i char). trivy emette sempre liste o assenza per questi
+    campi: qualsiasi altra shape è degenere → nessun finding, nessun crash."""
+    return value if isinstance(value, list) else []
 
 
 # ─── il modulo (§9/§14) ──────────────────────────────────────────────────────
@@ -213,22 +230,22 @@ class TrivyModule(Module):
     def _parse(self, report: dict, target: str) -> list[Finding]:
         """Parsa il report JSON di trivy → Finding[] dedupati (§14/§16).
 
-        Itera report.get("Results",[]) e per ciascun Result le "Vulnerabilities"
-        e "Misconfigurations" (se presenti). Un record senza ID viene SALTATO,
-        non crasha gli altri (§4.7)."""
+        Itera report.get("Results",[]) e per ciascun Result le "Vulnerabilities",
+        le "Misconfigurations" e i "Secrets" (se presenti). Un record senza ID
+        (VulnerabilityID/ID/RuleID) viene SALTATO, non crasha gli altri (§4.7).
+        I Secrets diventano Finding PER-SECRET a severità INFO (design LOCKED)."""
         deduped: dict[str, Finding] = {}
         # `report` può non essere un dict (difesa in profondità §4.7) e "Results"
         # può essere esplicitamente null (output reale di trivy: chiave presente con
         # valore None). `.get("Results", [])` da solo NON copre il caso null →
-        # coalesciamo con `or []` (coerente con Vulnerabilities/Misconfigurations sotto).
-        results = report.get("Results") or [] if isinstance(report, dict) else []
-        for result in results:
+        # coalesciamo via `_as_list` (lista solo se davvero lista, altrimenti []).
+        for result in _as_list(report.get("Results")) if isinstance(report, dict) else []:
             if not isinstance(result, dict):
                 continue
             result_target = result.get("Target", "") or ""
 
             # Vulnerabilità
-            for vuln in result.get("Vulnerabilities") or []:
+            for vuln in _as_list(result.get("Vulnerabilities")):
                 finding = self._vuln_to_finding(vuln, result_target, target)
                 if finding is None:
                     continue
@@ -236,8 +253,15 @@ class TrivyModule(Module):
                 deduped.setdefault(finding.finding_id, finding)
 
             # Misconfigurations (se presenti nel risultato)
-            for misconf in result.get("Misconfigurations") or []:
+            for misconf in _as_list(result.get("Misconfigurations")):
                 finding = self._misconf_to_finding(misconf, result_target, target)
+                if finding is None:
+                    continue
+                deduped.setdefault(finding.finding_id, finding)
+
+            # Secrets (O06): un Finding PER-SECRET a severità INFO (design LOCKED).
+            for secret in _as_list(result.get("Secrets")):
+                finding = self._secret_to_finding(secret, result_target, target)
                 if finding is None:
                     continue
                 deduped.setdefault(finding.finding_id, finding)
@@ -330,6 +354,71 @@ class TrivyModule(Module):
                 f"'{result_target}' (severità {severity.name}). "
                 "Rilevato da una scansione FS white-box (PROBE §14). "
                 "Verifica il dettaglio nel report raw/trivy.json."
+            ),
+            remediation_ref=rule_id,
+            intrusion_used=IntrusionLevel.PROBE,
+        )
+
+    def _secret_to_finding(
+        self, secret: object, result_target: str, target: str
+    ) -> Finding | None:
+        """Una voce Secrets del report trivy → Finding, o None (O06, design LOCKED).
+
+        Finding PER-SECRET a severità SEMPRE INFO (non la severità di trivy): i
+        secret di trivy includono falsi positivi by-design (es. anon key pubblica
+        nel bundle); a INFO sono visibili ma non gonfiano il posture score, e il
+        triage autorevole dei secret pericolosi resta il detector §10
+        (SECRET_SERVICE_ROLE).
+
+        rule_id = RuleID; location.file = result_target, location.line = StartLine
+        (così due secret della stessa RuleID su righe diverse dello STESSO file
+        danno finding_id distinti §16; identici dedupano).
+
+        P8 (segreti redatti §7): il valore del secret (Match/Code) NON compare MAI
+        in evidence/title/description/remediation_ref — solo metadati di regola
+        (RuleID, Category, Title, file:line). Il Title di trivy è il nome-regola
+        umano (es. "AWS Access Key ID"), NON il segreto → P8-safe."""
+        if not isinstance(secret, dict):
+            return None
+        rule_id = secret.get("RuleID")
+        if not isinstance(rule_id, str) or not rule_id:
+            log.debug("trivy: secret senza RuleID, saltato")
+            return None
+
+        # Severità SEMPRE INFO (design LOCKED): la severità di trivy è ignorata.
+        severity = Severity.INFO
+        start_line = secret.get("StartLine")
+        line = start_line if isinstance(start_line, int) else None
+        category = secret.get("Category") or ""
+        # Fallback al bare rule_id (come vuln/misconf): il prefisso "trivy: " è
+        # applicato una sola volta sotto. Il Title di trivy è il nome-regola umano,
+        # mai il segreto (P8-safe).
+        title = secret.get("Title") or rule_id
+
+        location = Location(file=result_target or None, line=line)
+        fid = _finding_id("trivy", rule_id, location)
+        # Evidence redatta (P8): SOLO metadati di regola — mai il Match né il Code.
+        line_str = str(line) if line is not None else ""
+        evidence = f"trivy secret {rule_id} ({category}) in {result_target}:{line_str}"
+
+        return Finding(
+            finding_id=fid,
+            module="trivy",
+            rule_id=rule_id,
+            title=f"trivy: {title}",
+            severity=severity,
+            confidence=Confidence.FIRM,
+            target=target,
+            location=location,
+            evidence=evidence,
+            description=(
+                f"trivy ha rilevato un potenziale secret '{rule_id}' "
+                f"(categoria '{category}') in '{result_target}' (severità INFO). "
+                "Il triage autorevole dei secret pericolosi è il detector §10 "
+                "(SECRET_SERVICE_ROLE): i secret di trivy includono falsi positivi "
+                "by-design, perciò qui restano a INFO (non gonfiano il posture score). "
+                "Il dettaglio completo (incluso il match) è SOLO nel report locale "
+                "raw/trivy.json (gitignored) — il valore del secret NON è incluso qui (P8)."
             ),
             remediation_ref=rule_id,
             intrusion_used=IntrusionLevel.PROBE,
