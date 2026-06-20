@@ -69,6 +69,9 @@ TASK
 - **Path-traversal + SSTI sul `rule_id` dei playbook (M1 step 4):** whitelist + containment.
 - **`nuclei -include-tags safe` è additivo, non restrittivo (M1 step 6):** avrebbe girato template *attivi* sotto un modulo PROBE/passive → fix `-exclude-tags` + cap di severità.
 - **Rollback multi-linea (M2 step 0):** rompeva il Markdown del `FIX-PLAN.md` → reso fenced.
+- **`_as_list()` per i parser degeneri (M3 O06/O07, S12):** la blind-review *robustezza* ha trovato che i `result.get("X") or []` di `_parse` (trivy) crashavano su uno scalare truthy (`Secrets:42` → `TypeError` fuori da `run()`) → coalesce difensivo a lista-solo-se-lista.
+
+> **Lezione sul GATE→FIX (NUOVA, S12):** se l'orchestratore innesca il fixer filtrando i finding dei reviewer su `is_real==true`, attenzione: un reviewer può mettere in `findings[]` una **conferma positiva** ("P8 ok", "argv sicuro") con `is_real=true` e `severity=info`. In S12 questo ha **innescato il fixer inutilmente** (3 conferme + 1 difetto reale low; il fixer ha comunque distinto e fixato solo il difetto). Filtro corretto: `is_real && severity != info && il suggested_fix richiede un'azione` — **oppure** istruisci i reviewer a NON mettere conferme positive in `findings[]` (solo difetti). In ogni caso il verdetto resta dell'orchestratore che rilancia `python -m pytest -q` sull'albero stabile.
 
 ## 4 · Ondate & DAG
 
@@ -114,18 +117,18 @@ I task si organizzano in un **grafo di dipendenze**; gli indipendenti girano in 
 
 ## 7 · Milestone → workflow (fan-out reale)
 
-> Conteggi presi da `BASTIONE-SESSION-STATE.md` — fatti, non stime. Stato attuale: **831 test verdi**, tutto offline.
+> Conteggi presi da `BASTIONE-SESSION-STATE.md` — fatti, non stime. Stato attuale: **859 test verdi**, tutto offline.
 
 | Milestone | Stato | Task/step | Gate di milestone | File di dettaglio |
 |---|---|---|---|---|
 | **M0 · Vista dell'attaccante (read-only)** | ✅ **done** (validata live read-only) | ~16 step (build-order) | scan E2E read-only senza crash + **DoD §3** (SARIF+MD+state reali) | SESSION-STATE §2/§3 |
 | **M1 · Profondità + difesa di base** | ✅ **done** (validata live read-only) | 7 step | profondità + difesa: table-discovery, liveness PROBE, baseline/drift, playbook, agent-bundle, black-box, report HTML | SESSION-STATE §3-bis |
 | **M2 · Sistema di difesa continuo** | ✅ **code-complete (offline)** · capstone live pendente | 7 step | **629 test verdi** + canary §11.2 offline + oracolo/notifier/CI-gate/portfolio/monitoring | SESSION-STATE §3-ter |
-| **M3 · Espansioni** | ✅ **code-complete** · ✅ **corsie validate live** (S11) · push DefectDojo trigger-gated | 5 step (T0 + 4 corsie + integraz.) | **831 test verdi** + semgrep/trivy §14 + attack-surface §16 (`surface`) + DefectDojo §19 exporter+push gated (`export-defectdojo`) | SESSION-STATE §3-quater/§7 |
+| **M3 · Espansioni** | ✅ **code-complete** · ✅ **corsie validate live** (S11) · ✅ **O06/O07 risolte** (S12) · push DefectDojo trigger-gated | 5 step (T0 + 4 corsie + integraz.) + O06/O07 | **859 test verdi** + semgrep/trivy §14 (incl. trivy Secrets→Finding INFO P8 + scanner misconfig) + attack-surface §16 (`surface`) + DefectDojo §19 exporter+push gated (`export-defectdojo`) | SESSION-STATE §3-quater/§7 |
 
 ## 8 · Task-graph M3 — ✅ COSTRUITO (Sessione 10), esecuzioni live trigger-gated
 
-> **Premessa (aggiornata Sessione 11):** **M3 è stata COSTRUITA offline** in un solo dynamic workflow (semgrep, trivy, attack-surface, DefectDojo), e le **4 corsie sono state poi VALIDATE LIVE** (Sessione 11, 2026-06-20): semgrep su output Docker reale, trivy nativo end-to-end su 61 CVE reali, attack-surface diff deterministico, DefectDojo exporter su finding reali. Resta gated **solo il push DefectDojo reale** (trigger: *1° cliente pagante*). Il *"deferred/trigger-based"* del canone riguardava l'**esecuzione live/outward-facing**, **non** il codice: ogni GATE era un **test offline** + binario/sorgente assente → **`SKIPPED` INFO onesto** (mai crash), sul modello della colla sottile §14 (nuclei/ZAP). Regola d'oro **P5** rispettata: il deferral è stato sollevato da Claudio (owner), che resta il decisore. *Lezione live (S11):* su Windows il `subprocess` nudo (`["semgrep",…]`) cerca `.exe` e **non** lancia i `.bat` ⇒ semgrep va validato via seam I/O→Docker (max fedele); trivy ha binario nativo ⇒ end-to-end vero. Emerse **O06/O07** (SESSION-STATE §5) dalla validazione trivy.
+> **Premessa (aggiornata Sessione 11):** **M3 è stata COSTRUITA offline** in un solo dynamic workflow (semgrep, trivy, attack-surface, DefectDojo), e le **4 corsie sono state poi VALIDATE LIVE** (Sessione 11, 2026-06-20): semgrep su output Docker reale, trivy nativo end-to-end su 61 CVE reali, attack-surface diff deterministico, DefectDojo exporter su finding reali. Resta gated **solo il push DefectDojo reale** (trigger: *1° cliente pagante*). Il *"deferred/trigger-based"* del canone riguardava l'**esecuzione live/outward-facing**, **non** il codice: ogni GATE era un **test offline** + binario/sorgente assente → **`SKIPPED` INFO onesto** (mai crash), sul modello della colla sottile §14 (nuclei/ZAP). Regola d'oro **P5** rispettata: il deferral è stato sollevato da Claudio (owner), che resta il decisore. *Lezione live (S11):* su Windows il `subprocess` nudo (`["semgrep",…]`) cerca `.exe` e **non** lancia i `.bat` ⇒ semgrep va validato via seam I/O→Docker (max fedele); trivy ha binario nativo ⇒ end-to-end vero. Emerse **O06/O07** (SESSION-STATE §5) dalla validazione trivy. **Aggiornamento (Sessione 12):** **O06/O07 RISOLTE** via un dynamic workflow dedicato (1 builder Opus TDD → 3 blind-review parallele → 1 fixer): O06 = trivy `Secrets`→**Finding per-secret a INFO** P8-redatti; O07 = `--scanners vuln,secret,misconfig` nell'argv. La blind-review robustezza ha pescato 1 difetto reale (helper `_as_list()` §4.7). **859 verdi.** Con questo M3 e l'intero canone §27 sono completi.
 
 | id | dipende_da | output | GATE | modello |
 |---|---|---|---|---|
