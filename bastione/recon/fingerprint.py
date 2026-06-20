@@ -37,6 +37,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 from bastione.models import Fingerprint
+from bastione.recon.api_surface import extract_api_paths
 
 log = logging.getLogger("bastione.recon")
 
@@ -287,6 +288,7 @@ def fingerprint(target: str, run_dir: Path | None = None) -> Fingerprint:
     supabase_url: str | None = None
     anon_key: str | None = None
     discovered: set[str] = set()
+    api_paths_acc: set[str] = set()
     for url in js_urls:
         # Owned-only (§7/§4.2): non scarichiamo bundle su host esterni non
         # dichiarati. La chiave Supabase sta nel bundle same-origin dell'app; gli
@@ -305,8 +307,13 @@ def fingerprint(target: str, run_dir: Path | None = None) -> Fingerprint:
         # bundle successivi (che possono referenziare altre tabelle) sarebbero
         # persi; restiamo comunque entro gli stessi host owned già dichiarati.
         discovered.update(extract_table_names(jresp.text))
+        # Scoperta superficie API (M4.0): aggrega i path `/api/...` referenziati
+        # nei bundle same-host già scaricati, in modo analogo alle tabelle. Funzione
+        # PURA su testo in memoria: nessun nuovo download (owned-only, §7).
+        api_paths_acc.update(extract_api_paths(jresp.text))
 
     discovered_tables = sorted(discovered)
+    discovered_api_paths = sorted(api_paths_acc)
 
     fp = Fingerprint(
         target=target,
@@ -319,6 +326,7 @@ def fingerprint(target: str, run_dir: Path | None = None) -> Fingerprint:
         is_supabase=supabase_url is not None,
         supabase_url=supabase_url,
         discovered_tables=discovered_tables,
+        discovered_api_paths=discovered_api_paths,
         anon_key=anon_key,
         cloudflare_fronted=cloudflare,
         endpoints=endpoints,

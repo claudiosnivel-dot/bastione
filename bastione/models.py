@@ -100,6 +100,10 @@ class Fingerprint(BaseModel):          # output di RECON (§8)
     # bundle same-host (§8). Fallback per l'RLS test quando l'OpenAPI è chiusa (401,
     # §11.1). Default [] → backward-compatible e serializza in fingerprint.json.
     discovered_tables: list[str] = []
+    # Path API applicativi (`/api/...`) referenziati nei bundle same-host (M4.0).
+    # Assist alla scoperta della superficie autenticata; la ground truth sono gli
+    # endpoint dichiarati in [auth] (§5/§15). Default [] → backward-compatible.
+    discovered_api_paths: list[str] = []
     cloudflare_fronted: bool = False
     endpoints: list[str] = []
     response_headers: dict[str, str] = {}
@@ -193,6 +197,47 @@ class TableExpectation(BaseModel):     # [[expectations.table]] del TOML (§15)
     anon_insert: bool = False
 
 
+class TestAccount(BaseModel):          # M4.0 — un account di test per il probe autenticato
+    __test__ = False                   # non è una test-class pytest (il prefisso "Test" è casuale)
+    label: str                         # es. "A", "B"
+    mode: Literal["token", "login_post"]
+    # mode="token": il token è in una env var (mai nel TOML), P8
+    token_env: str | None = None
+    token_header: str = "Authorization"
+    token_prefix: str = "Bearer "      # "" per cookie/raw
+    # mode="login_post":
+    login_url: str | None = None
+    email: str | None = None
+    password_env: str | None = None    # nome env var con la password (mai in chiaro)
+    session_json_path: str | None = None  # chiave del JSON di risposta col token (es. "access_token")
+    session_cookie: str | None = None  # nome del cookie di sessione (alternativa)
+
+
+class ApiEndpoint(BaseModel):          # M4.0 — un endpoint dell'API applicativa
+    method: str                        # GET/POST/PUT/PATCH/DELETE
+    path_template: str                 # es. "/api/orders/{id}"
+    kind: Literal["list", "read", "create", "update", "delete"]
+    public: bool = False               # dichiarato pubblico-di-proposito → oracolo soppresso (§15)
+
+
+class AuthConfig(BaseModel):           # M4.0 — sezione [auth] del TOML
+    test_accounts: list[TestAccount] = []
+    api_endpoints: list[ApiEndpoint] = []
+    public_endpoints: list[str] = []   # path/prefissi pubblici-di-proposito (§15)
+
+
+class AuthSession(BaseModel):          # M4.0 — sessione acquisita per un account
+    account_label: str
+    headers: dict[str, str] = Field(default_factory=dict, repr=False)   # P8: token fuori dal repr
+    cookies: dict[str, str] = Field(default_factory=dict, repr=False)   # P8
+    acquired_ok: bool = False
+
+
+class ApiSurface(BaseModel):           # M4.0 — superficie API per il probe autenticato
+    endpoints: list[ApiEndpoint] = []  # ground truth (dichiarati in [auth])
+    extracted_paths: list[str] = []    # assist: path /api/... estratti dal bundle
+
+
 class TargetConfig(BaseModel):         # prodotto da config.py: parse+validate del TOML (§29)
     name: str
     base_url: str
@@ -205,6 +250,7 @@ class TargetConfig(BaseModel):         # prodotto da config.py: parse+validate d
     expectations: list[TableExpectation] = []       # §15 (M2)
     modules_disabled: list[str] = []   # [modules].disabled
     source_path: str | None = None     # path locale del sorgente (white-box: semgrep/trivy)
+    auth: AuthConfig | None = None     # [auth] — modalità autenticata (M4.0)
 
     @field_validator("notify_min_severity", mode="before")
     @classmethod

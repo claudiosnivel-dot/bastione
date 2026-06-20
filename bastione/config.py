@@ -81,4 +81,21 @@ def _flatten(data: dict) -> dict:
     if "source_path" in data:
         kwargs["source_path"] = data["source_path"]
 
+    auth = data.get("auth")
+    if auth is not None:
+        auth_kwargs: dict = {}
+        if "test_accounts" in auth:
+            auth_kwargs["test_accounts"] = auth["test_accounts"]
+        if "api_endpoints" in auth:
+            auth_kwargs["api_endpoints"] = auth["api_endpoints"]
+        # public_endpoints vive in una sotto-tabella per TOML valido dopo un
+        # array-of-tables (una chiave nuda dopo [[auth.api_endpoints]] finirebbe
+        # in quell'ultima tabella). Accettiamo entrambe le forme per robustezza.
+        suppression = auth.get("suppression") or {}
+        if "public_endpoints" in suppression:
+            auth_kwargs["public_endpoints"] = suppression["public_endpoints"]
+        elif "public_endpoints" in auth:
+            auth_kwargs["public_endpoints"] = auth["public_endpoints"]
+        kwargs["auth"] = auth_kwargs
+
     return kwargs
