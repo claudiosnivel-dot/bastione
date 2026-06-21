@@ -96,3 +96,15 @@ def test_flatten_no_auth_section_leaves_auth_none():
         'environment="staging"\nownership="owned"\n')
     cfg = TargetConfig(**_flatten(data))
     assert cfg.auth is None
+
+
+def test_flatten_parses_login_attempts_cap():
+    import tomllib
+    from bastione.config import _flatten
+    from bastione.models import TargetConfig
+    data = tomllib.loads(
+        'name="t"\nbase_url="https://s.example.com"\nenvironment="staging"\nownership="owned"\n'
+        '[auth]\nlogin_attempts_cap = 3\n'
+        '[[auth.test_accounts]]\nlabel="A"\nmode="token"\ntoken_env="T"\n')
+    cfg = TargetConfig(**_flatten(data))
+    assert cfg.auth.login_attempts_cap == 3

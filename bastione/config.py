@@ -96,6 +96,8 @@ def _flatten(data: dict) -> dict:
             auth_kwargs["public_endpoints"] = suppression["public_endpoints"]
         elif "public_endpoints" in auth:
             auth_kwargs["public_endpoints"] = auth["public_endpoints"]
+        if "login_attempts_cap" in auth:
+            auth_kwargs["login_attempts_cap"] = auth["login_attempts_cap"]
         kwargs["auth"] = auth_kwargs
 
     return kwargs

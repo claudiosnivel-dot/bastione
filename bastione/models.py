@@ -224,6 +224,7 @@ class AuthConfig(BaseModel):           # M4.0 — sezione [auth] del TOML
     test_accounts: list[TestAccount] = []
     api_endpoints: list[ApiEndpoint] = []
     public_endpoints: list[str] = []   # path/prefissi pubblici-di-proposito (§15)
+    login_attempts_cap: int = 5        # M4.2: cap basso del probe rate-limit (non brute-force)
 
 
 class AuthSession(BaseModel):          # M4.0 — sessione acquisita per un account
