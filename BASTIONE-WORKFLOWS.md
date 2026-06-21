@@ -5,7 +5,7 @@
 > **UN workflow per milestone** (LOCKED, Claudio 2026-06-14): **NON** uno per step. Tutti gli step della milestone confluiscono in un solo workflow, con gli agenti in parallelo *dove i file lo consentono*.
 > **Cap reali dello strumento:** **concorrenza = `min(16, core_CPU − 2)` per workflow** (16 è il *tetto*, non una garanzia: con pochi core la parallelizzazione effettiva è minore) · **1.000 agent totali per run**.
 > **Ground-truth:** il verdetto è dell'oracolo — l'orchestratore riesegue **`python -m pytest -q`** (su Windows: `python -m pytest -q`, **NON** uv — uv è assente; python 3.14 ha pytest/pydantic) — **più** la blind-review adversariale. **MAI** il self-report dell'agente.
-> Codename BAS · allineato a `BASTIONE-BLUEPRINT-v2.md` (v2.1) e `BASTIONE-SESSION-STATE.md` · Aggiornato: 2026-06-18
+> Codename BAS · allineato a `BASTIONE-BLUEPRINT-v2.md` (v2.1) e `BASTIONE-SESSION-STATE.md` · Aggiornato: 2026-06-21
 
 ---
 
@@ -117,7 +117,7 @@ I task si organizzano in un **grafo di dipendenze**; gli indipendenti girano in 
 
 ## 7 · Milestone → workflow (fan-out reale)
 
-> Conteggi presi da `BASTIONE-SESSION-STATE.md` — fatti, non stime. Stato attuale: **900 test verdi**, tutto offline.
+> Conteggi presi da `BASTIONE-SESSION-STATE.md` — fatti, non stime. Stato attuale: **925 test verdi**, tutto offline.
 
 | Milestone | Stato | Task/step | Gate di milestone | File di dettaglio |
 |---|---|---|---|---|
@@ -125,7 +125,7 @@ I task si organizzano in un **grafo di dipendenze**; gli indipendenti girano in 
 | **M1 · Profondità + difesa di base** | ✅ **done** (validata live read-only) | 7 step | profondità + difesa: table-discovery, liveness PROBE, baseline/drift, playbook, agent-bundle, black-box, report HTML | SESSION-STATE §3-bis |
 | **M2 · Sistema di difesa continuo** | ✅ **code-complete (offline)** · capstone live pendente | 7 step | **629 test verdi** + canary §11.2 offline + oracolo/notifier/CI-gate/portfolio/monitoring | SESSION-STATE §3-ter |
 | **M3 · Espansioni** | ✅ **code-complete** · ✅ **corsie validate live** (S11) · ✅ **O06/O07 risolte** (S12) · push DefectDojo trigger-gated | 5 step (T0 + 4 corsie + integraz.) + O06/O07 | **859 test verdi** + semgrep/trivy §14 (incl. trivy Secrets→Finding INFO P8 + scanner misconfig) + attack-surface §16 (`surface`) + DefectDojo §19 exporter+push gated (`export-defectdojo`) | SESSION-STATE §3-quater/§7 |
-| **M4 · Bastione autenticato** (NUOVO, oltre il canone §27) | 🔨 **M4.0 + M4.1 code-complete (offline)** (S12-cont) · M4.2/4.3/4.4 deferred · esecuzione live IDOR gated | 5 step (M4.0 fondamenta + M4.1 IDOR + 3 deferred) | **900 test verdi** + auth/session §7 + api_surface §8 + IDOR cross-tenant §11.2/§15 (`modules/idor/`, READ a PROBE + WRITE canary a MUTATING + cleanup garantito) | SESSION-STATE §3-quinquies · spec/plan in `docs/superpowers/` |
+| **M4 · Bastione autenticato** (NUOVO, oltre il canone §27) | ✅ **code-complete (offline) 5/5** (M4.0+M4.1 S12-cont · M4.2/4.3/4.4 S13) · esecuzione live gated | 5 step (M4.0 fondamenta + M4.1 IDOR + M4.2 login_hardening + M4.3 zap_active + M4.4 server_exposure) | **925 test verdi** + auth/session §7 + api_surface §8 + IDOR cross-tenant §11.2/§15 + login_hardening (PROBE) + zap_active (MUTATING, policy vincolata enforced fail-closed) + server_exposure (PROBE) | SESSION-STATE §3-quinquies · spec/plan in `docs/superpowers/` |
 
 ## 8 · Task-graph M3 — ✅ COSTRUITO (Sessione 10), esecuzioni live trigger-gated
 
