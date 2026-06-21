@@ -109,13 +109,16 @@ def _ensure_modules_loaded() -> None:
     import bastione.modules.cloudflare.module  # noqa: F401
     import bastione.modules.headers.module  # noqa: F401
     import bastione.modules.idor.module  # noqa: F401  (M4.1 IDOR autenticato)
+    import bastione.modules.login_hardening.module  # noqa: F401  (M4.2)
     import bastione.modules.nuclei.module  # noqa: F401  (§14 black-box esterno)
     import bastione.modules.secrets.detectors  # noqa: F401  (popola DETECTORS)
     import bastione.modules.secrets.module  # noqa: F401
     import bastione.modules.semgrep.module  # noqa: F401  (§14 white-box SAST, gated su source_path)
+    import bastione.modules.server_exposure.module  # noqa: F401  (M4.4)
     import bastione.modules.supabase.module  # noqa: F401
     import bastione.modules.trivy.module  # noqa: F401  (§14 white-box SCA, gated su source_path)
     import bastione.modules.zap.module  # noqa: F401  (§14 black-box esterno)
+    import bastione.modules.zap_active.module  # noqa: F401  (M4.3)
 
 
 class Orchestrator:
