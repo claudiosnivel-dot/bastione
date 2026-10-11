@@ -12,6 +12,8 @@ ownership_token = "b3f1c2a4-…"          # pubblicato su /.well-known/bastione-
 [supabase]
 url = "https://abcdef.supabase.co"      # opzionale; il recon può estrarlo dal bundle
 # anon_key: NON metterla qui — la estrae il recon (è pubblica)
+buckets = ["avatars"]                   # nomi noti (lo storage non li elenca all'anon)
+rpcs = ["get_listino"]                  # nomi noti oltre a quelli del bundle
 
 # ─── Notifiche ──────────────────────────────────────────────────────
 [notify]
@@ -20,6 +22,11 @@ min_severity = "high"                   # soglia per alert/CI
 
 # ─── Modo oracolo (opzionale → abilita la profondità) ───────────────
 [expectations]
+
+[expectations.auth]
+signup_open = false                     # il signup pubblico è voluto?
+anonymous_signin = false                # il sign-in anonimo è voluto?
+
 [[expectations.table]]
 name = "clienti"
 anon_select = false
@@ -28,6 +35,15 @@ anon_insert = false
 name = "listino_pubblico"
 anon_select = true
 anon_insert = false
+
+[[expectations.bucket]]
+name = "avatars"
+anon_list = false                       # l'anon può elencare gli oggetti?
+
+[[expectations.rpc]]
+name = "get_listino"
+anon_execute = true                     # l'anon può eseguirla?
+sample_args = { categoria = "freni" }   # opzionale: argomenti (query string)
 
 # ─── Override moduli (opzionale) ────────────────────────────────────
 [modules]

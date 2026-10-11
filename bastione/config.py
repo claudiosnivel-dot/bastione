@@ -63,6 +63,10 @@ def _flatten(data: dict) -> dict:
     supabase = data.get("supabase") or {}
     if "url" in supabase:
         kwargs["supabase_url"] = supabase["url"]
+    if "buckets" in supabase:
+        kwargs["supabase_buckets"] = supabase["buckets"]
+    if "rpcs" in supabase:
+        kwargs["supabase_rpcs"] = supabase["rpcs"]
 
     notify = data.get("notify") or {}
     if "channel" in notify:
@@ -70,9 +74,15 @@ def _flatten(data: dict) -> dict:
     if "min_severity" in notify:
         kwargs["notify_min_severity"] = notify["min_severity"]
 
-    tables = (data.get("expectations") or {}).get("table")
-    if tables is not None:
-        kwargs["expectations"] = tables
+    expectations = data.get("expectations") or {}
+    if expectations.get("table") is not None:
+        kwargs["expectations"] = expectations["table"]
+    if "auth" in expectations:
+        kwargs["expect_auth"] = expectations["auth"]
+    if "bucket" in expectations:
+        kwargs["expect_buckets"] = expectations["bucket"]
+    if "rpc" in expectations:
+        kwargs["expect_rpcs"] = expectations["rpc"]
 
     modules = data.get("modules") or {}
     if "disabled" in modules:

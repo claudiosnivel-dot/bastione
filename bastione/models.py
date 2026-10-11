@@ -96,6 +96,14 @@ class Fingerprint(BaseModel):          # output di RECON (§8)
     is_supabase: bool = False          # PostgREST rilevato
     supabase_url: str | None = None
     anon_key: str | None = None        # pubblica per design, estratta dal bundle
+    # §4.2 M5: tipo della chiave pubblica estratta (legacy JWT `eyJ…` vs nuova
+    # `sb_publishable_…`). None se nessuna chiave trovata. `anon_key` resta e porta
+    # la chiave pubblica di ENTRAMBI i tipi (retrocompatibilità).
+    supabase_key_kind: Literal["legacy_jwt", "publishable"] | None = None
+    # Nomi bucket/RPC ricavati dal bundle JS same-host (§4.2/§8). Fallback quando lo
+    # storage non elenca all'anon e l'OpenAPI è chiusa. Default [] → backward-compatible.
+    discovered_buckets: list[str] = []
+    discovered_rpcs: list[str] = []
     # Nomi tabella ricavati dai riferimenti `.from('...')` del client Supabase nei
     # bundle same-host (§8). Fallback per l'RLS test quando l'OpenAPI è chiusa (401,
     # §11.1). Default [] → backward-compatible e serializza in fingerprint.json.
@@ -173,6 +181,11 @@ class RawSecret(BaseModel):
     value: str                         # valore grezzo (redatto in output)
     location: Location
     entropy: float | None = None
+    # §4.4 M5: override di severità per-match. Il modulo secrets usa questo se
+    # presente, altrimenti `detector.severity`. Permette a un detector (Stripe) di
+    # distinguere live/test/webhook mantenendo UN solo detector_id. None = usa il
+    # default del detector.
+    severity_override: "Severity | None" = None
 
 
 class LivenessResult(BaseModel):
@@ -195,6 +208,22 @@ class TableExpectation(BaseModel):     # [[expectations.table]] del TOML (§15)
     name: str
     anon_select: bool = False
     anon_insert: bool = False
+
+
+class BucketExpectation(BaseModel):    # [[expectations.bucket]] del TOML (§15/§4.2)
+    name: str
+    anon_list: bool = False            # l'anon può elencare gli oggetti del bucket?
+
+
+class RpcExpectation(BaseModel):       # [[expectations.rpc]] del TOML (§15/§4.2)
+    name: str
+    anon_execute: bool = False         # l'anon può eseguire la funzione?
+    sample_args: dict = {}             # argomenti opzionali per invocarla (query string)
+
+
+class AuthExpectation(BaseModel):      # [expectations.auth] del TOML (§15/§4.2)
+    signup_open: bool | None = None       # il signup pubblico è voluto? None = non dichiarato
+    anonymous_signin: bool | None = None  # il sign-in anonimo è voluto? None = non dichiarato
 
 
 class TestAccount(BaseModel):          # M4.0 — un account di test per il probe autenticato
@@ -249,6 +278,11 @@ class TargetConfig(BaseModel):         # prodotto da config.py: parse+validate d
     notify_channel: str = "none"       # [notify].channel
     notify_min_severity: Severity = Severity.HIGH   # [notify].min_severity (--fail-on ha precedenza, §25)
     expectations: list[TableExpectation] = []       # §15 (M2)
+    supabase_buckets: list[str] = []            # [supabase].buckets (nomi noti)
+    supabase_rpcs: list[str] = []               # [supabase].rpcs (nomi noti)
+    expect_auth: AuthExpectation | None = None  # [expectations.auth]
+    expect_buckets: list[BucketExpectation] = []  # [[expectations.bucket]]
+    expect_rpcs: list[RpcExpectation] = []        # [[expectations.rpc]]
     modules_disabled: list[str] = []   # [modules].disabled
     source_path: str | None = None     # path locale del sorgente (white-box: semgrep/trivy)
     auth: AuthConfig | None = None     # [auth] — modalità autenticata (M4.0)

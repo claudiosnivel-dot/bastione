@@ -344,3 +344,36 @@ def test_fixplan_roundtrip_json_reloadable():
     assert reloaded.schema_version == "bastione-fixplan/1"
     assert reloaded.fixes[0].fix_type is FixType.SQL_MIGRATION
     assert reloaded.fixes[0].finding_id == "abc123"
+
+
+# ─── M5 W0 — nuovi contratti expectation + RawSecret.severity_override (Task 1) ──
+
+from bastione.models import AuthExpectation, BucketExpectation, RpcExpectation
+
+
+def test_bucket_expectation_defaults_deny_list():
+    be = BucketExpectation(name="avatars")
+    assert be.name == "avatars"
+    assert be.anon_list is False
+
+
+def test_rpc_expectation_defaults():
+    rpc_exp = RpcExpectation(name="get_listino")
+    assert rpc_exp.anon_execute is False
+    assert rpc_exp.sample_args == {}
+
+
+def test_auth_expectation_defaults_none():
+    ae = AuthExpectation()
+    assert ae.signup_open is None and ae.anonymous_signin is None
+
+
+def test_raw_secret_severity_override_defaults_none():
+    rs = RawSecret(detector_id="D", value="v", location=Location())
+    assert rs.severity_override is None
+
+
+def test_fingerprint_m5_discovery_defaults():
+    fp = Fingerprint(target="g", resolved_urls=[])
+    assert fp.supabase_key_kind is None
+    assert fp.discovered_buckets == [] and fp.discovered_rpcs == []

@@ -147,3 +147,71 @@ def test_source_path_defaults_to_none_when_absent(tmp_path: Path):
     _write(tmp_path, "g.toml", MINIMAL)
     cfg = load_target("g", tmp_path)
     assert cfg.source_path is None
+
+
+# ─── M5 W0 — contratti supabase/expectations (Task 1) ────────────────────────
+
+import tomllib
+
+from bastione.config import _flatten
+from bastione.models import (
+    AuthExpectation,
+    BucketExpectation,
+    Fingerprint,
+    RpcExpectation,
+    TargetConfig,
+)
+
+_M5_TOML = """
+name = "t"
+base_url = "https://staging.example.com"
+environment = "staging"
+ownership = "owned"
+
+[supabase]
+url = "https://abcdef.supabase.co"
+buckets = ["avatars"]
+rpcs = ["get_listino"]
+
+[expectations.auth]
+signup_open = false
+anonymous_signin = false
+
+[[expectations.table]]
+name = "clienti"
+anon_select = false
+
+[[expectations.bucket]]
+name = "avatars"
+anon_list = false
+
+[[expectations.rpc]]
+name = "get_listino"
+anon_execute = true
+sample_args = { categoria = "freni" }
+"""
+
+
+def test_flatten_parses_m5_supabase_and_expectations():
+    cfg = TargetConfig(**_flatten(tomllib.loads(_M5_TOML)))
+    assert cfg.supabase_buckets == ["avatars"]
+    assert cfg.supabase_rpcs == ["get_listino"]
+    assert cfg.expect_auth == AuthExpectation(signup_open=False, anonymous_signin=False)
+    assert [b.name for b in cfg.expect_buckets] == ["avatars"]
+    assert cfg.expect_buckets[0].anon_list is False
+    assert cfg.expect_rpcs[0].anon_execute is True
+    assert cfg.expect_rpcs[0].sample_args == {"categoria": "freni"}
+    # retro-compat: le table expectations esistenti restano
+    assert [t.name for t in cfg.expectations] == ["clienti"]
+
+
+def test_m5_fields_optional_and_default_empty():
+    cfg = TargetConfig(name="t", base_url="https://s.example", environment="staging", ownership="owned")
+    assert cfg.supabase_buckets == [] and cfg.supabase_rpcs == []
+    assert cfg.expect_auth is None and cfg.expect_buckets == [] and cfg.expect_rpcs == []
+
+
+def test_fingerprint_key_kind_and_discovery_defaults():
+    fp = Fingerprint(target="t", resolved_urls=[])
+    assert fp.supabase_key_kind is None
+    assert fp.discovered_buckets == [] and fp.discovered_rpcs == []
