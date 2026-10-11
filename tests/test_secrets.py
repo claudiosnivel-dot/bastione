@@ -667,3 +667,65 @@ def test_finding_id_independent_of_target(monkeypatch):
 
     assert fa.target != fb.target
     assert fa.finding_id == fb.finding_id
+
+
+# ─── (7) RawSecret.severity_override pilota la severità del Finding (D4) ──────
+
+def test_raw_secret_severity_override_wins(monkeypatch):
+    """Un RawSecret con severity_override pilota la severità del Finding (D4)."""
+    import bastione.modules.secrets.module as mod_module
+    from bastione.modules.secrets.detectors.base import Detector, DETECTORS
+    from bastione.models import RawSecret, Location
+    from bastione.enums import Severity
+    class _Fake(Detector):
+        detector_id = "SECRET_FAKE_OVR"; title = "x"; severity = Severity.CRITICAL
+        def scan(self, asset):
+            return [RawSecret(detector_id=self.detector_id, value="k"*20,
+                              location=Location(file=asset.source), severity_override=Severity.HIGH)]
+    DETECTORS.append(_Fake())          # l'autouse _reset_detectors ripristina
+    base = "https://staging.example.com/"
+    monkeypatch.setattr(mod_module, "_fetch", lambda url: fake_resp(url=base, text="x"))
+    res = mod_module.SecretsModule().run(_make_ctx(resolved_urls=[base]))
+    ovr = [f for f in res.findings if f.rule_id == "SECRET_FAKE_OVR"]
+    assert ovr and ovr[0].severity == Severity.HIGH
+
+
+# ─── (8) Wiring dei detector M5 in DETECTORS (Task 23, §4.4) ──────────────────
+
+def test_raw_secret_severity_override_info_is_respected(monkeypatch):
+    """Severity.INFO vale 0 (falsy): un override INFO esplicito NON deve ricadere sulla
+    severità di default del detector (contratto `None = usa il default`)."""
+    import bastione.modules.secrets.module as mod_module
+    from bastione.modules.secrets.detectors.base import Detector, DETECTORS
+    from bastione.models import RawSecret, Location
+    from bastione.enums import Severity
+    class _Fake(Detector):
+        detector_id = "SECRET_FAKE_OVR_INFO"; title = "x"; severity = Severity.CRITICAL
+        def scan(self, asset):
+            return [RawSecret(detector_id=self.detector_id, value="k"*20,
+                              location=Location(file=asset.source), severity_override=Severity.INFO)]
+    DETECTORS.append(_Fake())          # l'autouse _reset_detectors ripristina
+    base = "https://staging.example.com/"
+    monkeypatch.setattr(mod_module, "_fetch", lambda url: fake_resp(url=base, text="x"))
+    res = mod_module.SecretsModule().run(_make_ctx(resolved_urls=[base]))
+    ovr = [f for f in res.findings if f.rule_id == "SECRET_FAKE_OVR_INFO"]
+    assert ovr and ovr[0].severity == Severity.INFO
+
+
+def test_m5_detectors_registered():
+    """Il wiring di `detectors/__init__.py` va verificato in un interprete PULITO: nella
+    suite intera i file test_detectors_* importano già i sottomoduli, quindi DETECTORS
+    sarebbe pieno anche se `__init__.py` perdesse un import (regressione silenziosa)."""
+    import subprocess
+    import sys
+    code = ("import bastione.modules.secrets.detectors\n"
+            "from bastione.modules.secrets.detectors.base import DETECTORS\n"
+            "print(' '.join(sorted(d.detector_id for d in DETECTORS)))\n")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         check=True, timeout=60)
+    ids = set(out.stdout.split())
+    for rid in ("SECRET_SERVICE_ROLE", "SECRET_SUPABASE_SECRET_KEY", "SECRET_STRIPE",
+                "SECRET_AWS_AKIA", "SECRET_GITHUB", "SECRET_NPM", "SECRET_UPSTASH",
+                "SECRET_OPENAI", "SECRET_ANTHROPIC", "SECRET_GOOGLE_API_KEY",
+                "SECRET_TELEGRAM_BOT", "SECRET_PRIVATE_KEY", "SECRET_HIGH_ENTROPY"):
+        assert rid in ids

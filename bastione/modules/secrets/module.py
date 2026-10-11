@@ -203,7 +203,9 @@ class SecretsModule(Module):
                         module="secrets",
                         rule_id=detector.detector_id,
                         title=detector.title,
-                        severity=detector.severity,
+                        severity=(raw.severity_override
+                                  if raw.severity_override is not None
+                                  else detector.severity),
                         confidence=Confidence.FIRM,
                         target=ctx.target_cfg.name,
                         location=loc,
