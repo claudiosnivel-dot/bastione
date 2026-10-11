@@ -1,7 +1,8 @@
 """ServerExposureModule — segreti/config esposti lato server (M4.4, PROBE 🟡).
 
-Quattro oracoli: source-map .js.map esposte (riusa i detector §10), errori verbosi,
-endpoint sensibili (allowlist), CORS permissivo. Confine I/O `_fetch` monkeypatchato.
+Oracoli: source-map .js.map esposte (riusa i detector §10), endpoint sensibili
+(allowlist; dal M5 il body passa ai detector §10), dev server esposto, specifica API
+pubblicata, CORS permissivo. Confine I/O `_fetch` monkeypatchato.
 P8: i segreti trovati sono REDATTI; l'evidence riporta solo metadati."""
 from __future__ import annotations
 
@@ -18,9 +19,14 @@ from bastione.recon.fingerprint import extract_script_srcs
 
 log = logging.getLogger("bastione.modules.server_exposure")
 _HTTP_TIMEOUT = 15.0
-# allowlist conservativa di path sensibili (§14). GET read-only.
-_SENSITIVE_PATHS = ["/.env", "/.git/config", "/api/debug", "/server-status",
+# allowlist conservativa di path sensibili (§14). GET read-only. M5 (§4.5): varianti
+# `.env` e metadati git.
+_SENSITIVE_PATHS = ["/.env", "/.env.local", "/.env.production", "/.env.development",
+                    "/.git/config", "/.git/HEAD", "/api/debug", "/server-status",
                     "/actuator", "/.aws/credentials", "/config.json"]
+# M5 (§4.5): specifica API pubblicata (LOW) e marker di un dev server (HIGH).
+_API_SPEC_PATHS = ["/openapi.json", "/swagger.json", "/api-docs", "/v2/api-docs"]
+_DEV_SERVER_PATHS = ["/@vite/client", "/__vite_ping"]
 _EVIL_ORIGIN = "https://evil.bastione-probe.example"
 # marker tipici di stack trace / errore verboso
 _ERROR_MARKERS = ("traceback", "stack trace", "at line", ".py\", line", "\tat ",
@@ -45,6 +51,13 @@ def _fetch(method: str, url: str, *, headers=None):
 def _finding_id(module: str, rule_id: str, location: Location) -> str:
     raw = f"{module}:{rule_id}:{location.canonical()}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _content_type(resp) -> str:
+    try:
+        return (resp.headers.get("content-type", "") or "").lower()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _redact(value: str) -> str:
@@ -79,6 +92,8 @@ class ServerExposureModule(Module):
         posture: list[PostureCheck] = []
         self._source_maps(base, target, findings, posture)
         self._sensitive_endpoints(base, target, findings)
+        self._dev_server(base, target, findings)
+        self._api_spec(base, target, findings)
         self._cors(base, target, findings, posture)
         return ModuleResult(findings=findings, posture_checks=posture)
 
@@ -127,11 +142,7 @@ class ServerExposureModule(Module):
             resp = _fetch("GET", base + path, headers=None)
             if resp is None or getattr(resp, "status_code", 0) != 200:
                 continue
-            ctype = ""
-            try:
-                ctype = (resp.headers.get("content-type", "") or "").lower()
-            except Exception:  # noqa: BLE001
-                ctype = ""
+            ctype = _content_type(resp)
             # euristica anti-falso-positivo: l'SPA fallback è text/html
             if "text/html" in ctype:
                 continue
@@ -143,9 +154,84 @@ class ServerExposureModule(Module):
                 severity=Severity.HIGH, confidence=Confidence.FIRM, target=target, location=loc,
                 evidence=f"GET {path} → 200 (content-type {ctype or 'n/d'})",
                 description=(f"Il path sensibile {path} risponde 200: può esporre segreti/config "
-                             "(OWASP A05). Blocca l'accesso pubblico. (P8: nessun contenuto incluso)"),
+                             "(OWASP A05). Blocca l'accesso pubblico. Il contenuto passa ai "
+                             "detector segreti (P8: valori redatti, nessun contenuto incluso)."),
                 remediation_ref="SENSITIVE_ENDPOINT_EXPOSED", owasp=["A05:2021"],
                 intrusion_used=IntrusionLevel.PROBE))
+            # §4.5: il BODY passa ai detector L2 — una chiave trapelata va identificata
+            # (e messa in rotazione), come già fa `_source_maps`.
+            self._scan_body(path, getattr(resp, "text", "") or "", target, findings)
+
+    def _scan_body(self, path, body, target, findings) -> None:
+        asset = TextAsset(source=path, content=body)
+        loc = Location(endpoint=path, file=path)
+        seen: set[str] = set()
+        for det in DETECTORS:
+            try:
+                raws = det.scan(asset)
+            except Exception:  # noqa: BLE001
+                continue
+            for raw in raws:
+                # stesso detector + stesso file → stesso finding_id: un solo finding
+                if raw.detector_id in seen:
+                    continue
+                seen.add(raw.detector_id)
+                sev = (raw.severity_override if raw.severity_override is not None
+                       else det.severity)
+                findings.append(Finding(
+                    finding_id=_finding_id("server_exposure", raw.detector_id, loc),
+                    module="server_exposure", rule_id=raw.detector_id,
+                    title=f"{det.title} (in file di config esposto {path})", severity=sev,
+                    confidence=Confidence.FIRM, target=target, location=loc,
+                    evidence=f"{_redact(raw.value)} (in {path})",
+                    description=(f"Un file di config esposto ({path}) contiene un segreto "
+                                 f"{raw.detector_id}. Rimuovere il file dall'accesso pubblico e "
+                                 "RUOTARE il segreto. (P8: valore redatto.)"),
+                    remediation_ref=raw.detector_id, owasp=["A05:2021"],
+                    gdpr_relevant=det.gdpr_relevant, intrusion_used=IntrusionLevel.PROBE))
+
+    def _dev_server(self, base, target, findings) -> None:
+        for path in _DEV_SERVER_PATHS:
+            resp = _fetch("GET", base + path, headers=None)
+            if resp is None or getattr(resp, "status_code", 0) != 200:
+                continue
+            # SPA fallback (ogni path → index.html) non è un dev server
+            if "text/html" in _content_type(resp):
+                continue
+            loc = Location(endpoint=path)
+            findings.append(Finding(
+                finding_id=_finding_id("server_exposure", "DEV_SERVER_EXPOSED", loc),
+                module="server_exposure", rule_id="DEV_SERVER_EXPOSED",
+                title="Dev server raggiungibile pubblicamente", severity=Severity.HIGH,
+                confidence=Confidence.FIRM, target=target, location=loc,
+                evidence=f"GET {path} → 200 (endpoint da dev server)",
+                description=(f"Il path {path} risponde 200: un dev server (es. Vite) è esposto "
+                             "— source non minificato, HMR, superficie estesa. Servi solo la "
+                             "build di produzione."),
+                remediation_ref="DEV_SERVER_EXPOSED", owasp=["A05:2021"],
+                intrusion_used=IntrusionLevel.PROBE))
+            return   # un marker basta
+
+    def _api_spec(self, base, target, findings) -> None:
+        for path in _API_SPEC_PATHS:
+            resp = _fetch("GET", base + path, headers=None)
+            if resp is None or getattr(resp, "status_code", 0) != 200:
+                continue
+            ctype = _content_type(resp)
+            if "text/html" in ctype:
+                continue
+            loc = Location(endpoint=path)
+            findings.append(Finding(
+                finding_id=_finding_id("server_exposure", "API_SPEC_EXPOSED", loc),
+                module="server_exposure", rule_id="API_SPEC_EXPOSED",
+                title=f"Specifica API pubblicata: {path}", severity=Severity.LOW,
+                confidence=Confidence.FIRM, target=target, location=loc,
+                evidence=f"GET {path} → 200 (content-type {ctype or 'n/d'})",
+                description=(f"La specifica API {path} è pubblica: utile a un attaccante per "
+                             "mappare la superficie. Pubblicala solo se intenzionale."),
+                remediation_ref="API_SPEC_EXPOSED", owasp=["A05:2021"],
+                intrusion_used=IntrusionLevel.PROBE))
+            return
 
     def _cors(self, base, target, findings, posture) -> None:
         resp = _fetch("GET", base + "/", headers={"Origin": _EVIL_ORIGIN})

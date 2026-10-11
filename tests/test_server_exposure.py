@@ -106,3 +106,103 @@ def test_hardened_app_no_findings(monkeypatch):
     res = ServerExposureModule().run(_ctx())
     bad = {"SOURCEMAP_EXPOSED", "SENSITIVE_ENDPOINT_EXPOSED", "CORS_MISCONFIG", "VERBOSE_ERROR_LEAK"}
     assert not (bad & {f.rule_id for f in res.findings})
+
+
+# ─── M5 Task 22 (§4.5): path estesi, DEV_SERVER/API_SPEC, body → detector L2 ───
+
+def test_env_body_forwarded_to_detectors(monkeypatch):
+    import bastione.modules.server_exposure.module as m
+    import bastione.modules.secrets.detectors.stripe  # noqa: F401 — registra SECRET_STRIPE
+    def fetch(method, url, *, headers=None):
+        if url.endswith("/.env"):
+            return _Resp(200, {"content-type": "text/plain"}, text="STRIPE=sk_live_ABCdef0123456789XYZ")
+        return _Resp(404)
+    monkeypatch.setattr(m, "_fetch", fetch)
+    res = m.ServerExposureModule().run(_ctx())
+    rids = {f.rule_id for f in res.findings}
+    assert "SENSITIVE_ENDPOINT_EXPOSED" in rids and "SECRET_STRIPE" in rids
+    secret = next(f for f in res.findings if f.rule_id == "SECRET_STRIPE")
+    assert secret.severity == Severity.CRITICAL          # severity_override del match live
+    assert secret.module == "server_exposure"
+    for field in (secret.evidence, secret.title, secret.description):   # P8 redatto
+        assert "sk_live_ABCdef0123456789XYZ" not in field
+
+
+def test_env_body_same_secret_twice_is_one_finding(monkeypatch):
+    """Due match dello stesso detector nello stesso file → un solo finding (stesso finding_id)."""
+    import bastione.modules.server_exposure.module as m
+    import bastione.modules.secrets.detectors.stripe  # noqa: F401
+    body = "A=sk_live_ABCdef0123456789XYZ\nB=sk_live_ZZZdef0123456789XYZ"
+    def fetch(method, url, *, headers=None):
+        if url.endswith("/.env"):
+            return _Resp(200, {"content-type": "text/plain"}, text=body)
+        return _Resp(404)
+    monkeypatch.setattr(m, "_fetch", fetch)
+    res = m.ServerExposureModule().run(_ctx())
+    stripe = [f for f in res.findings if f.rule_id == "SECRET_STRIPE"]
+    assert len(stripe) == 1
+
+
+def test_env_variants_and_git_metadata_probed(monkeypatch):
+    import bastione.modules.server_exposure.module as m
+    seen = []
+    def fetch(method, url, *, headers=None):
+        seen.append(url)
+        return _Resp(404)
+    monkeypatch.setattr(m, "_fetch", fetch)
+    m.ServerExposureModule().run(_ctx())
+    for path in ("/.env.local", "/.env.production", "/.git/HEAD"):
+        assert "https://staging.example.com" + path in seen
+    # owned-only: nessuna richiesta fuori dall'host del target
+    assert all(u.startswith("https://staging.example.com") for u in seen)
+
+
+def test_dev_server_exposed(monkeypatch):
+    import bastione.modules.server_exposure.module as m
+    def fetch(method, url, *, headers=None):
+        if url.endswith("/@vite/client"):
+            return _Resp(200, {"content-type": "application/javascript"}, text="export const x=1")
+        return _Resp(404)
+    monkeypatch.setattr(m, "_fetch", fetch)
+    res = m.ServerExposureModule().run(_ctx())
+    dev = [f for f in res.findings if f.rule_id == "DEV_SERVER_EXPOSED"]
+    assert len(dev) == 1 and dev[0].severity == Severity.HIGH
+
+
+def test_spa_fallback_is_not_dev_server_or_api_spec(monkeypatch):
+    """SPA con fallback: ogni path risponde 200 text/html → nessun DEV_SERVER/API_SPEC."""
+    import bastione.modules.server_exposure.module as m
+    monkeypatch.setattr(m, "_fetch", lambda method, url, *, headers=None:
+                        _Resp(200, {"content-type": "text/html; charset=utf-8"}, text="<html></html>"))
+    res = m.ServerExposureModule().run(_ctx())
+    rids = {f.rule_id for f in res.findings}
+    assert not ({"DEV_SERVER_EXPOSED", "API_SPEC_EXPOSED", "SENSITIVE_ENDPOINT_EXPOSED"} & rids)
+
+
+def test_api_spec_exposed(monkeypatch):
+    import bastione.modules.server_exposure.module as m
+    def fetch(method, url, *, headers=None):
+        if url.endswith("/openapi.json"):
+            return _Resp(200, {"content-type": "application/json"}, text='{"openapi":"3.0"}')
+        return _Resp(404)
+    monkeypatch.setattr(m, "_fetch", fetch)
+    res = m.ServerExposureModule().run(_ctx())
+    spec = [f for f in res.findings if f.rule_id == "API_SPEC_EXPOSED"]
+    assert len(spec) == 1 and spec[0].severity == Severity.LOW
+
+
+def test_body_detector_crash_does_not_break_module(monkeypatch):
+    """Resilienza §4.7: un detector che solleva sul body non ferma il modulo."""
+    import bastione.modules.server_exposure.module as m
+    class _Boom:
+        detector_id = "SECRET_BOOM"
+        def scan(self, asset):
+            raise RuntimeError("boom")
+    monkeypatch.setattr(m, "DETECTORS", [_Boom()])
+    def fetch(method, url, *, headers=None):
+        if url.endswith("/.env"):
+            return _Resp(200, {"content-type": "text/plain"}, text="X=1")
+        return _Resp(404)
+    monkeypatch.setattr(m, "_fetch", fetch)
+    res = m.ServerExposureModule().run(_ctx())
+    assert "SENSITIVE_ENDPOINT_EXPOSED" in {f.rule_id for f in res.findings}
