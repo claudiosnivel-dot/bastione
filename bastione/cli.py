@@ -9,7 +9,8 @@ Comandi (§25):
   - `scan`          : esegue una run sull'orchestratore e stampa il sommario;
   - `verify`        : ri-scansiona (READ_ONLY) e mostra lo stato dei finding (§18-bis.8);
   - `baseline`      : gestisce la baseline locale del target (§16);
-  - `doctor`        : verifica quali tool esterni / lib opzionali sono presenti;
+  - `doctor`        : verifica tool esterni / lib opzionali: presenza, versione e
+                      stato della policy di versione (R4, via `toolcheck`);
   - `list-modules`  : elenca i moduli registrati (§9);
   - `list-detectors`: elenca i detector di segreti registrati (§10).
 
@@ -89,7 +90,10 @@ err_console = Console(stderr=True)
 
 # Tool esterni opzionali sondati da `doctor` (§24): l'assenza degrada il recon
 # (§8), non è un errore — è proprio lo scopo del comando rilevarla.
-_EXTERNAL_TOOLS = ["whatweb", "katana", "testssl.sh", "nuclei", "zap", "semgrep", "trivy"]
+# `zap-baseline.py` è il binario REALE usato dal modulo zap (`_ZAP_BINARY`): doctor
+# e modulo controllano lo stesso nome (niente mismatch).
+_EXTERNAL_TOOLS = ["whatweb", "katana", "testssl.sh", "nuclei", "zap-baseline.py",
+                   "semgrep", "trivy"]
 
 
 class IntrusionChoice(str, Enum):
@@ -528,21 +532,31 @@ def _baseline_accept(target: str, path: Path, finding_id: str) -> None:
 
 @app.command()
 def doctor() -> None:
-    """Verifica quali tool esterni e librerie opzionali sono presenti (§24).
+    """Verifica tool esterni e librerie opzionali: presenza, versione e policy (§24/R4).
 
     Best-effort: nessun crash se qualcosa manca — è esattamente ciò che il comando
-    deve rilevare. L'assenza di un tool degrada il recon (§8), non lo interrompe."""
+    deve rilevare. L'assenza di un tool degrada il recon (§8), non lo interrompe.
+    Per i tool con policy di versione (`toolcheck.TOOL_POLICY`: trivy, nuclei) mostra
+    la versione reale e lo stato: ammesso, oppure il motivo del blocco (R4)."""
+    from bastione.toolcheck import check_tool, TOOL_POLICY
+
     table = Table(title="Bastione doctor — dipendenze opzionali (§24)",
                   show_header=True, header_style="bold")
     table.add_column("componente")
     table.add_column("tipo")
+    table.add_column("versione")
     table.add_column("stato")
 
     for tool in _EXTERNAL_TOOLS:
         presente = shutil.which(tool) is not None
-        table.add_row(tool, "tool esterno", _ok(presente))
+        version, stato = "—", _ok(presente)
+        if presente and tool in TOOL_POLICY:
+            st = check_tool(tool)
+            version = st.version or "?"
+            stato = "[green]ammesso[/]" if st.ok else f"[red]{st.reason}[/]"
+        table.add_row(tool, "tool esterno", version, stato)
 
-    table.add_row("httpx", "libreria python", _ok(_lib_present("httpx")))
+    table.add_row("httpx", "libreria python", "—", _ok(_lib_present("httpx")))
 
     console.print(table)
 

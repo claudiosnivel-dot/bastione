@@ -45,6 +45,7 @@ from bastione.models import (
     TargetConfig,
 )
 from bastione.modules.base import Module, register
+from bastione.toolcheck import check_tool
 
 log = logging.getLogger("bastione.modules.semgrep")
 
@@ -150,11 +151,12 @@ class SemgrepModule(Module):
         return bool(getattr(cfg, "source_path", None))
 
     def run(self, ctx: RunContext) -> ModuleResult:
-        """Esegue semgrep white-box (§14): self-gate → sorgente → which →
-        authorize backstop → invocazione argv-list → parse+normalize → Finding[] dedupati.
+        """Esegue semgrep white-box (§14): self-gate → sorgente → which → toolcheck
+        (R4, versione) → authorize backstop → invocazione argv-list → parse+normalize
+        → Finding[] dedupati.
 
-        Sotto read-only o senza ownership/sorgente/binario, emette un singolo Finding
-        INFO SKIPPED e prosegue (nessun authorize, nessun subprocess)."""
+        Sotto read-only o senza ownership/sorgente/binario/versione ammessa, emette un
+        singolo Finding INFO SKIPPED e prosegue (nessun authorize, nessun subprocess)."""
         target = ctx.target_cfg.name
 
         # (a) self-gate: niente PROBE sotto read-only o senza ownership (M0 identico).
@@ -181,6 +183,13 @@ class SemgrepModule(Module):
                 "binario semgrep assente sul PATH (§14): scansione saltata. "
                 "Installa semgrep per abilitare l'analisi statica white-box.",
             )
+
+        # (c-bis) gate di versione fail-closed (R4, §4.2/§4.7). semgrep non ha (ancora)
+        # una policy in TOOL_POLICY → `check_tool` ritorna ok=True senza leggere la
+        # versione (no-op a costo zero); il gate resta cablato per policy future.
+        status = check_tool("semgrep")
+        if not status.ok:
+            return self._skipped(target, f"versione non ammessa (R4): {status.reason}")
 
         # (d) backstop del gate (§7): se nega, SKIPPED, niente crash, niente subprocess.
         try:

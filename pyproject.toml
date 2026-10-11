@@ -29,6 +29,7 @@ bastione = "bastione.cli:app"
 [dependency-groups]
 dev = [
     "pytest>=8",                     # test (un test minimo per modulo non banale, §3 L-test)
+    "pip-tools>=7",                  # pip-compile per il lockfile con hash (R4)
 ]
 
 [build-system]

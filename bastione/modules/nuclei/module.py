@@ -3,17 +3,21 @@
 nuclei (projectdiscovery) è uno scanner template-based maturo. Bastione NON
 reimplementa la detection: gli mette intorno la colla canonica (§14):
 
-  1. **self-gate + which** — il modulo gira SOLO se il tetto della run è ≥ PROBE
-     E l'ownership è verificata; in più chiama `gate.authorize(PROBE, ctx)` come
-     backstop (difesa in profondità §7). Sotto read-only → Finding INFO `SKIPPED`
+  1. **self-gate + which + toolcheck** — il modulo gira SOLO se il tetto della run
+     è ≥ PROBE E l'ownership è verificata; in più chiama `gate.authorize(PROBE, ctx)`
+     come backstop (difesa in profondità §7). Sotto read-only → Finding INFO `SKIPPED`
      e prosegue, NESSUN authorize, NESSUN subprocess (comportamento M0 invariato).
-     Se il binario manca (`shutil.which("nuclei") is None`) → Finding INFO
-     `SKIPPED` ONESTO: il report DICHIARA lo skip, non lo nasconde (§4.7/§26).
+     Se il binario manca (`shutil.which("nuclei") is None`) → Finding INFO `SKIPPED`
+     ONESTO: il report DICHIARA lo skip, non lo nasconde (§4.7/§26). Se la versione
+     di nuclei non è ammessa dalla policy (`toolcheck`, min 3.10.0, R4) → `SKIPPED`
+     fail-closed: nessun subprocess di scansione.
   2. **invocazione** — argv-list (mai shell=True, niente interpolazione di shell
-     dell'URL → niente command injection §14), template passive/safe selezionati
-     con filtri RESTRITTIVI (`-exclude-tags intrusive,dos,fuzz,attack,...` +
-     `-severity info,low,medium`, non il solo `-include-tags safe` che è additivo).
-     Gli active templates sono MUTATING e NON girano qui (restano M2/gated §14).
+     dell'URL → niente command injection §14), template selezionati col filtro
+     RESTRITTIVO `-exclude-tags intrusive,dos,fuzz,attack,sqli,xss,ssrf,rce,lfi`
+     (le categorie MUTATING). La severità copre info→critical per rilevare ANCHE le
+     CVE gravi (§4.7): il guardrail anti-MUTATING è l'exclude-tags, NON il cap di
+     severità; `-include-tags safe` è stato rimosso (era additivo). Gli active
+     templates sono MUTATING e NON girano qui (restano M2/gated §14).
      Output JSONL in `ctx.run_dir/raw/nuclei.jsonl` (struttura repo normativa §4).
   3. **parse + normalize** — ogni record JSONL → Finding (rule_id = template-id;
      severity mappata info/low/medium/high/critical → Severity; location = URL
@@ -63,42 +67,49 @@ _SEVERITY_MAP: dict[str, Severity] = {
 }
 
 
+# ─── argv builder (puro, testabile direttamente) ────────────────────────────
+
+def _nuclei_argv(urls: list[str], out_path: str) -> list[str]:
+    """Costruisce l'argv di nuclei (§14/§4.7). Funzione PURA (nessun I/O): testabile
+    direttamente e riusata da `_run_nuclei`.
+
+    Guardrail anti-MUTATING (§14): `-exclude-tags` esclude le categorie attive
+    (intrusive/dos/fuzz/attack/sqli/xss/ssrf/rce/lfi) → i template active/exploit NON
+    girano qui (restano M2/gated). La severità copre info→critical per rilevare ANCHE
+    le CVE gravi (§4.7): il guardrail è l'exclude-tags, NON il cap di severità. NIENTE
+    `-include-tags safe` (era additivo e tagliava i template di detection CVE). L'URL
+    è passato come ARGOMENTO `-target`, mai concatenato in shell (niente injection)."""
+    argv = [
+        "nuclei", "-jsonl", "-jsonl-export", out_path,
+        # Guardrail anti-MUTATING (§14): le categorie invasive/di disservizio restano escluse.
+        "-exclude-tags", "intrusive,dos,fuzz,attack,sqli,xss,ssrf,rce,lfi",
+        # §4.7: la detection copre ANCHE high/critical (le CVE gravi), non più cappata.
+        "-severity", "info,low,medium,high,critical",
+        # Owned-only (§7): niente interactsh — i template OAST farebbero contattare al
+        # target (e a nuclei) server pubblici di terzi. Senza OOB quei template non
+        # confermano: un falso negativo dichiarabile, mai traffico fuori perimetro.
+        "-no-interactsh",
+        "-disable-update-check", "-silent", "-no-color",
+    ]
+    for url in urls:
+        argv += ["-target", url]
+    return argv
+
+
 # ─── confine I/O (monkeypatchato nei test) ──────────────────────────────────
 
 def _run_nuclei(urls: list[str], out_path: str) -> list[str]:
-    """Invoca nuclei in modalità passive/safe e ritorna le righe JSONL (§14).
+    """Invoca nuclei e ritorna le righe JSONL (§14). Confine I/O monkeypatchato nei test.
 
-    Subprocess SICURO: argv-list, mai shell=True — nessuna interpolazione di shell
-    dell'URL (niente command injection §14). Scrive il JSONL anche su disco in
-    `out_path` (`-jsonl-export`) per l'artefatto raw/, e lo legge da stdout.
-
-    Template policy (§14): SOLO passive/safe. ATTENZIONE: `-include-tags` in nuclei
-    è ADDITIVO (esegue ANCHE i template con quei tag, non SOLO quelli) → da solo NON
-    è un guardrail anti-MUTATING. Il filtro RESTRITTIVO reale combina più flag:
-      • `-exclude-tags intrusive,dos,fuzz,attack,sqli,xss,ssrf,rce,lfi` esclude i
-        template che inviano payload crafted/attivi (la categoria MUTATING §14);
-      • `-severity info,low,medium` mette un cap (gli exploit gravi sono high/critical);
-      • `-include-tags safe` lascia comunque passare i template marcati safe.
-    Così i template active/exploit NON girano qui (restano M2/gated §14). Niente
-    `-headless` né exploit.
+    Subprocess SICURO: argv-list (`_nuclei_argv`), mai shell=True — nessuna
+    interpolazione di shell dell'URL (niente command injection §14). Scrive il JSONL
+    anche su disco in `out_path` (`-jsonl-export`) per l'artefatto raw/, e lo legge da
+    stdout.
 
     Degrado grazioso (§4.7/L06): se il binario è sparito a runtime o l'esecuzione
     fallisce → [] (nessuna riga), mai un crash. Il chiamante ha già verificato
-    `shutil.which`, ma qui restiamo difensivi."""
-    argv = [
-        "nuclei",
-        "-jsonl",                    # output JSON-lines su stdout
-        "-jsonl-export", out_path,   # artefatto raw/ su disco (§4)
-        # Guardrail anti-MUTATING (§14): filtri RESTRITTIVI, non solo additivi.
-        "-exclude-tags", "intrusive,dos,fuzz,attack,sqli,xss,ssrf,rce,lfi",
-        "-severity", "info,low,medium",  # cap: niente exploit gravi (high/critical)
-        "-include-tags", "safe",     # ammette i template marcati safe (additivo)
-        "-disable-update-check",
-        "-silent",
-        "-no-color",
-    ]
-    for url in urls:
-        argv += ["-target", url]     # URL come ARGOMENTO, mai concatenato in shell
+    `shutil.which` e la policy di versione (`toolcheck`), ma qui restiamo difensivi."""
+    argv = _nuclei_argv(urls, out_path)
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True,
@@ -171,6 +182,16 @@ class NucleiModule(Module):
                 "binario nuclei assente sul PATH (§14): scansione saltata. "
                 "Installa nuclei (projectdiscovery) per abilitare i template passive.",
             )
+
+        # (b2) toolcheck (R4): la versione di nuclei è ammessa dalla policy (min 3.10.0)?
+        # Fail-closed — versione vietata/sotto-minimo/ILLEGGIBILE → SKIPPED, nessun
+        # subprocess di scansione (§4.7/§26). nuclei HA policy in toolcheck.TOOL_POLICY.
+        from bastione.toolcheck import check_tool
+
+        status = check_tool("nuclei")
+        if not status.ok:
+            return self._skipped(
+                target, f"versione nuclei non ammessa (R4): {status.reason}")
 
         # (c) backstop del gate (§7): se nega, SKIPPED, niente crash, niente subprocess.
         try:

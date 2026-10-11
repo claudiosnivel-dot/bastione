@@ -46,6 +46,7 @@ from bastione.models import (
     TargetConfig,
 )
 from bastione.modules.base import Module, register
+from bastione.toolcheck import check_tool
 
 log = logging.getLogger("bastione.modules.trivy")
 
@@ -166,11 +167,12 @@ class TrivyModule(Module):
         return bool(cfg.source_path)
 
     def run(self, ctx: RunContext) -> ModuleResult:
-        """Esegue trivy fs (§14): self-gate → source_path → which → authorize
-        backstop → invocazione argv-list → parse+normalize → Finding[] dedupati.
+        """Esegue trivy fs (§14): self-gate → source_path → which → toolcheck (R4,
+        versione) → authorize backstop → invocazione argv-list → parse+normalize →
+        Finding[] dedupati.
 
-        Sotto read-only o senza ownership/source_path/binario, emette un singolo
-        Finding INFO SKIPPED e prosegue (nessun authorize, nessun subprocess)."""
+        Sotto read-only o senza ownership/source_path/binario/versione ammessa, emette
+        un singolo Finding INFO SKIPPED e prosegue (nessun authorize, nessun subprocess)."""
         target = ctx.target_cfg.name
 
         # (a) self-gate: niente PROBE sotto read-only o senza ownership (M0 identico).
@@ -197,6 +199,14 @@ class TrivyModule(Module):
                 "binario trivy assente sul PATH (§14): scansione saltata. "
                 "Installa trivy (aquasecurity) per abilitare la scansione FS.",
             )
+
+        # (c-bis) gate di versione fail-closed (R4, §4.2/§4.7): trivy ha una policy
+        # (min 0.72.0 + denylist 0.69.4/5/6, CVE note). Versione vietata, sotto il
+        # minimo o illeggibile → SKIPPED col motivo, il binario NON viene eseguito.
+        # Dopo il self-gate (a): sotto read-only nemmeno `trivy --version` parte.
+        status = check_tool("trivy")
+        if not status.ok:
+            return self._skipped(target, f"versione non ammessa (R4): {status.reason}")
 
         # (d) backstop del gate (§7): se nega, SKIPPED, niente crash, niente subprocess.
         try:

@@ -87,6 +87,21 @@ def _nuclei_record(
     })
 
 
+# ─── fixture: neutralizza il confine I/O di toolcheck (Task 15) ──────────────
+
+@pytest.fixture(autouse=True)
+def _toolcheck_allows_nuclei(monkeypatch):
+    """Il gate toolcheck (Task 15) legge la versione REALE di nuclei via subprocess
+    (`toolcheck._read_version`). Offline neutralizziamo questo confine I/O con una
+    versione AMMESSA (>= 3.10.0), come già si fa per `_run_nuclei`: così i test del
+    path "binario presente" non dipendono da un nuclei installato sulla macchina. Il
+    test del gate negato sovrascrive `_read_version` nel proprio corpo (vince l'ultimo
+    setattr)."""
+    import bastione.toolcheck as tc
+    monkeypatch.setattr(tc, "_read_version",
+                        lambda name: "Nuclei Engine Version: v3.10.0")
+
+
 # ─── (1) attributi di classe ────────────────────────────────────────────────
 
 def test_nuclei_module_name_and_intrusion():
@@ -432,12 +447,13 @@ def test_run_nuclei_uses_argv_list_no_shell(monkeypatch):
 
 def test_run_nuclei_argv_has_restrictive_template_filters(monkeypatch):
     """REGRESSIONE (guardrail anti-MUTATING §14): `-include-tags safe` è ADDITIVO,
-    non restrittivo. L'argv DEVE contenere filtri RESTRITTIVI reali — `-exclude-tags`
-    con le categorie attive (intrusive/dos/fuzz/attack/sqli/xss/ssrf/rce/lfi) e un cap
-    `-severity` che esclude high/critical — così i template active/exploit NON girano.
+    non restrittivo, ed è stato RIMOSSO (Task 15). Il guardrail reale è `-exclude-tags`
+    con le categorie attive (intrusive/dos/fuzz/attack/sqli/xss/ssrf/rce/lfi): così i
+    template active/exploit NON girano, anche se la severità ora copre high/critical
+    per rilevare le CVE gravi (§4.7).
 
-    Senza questi flag un modulo dichiarato PROBE eseguirebbe scansioni attive (payload
-    crafted) violando il contratto di intrusione (§7)."""
+    Senza l'`-exclude-tags` un modulo dichiarato PROBE eseguirebbe scansioni attive
+    (payload crafted) violando il contratto di intrusione (§7)."""
     import bastione.modules.nuclei.module as nuclei_mod
 
     captured: dict = {}
@@ -462,12 +478,15 @@ def test_run_nuclei_argv_has_restrictive_template_filters(monkeypatch):
     for mutating in ("intrusive", "dos", "fuzz", "attack"):
         assert mutating in excl_tags, f"manca l'esclusione del tag MUTATING {mutating!r}"
 
-    # cap di severità: niente exploit gravi (high/critical fuori)
+    # §4.7: la detection ora copre ANCHE high/critical (CVE gravi); il guardrail
+    # anti-MUTATING è l'-exclude-tags, non il cap di severità.
     assert "-severity" in argv
     sev = argv[argv.index("-severity") + 1]
     sev_levels = {s.strip().lower() for s in sev.split(",")}
-    assert "high" not in sev_levels
-    assert "critical" not in sev_levels
+    assert "high" in sev_levels
+    assert "critical" in sev_levels
+    # `-include-tags safe` rimosso (Task 15): niente restrizione ai soli template "safe"
+    assert "-include-tags" not in argv
 
 
 def test_run_nuclei_degrades_on_oserror(monkeypatch):
@@ -480,3 +499,41 @@ def test_run_nuclei_degrades_on_oserror(monkeypatch):
 
     monkeypatch.setattr(nuclei_mod.subprocess, "run", boom)
     assert nuclei_mod._run_nuclei(["https://staging.example.com/"], "out.jsonl") == []
+
+
+# ─── (7) Task 15 — gate toolcheck (R4) + copertura CVE gravi (§4.7) ──────────
+
+def test_nuclei_argv_covers_critical_but_excludes_intrusive():   # Review Focus #5
+    """L'argv alza il cap di severità a info→critical (CVE gravi) MA lascia intatto
+    l'`-exclude-tags` delle categorie MUTATING e NON usa `-include-tags safe` (§4.7)."""
+    import bastione.modules.nuclei.module as nm
+    argv = nm._nuclei_argv(["https://staging.example"], "/tmp/out.jsonl")
+    sev = argv[argv.index("-severity") + 1]
+    assert "critical" in sev and "high" in sev
+    tags = argv[argv.index("-exclude-tags") + 1]
+    for t in ("intrusive", "dos", "attack", "sqli", "xss", "ssrf", "rce", "lfi"):
+        assert t in tags
+    assert "-include-tags" not in argv            # niente restrizione ai soli "safe"
+    assert "-target" in argv and "https://staging.example" in argv
+
+
+def test_nuclei_denied_version_skips(monkeypatch):
+    """Gate toolcheck fail-closed (R4): versione nuclei < 3.10.0 → NUCLEI_SKIPPED,
+    nessun subprocess di scansione (il binario risulta presente via `which`)."""
+    import bastione.modules.nuclei.module as nm
+    import bastione.toolcheck as tc
+    monkeypatch.setattr(nm.shutil, "which", lambda name: "/usr/bin/nuclei")
+    monkeypatch.setattr(tc, "_read_version", lambda name: "v3.9.0")   # < 3.10.0
+    ran: list = []
+    monkeypatch.setattr(nm, "_run_nuclei", lambda urls, out_path: ran.append(1) or [])
+    res = nm.NucleiModule().run(_make_ctx(resolved_urls=["https://staging.example.com/"]))
+    assert ran == []
+    assert res.findings[0].rule_id == "NUCLEI_SKIPPED"
+
+
+
+def test_nuclei_argv_disables_interactsh():
+    """Owned-only (§7): con la severità non più cappata girano anche i template CVE
+    OAST — l'argv deve disattivare interactsh (nessun server di terzi)."""
+    from bastione.modules.nuclei.module import _nuclei_argv
+    assert "-no-interactsh" in _nuclei_argv(["https://staging.example"], "o.jsonl")

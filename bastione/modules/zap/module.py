@@ -56,6 +56,7 @@ from bastione.models import (
     TargetConfig,
 )
 from bastione.modules.base import Module, register
+from bastione.toolcheck import check_tool
 
 log = logging.getLogger("bastione.modules.zap")
 
@@ -189,11 +190,12 @@ class ZapModule(Module):
         return bool(fp.resolved_urls)
 
     def run(self, ctx: RunContext) -> ModuleResult:
-        """Esegue ZAP passive (§14): self-gate → which → authorize backstop →
-        invocazione argv-list → parse+normalize → Finding[] dedupati.
+        """Esegue ZAP passive (§14): self-gate → which → toolcheck (R4, versione) →
+        authorize backstop → invocazione argv-list → parse+normalize → Finding[] dedupati.
 
-        Sotto read-only o senza ownership/binario, emette un singolo Finding INFO
-        SKIPPED e prosegue (nessun authorize, nessun subprocess, nessun daemon)."""
+        Sotto read-only o senza ownership/binario/versione ammessa, emette un singolo
+        Finding INFO SKIPPED e prosegue (nessun authorize, nessun subprocess, nessun
+        daemon)."""
         target = ctx.target_cfg.name
 
         # (a) self-gate: niente PROBE sotto read-only o senza ownership (M0 identico).
@@ -211,6 +213,14 @@ class ZapModule(Module):
                 f"binario {_ZAP_BINARY} assente sul PATH (§14): scansione saltata. "
                 "Installa OWASP ZAP (passive baseline) per abilitare questo modulo.",
             )
+
+        # (b-bis) gate di versione fail-closed (R4, §4.2/§4.7). Il binario è
+        # `zap-baseline.py` (_ZAP_BINARY): senza policy in TOOL_POLICY `check_tool`
+        # ritorna ok=True senza leggere la versione (no-op a costo zero), ma il gate
+        # resta cablato e pronto per policy future.
+        status = check_tool(_ZAP_BINARY)
+        if not status.ok:
+            return self._skipped(target, f"versione non ammessa (R4): {status.reason}")
 
         # (c) backstop del gate (§7): se nega, SKIPPED, niente crash, niente subprocess.
         try:

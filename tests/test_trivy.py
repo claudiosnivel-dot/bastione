@@ -46,6 +46,17 @@ def _chdir_tmp(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
 
+@pytest.fixture(autouse=True)
+def _toolcheck_version_ok(monkeypatch):
+    """R4 (M5, Task 14): il wrapper applica il gate `toolcheck` (policy trivy: min
+    0.72.0 + denylist) subito DOPO il `which`. Di default i test girano con una
+    versione AMMESSA, così nessun `trivy --version` reale parte (resta OFFLINE) e i
+    test pre-esistenti non vengono bloccati dal fail-closed; i test del gate (in
+    fondo al file) la sovrascrivono con una versione vietata / illeggibile."""
+    import bastione.toolcheck as tc
+    monkeypatch.setattr(tc, "_read_version", lambda name: "Version: 0.72.0")
+
+
 # ─── helper: RunContext minimale ────────────────────────────────────────────
 
 def _make_cfg(
@@ -1289,3 +1300,120 @@ def test_run_mixed_vuln_misconf_secret(monkeypatch, tmp_path):
     # il secret resta INFO, non CRITICAL
     secret_f = next(f for f in result.findings if f.rule_id == "mix-secret")
     assert secret_f.severity == Severity.INFO
+
+
+# ─── (6) gate toolcheck nei wrapper trivy/semgrep/zap (R4, M5 Task 14) ───────
+#
+# Subito DOPO il `which` (binario presente) e PRIMA di eseguirlo, il wrapper chiama
+# `check_tool(<tool>)`: versione vietata / sotto il minimo / illeggibile →
+# `<TOOL>_SKIPPED` INFO col motivo e NESSUNA esecuzione (fail-closed, Review Focus #4).
+# trivy ha policy (min 0.72.0 + denylist); semgrep/zap no (→ no-op a costo zero, ma il
+# gate è cablato, pronto per policy future). Confine I/O = `bastione.toolcheck.
+# _read_version`, monkeypatchato: nessun `<tool> --version` reale, tutto OFFLINE.
+
+def test_trivy_denied_version_skips_without_running(monkeypatch, tmp_path):
+    import bastione.modules.trivy.module as tm
+    import bastione.toolcheck as tc
+    monkeypatch.setattr(tm.shutil, "which", lambda n: "/usr/bin/trivy")
+    monkeypatch.setattr(tc, "_read_version", lambda n: "Version: 0.69.4")   # VIETATA
+    ran = []
+    monkeypatch.setattr(tm, "_run_trivy", lambda src, out: ran.append(1) or {})
+    cfg = _make_cfg(source_path=str(tmp_path))     # source_path = dir esistente
+    res = tm.TrivyModule().run(_make_ctx(cfg=cfg))
+    assert ran == []                               # il binario NON è stato eseguito (fail-closed)
+    assert res.findings and res.findings[0].rule_id == "TRIVY_SKIPPED"
+    assert "versione" in res.findings[0].evidence.lower()
+
+
+def test_trivy_allowed_version_proceeds(monkeypatch, tmp_path):
+    import bastione.modules.trivy.module as tm
+    import bastione.toolcheck as tc
+    monkeypatch.setattr(tm.shutil, "which", lambda n: "/usr/bin/trivy")
+    monkeypatch.setattr(tc, "_read_version", lambda n: "Version: 0.72.0")
+    ran = []
+    monkeypatch.setattr(tm, "_run_trivy", lambda src, out: ran.append(1) or {"Results": []})
+    cfg = _make_cfg(source_path=str(tmp_path))
+    res = tm.TrivyModule().run(_make_ctx(cfg=cfg))
+    assert ran == [1]                              # versione ammessa → il binario gira
+    assert not any(f.rule_id == "TRIVY_SKIPPED" for f in res.findings)
+
+
+@pytest.mark.parametrize("raw_version", [
+    "Version: 0.69.5",     # denylist (compromissione TeamPCP, CVE-2026-33634)
+    "Version: 0.69.6",     # denylist
+    "Version: 0.71.9",     # sotto il minimo 0.72.0 (CVE-2026-63328)
+    "Version: garbage",    # output non interpretabile → fail-closed
+    "",                    # output vuoto → fail-closed
+    None,                  # `--version` illeggibile / binario che non risponde
+])
+def test_trivy_unsafe_or_unreadable_version_fails_closed(monkeypatch, tmp_path, raw_version):
+    """Review Focus #4: una versione vietata, sotto il minimo o NON leggibile non
+    esegue mai il binario — TRIVY_SKIPPED INFO con il motivo (R4), nessun crash."""
+    import bastione.modules.trivy.module as tm
+    import bastione.toolcheck as tc
+    monkeypatch.setattr(tm.shutil, "which", lambda n: "/usr/bin/trivy")
+    monkeypatch.setattr(tc, "_read_version", lambda n: raw_version)
+    ran = []
+    monkeypatch.setattr(tm, "_run_trivy", lambda src, out: ran.append(1) or {})
+    cfg = _make_cfg(source_path=str(tmp_path))
+    res = tm.TrivyModule().run(_make_ctx(cfg=cfg))
+    assert ran == []
+    assert [f.rule_id for f in res.findings] == ["TRIVY_SKIPPED"]
+    f = res.findings[0]
+    assert f.severity == Severity.INFO
+    assert f.intrusion_used == IntrusionLevel.READ_ONLY   # nessuna azione eseguita
+    assert "versione" in f.evidence.lower() and "R4" in f.evidence
+
+
+def test_trivy_read_only_never_reads_version(monkeypatch, tmp_path):
+    """Gate-first (§4.0.7): sotto il tetto READ_ONLY il self-gate scatta PRIMA di
+    tutto — nemmeno `trivy --version` parte (M0 invariato: nessun subprocess)."""
+    import bastione.modules.trivy.module as tm
+    import bastione.toolcheck as tc
+    monkeypatch.setattr(tm.shutil, "which", lambda n: "/usr/bin/trivy")
+    asked = []
+    monkeypatch.setattr(tc, "_read_version", lambda n: asked.append(n) or "Version: 0.72.0")
+    cfg = _make_cfg(source_path=str(tmp_path))
+    res = tm.TrivyModule().run(
+        _make_ctx(cfg=cfg, max_intrusion=IntrusionLevel.READ_ONLY, ownership_verified=False))
+    assert asked == []
+    assert [f.rule_id for f in res.findings] == ["TRIVY_SKIPPED"]
+
+
+def test_semgrep_toolcheck_gate_wired(monkeypatch, tmp_path):
+    """Smoke: anche semgrep chiama `check_tool("semgrep")` dopo il `which`. Oggi non ha
+    policy (→ no-op), ma se il gate nega: SEMGREP_SKIPPED col motivo, nessuna esecuzione."""
+    import bastione.modules.semgrep.module as sm
+    from bastione.toolcheck import ToolStatus
+    monkeypatch.setattr(sm.shutil, "which", lambda n: "/usr/bin/semgrep")
+    asked = []
+    monkeypatch.setattr(
+        sm, "check_tool",
+        lambda name: asked.append(name) or ToolStatus(False, "9.9.9", "versione 9.9.9 VIETATA (test)"))
+    ran = []
+    monkeypatch.setattr(sm, "_run_semgrep", lambda src, out: ran.append(1) or [])
+    cfg = _make_cfg(source_path=str(tmp_path))
+    res = sm.SemgrepModule().run(_make_ctx(cfg=cfg))
+    assert asked == ["semgrep"]
+    assert ran == []
+    assert [f.rule_id for f in res.findings] == ["SEMGREP_SKIPPED"]
+    assert "versione" in res.findings[0].evidence.lower()
+
+
+def test_zap_toolcheck_gate_wired(monkeypatch):
+    """Smoke: anche zap chiama `check_tool("zap-baseline.py")` (il binario vero,
+    `_ZAP_BINARY`) dopo il `which`. Se il gate nega: ZAP_SKIPPED, nessuna esecuzione."""
+    import bastione.modules.zap.module as zm
+    from bastione.toolcheck import ToolStatus
+    monkeypatch.setattr(zm.shutil, "which", lambda n: "/usr/bin/zap-baseline.py")
+    asked = []
+    monkeypatch.setattr(
+        zm, "check_tool",
+        lambda name: asked.append(name) or ToolStatus(False, "9.9.9", "versione 9.9.9 VIETATA (test)"))
+    ran = []
+    monkeypatch.setattr(zm, "_run_zap", lambda urls, out: ran.append(1) or {})
+    res = zm.ZapModule().run(_make_ctx())
+    assert asked == ["zap-baseline.py"]
+    assert ran == []
+    assert [f.rule_id for f in res.findings] == ["ZAP_SKIPPED"]
+    assert "versione" in res.findings[0].evidence.lower()

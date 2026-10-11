@@ -14,7 +14,8 @@ Copre (§25 / vincoli M0):
   - --unsafe-show-secrets + --ci → errore (incompatibili), exit != 0;
   - IntrusionDenied dal gate → messaggio chiaro, exit != 0, NESSUNO stacktrace;
   - --fail-on/--ci: ≥1 finding ≥ soglia → exit 1; sotto soglia → exit 0;
-  - doctor elenca installato/assente con shutil.which monkeypatchato;
+  - doctor elenca installato/assente con shutil.which monkeypatchato e, per i tool
+    con policy (R4), versione + stato via toolcheck (`_read_version` monkeypatchato);
   - list-modules elenca i moduli reali; list-detectors elenca SECRET_SERVICE_ROLE;
   - i flag M1/M2 (--no-fix, --i-own-this-its-staging) sono accettati come no-op.
 """
@@ -339,6 +340,11 @@ def test_doctor_lists_tools_with_which_monkeypatched(monkeypatch):
     monkeypatch.setattr(
         cli_mod.shutil, "which",
         lambda name: f"/usr/bin/{name}" if name in installed else None)
+    # doctor interroga anche la versione dei tool con policy (R4, nuclei qui): il
+    # confine I/O è monkeypatchato → nessun subprocess reale, nessuna dipendenza
+    # dai tool davvero installati sulla macchina.
+    import bastione.toolcheck as _tc
+    monkeypatch.setattr(_tc, "_read_version", lambda name: None)
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0, result.output
     out = result.output
@@ -360,6 +366,70 @@ def test_doctor_lists_semgrep_and_trivy(monkeypatch):
     out = result.output
     assert "semgrep" in out, "semgrep non elencato da doctor"
     assert "trivy" in out, "trivy non elencato da doctor"
+
+
+# ─── doctor: versione + stato via toolcheck (M5 / R4) ───────────────────────
+
+def _pin_console_width(monkeypatch, width: int = 200) -> None:
+    """Console rich a larghezza fissa: la tabella di `doctor` non dipende da COLUMNS
+    né dal terminale, quindi i motivi di blocco non vengono spezzati dal wrap."""
+    from rich.console import Console
+    monkeypatch.setattr(cli_mod, "console", Console(width=width))
+
+
+def test_doctor_shows_version_and_status_for_policied_tools(monkeypatch):
+    import bastione.cli as cli
+    import bastione.toolcheck as tc
+    from typer.testing import CliRunner
+    monkeypatch.setattr(cli.shutil, "which", lambda n: "/usr/bin/" + n)
+    monkeypatch.setattr(tc, "_read_version",
+                        lambda n: "Version: 0.72.0" if n == "trivy" else "v3.10.0")
+    res = CliRunner().invoke(cli.app, ["doctor"])
+    assert res.exit_code == 0
+    assert "0.72" in res.stdout                      # versione trivy mostrata
+
+
+def test_doctor_zap_name_fixed(monkeypatch):
+    import bastione.cli as cli
+    # il vecchio nome "zap" non è più sondato…
+    assert "zap" not in cli._EXTERNAL_TOOLS
+    # …e il binario reale è referenziato (niente più mismatch doctor↔modulo)
+    assert "zap-baseline.py" in cli._EXTERNAL_TOOLS
+    # doctor e modulo zap controllano lo STESSO nome (nessuna deriva futura)
+    from bastione.modules.zap.module import _ZAP_BINARY
+    assert _ZAP_BINARY in cli._EXTERNAL_TOOLS
+
+
+def test_doctor_shows_block_reason_for_forbidden_or_unreadable_version(monkeypatch):
+    # R4 fail-closed: versione VIETATA (CVE nota) o illeggibile → doctor mostra il
+    # motivo del blocco e NON crasha (è un comando diagnostico, exit 0).
+    import bastione.toolcheck as tc
+    _pin_console_width(monkeypatch)
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda n: "/usr/bin/" + n)
+    monkeypatch.setattr(tc, "_read_version",
+                        lambda n: "Version: 0.69.4" if n == "trivy" else None)
+    res = runner.invoke(app, ["doctor"], color=False)
+    assert res.exit_code == 0, res.output
+    out = res.output
+    assert "0.69.4" in out and "VIETATA" in out      # trivy: versione vietata + motivo
+    assert "fail-closed" in out                      # nuclei: versione non leggibile
+    assert "ammesso" not in out                      # nessun tool con policy è ammesso
+
+
+def test_doctor_does_not_probe_version_of_missing_tools(monkeypatch):
+    # Tool assente → "assente", nessuna lettura di versione (nessun subprocess), no crash.
+    import bastione.toolcheck as tc
+
+    def _boom(name):
+        raise AssertionError(f"_read_version({name!r}) chiamata per un tool assente")
+
+    _pin_console_width(monkeypatch)
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda n: None)
+    monkeypatch.setattr(tc, "_read_version", _boom)
+    res = runner.invoke(app, ["doctor"], color=False)
+    assert res.exit_code == 0, res.output
+    assert "trivy" in res.output and "nuclei" in res.output
+    assert "assente" in res.output
 
 
 # ─── list-modules / list-detectors ──────────────────────────────────────────
