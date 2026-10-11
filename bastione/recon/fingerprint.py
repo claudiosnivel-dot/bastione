@@ -101,6 +101,15 @@ _JS_FROM_BUILTINS: tuple[str, ...] = (
 _JS_BUILTIN_FROM_RE = re.compile(
     r"(?:^|[^A-Za-z0-9_$])(?:" + "|".join(_JS_FROM_BUILTINS) + r")\s*(\.from\()"
 )
+# Chiave pubblica nel formato nuovo 2026 (§4.2): `sb_publishable_<token>`.
+_PUBLISHABLE_RE = re.compile(r"sb_publishable_[A-Za-z0-9]+")
+# `.rpc('fn')` / `.rpc("fn", {...})` — entry RPC del client Supabase (§3/§4.2).
+_RPC_FROM_RE = re.compile(r"\.rpc\(\s*(['\"])([A-Za-z_][A-Za-z0-9_]*)\1")
+# `.storage.from('bucket')` — entry storage del client (nomi bucket, §4.2).
+_STORAGE_FROM_RE = re.compile(r"\.storage\s*\.\s*from\(\s*(['\"])([A-Za-z0-9._-]+)\1")
+# Il `.from(` di `.storage.from(...)` (group 1): è un bucket, MAI una relazione
+# PostgREST → escluso da `extract_table_names` come i builtin JS.
+_STORAGE_DOT_FROM_RE = re.compile(r"\.storage\s*(\.\s*from\()")
 
 
 # ─── funzioni pure (la gemma): nessuna I/O, testate con input reali ─────────
@@ -140,6 +149,31 @@ def extract_anon_key(text: str) -> str | None:
     return None
 
 
+def extract_public_key(text: str) -> tuple[str | None, str | None]:
+    """Chiave pubblica Supabase: JWT `role:anon` (legacy) OPPURE `sb_publishable_`
+    (nuovo formato 2026, §4.2). Ritorna `(chiave, kind)` con kind in
+    {"legacy_jwt","publishable"}, o `(None, None)`. Preferisce la legacy quando
+    entrambe presenti (deterministico). La service_role NON è una chiave pubblica:
+    `extract_anon_key` la ignora già (§8/§10)."""
+    legacy = extract_anon_key(text)
+    if legacy is not None:
+        return legacy, "legacy_jwt"
+    m = _PUBLISHABLE_RE.search(text)
+    if m is not None:
+        return m.group(0), "publishable"
+    return None, None
+
+
+def extract_rpc_names(text: str) -> list[str]:
+    """Nomi RPC referenziati da `.rpc('...')` nel bundle (§4.2). Puro, dedup+ordina."""
+    return sorted({m.group(2) for m in _RPC_FROM_RE.finditer(text)})
+
+
+def extract_bucket_names(text: str) -> list[str]:
+    """Nomi bucket da `.storage.from('...')` nel bundle (§4.2). Puro, dedup+ordina."""
+    return sorted({m.group(2) for m in _STORAGE_FROM_RE.finditer(text)})
+
+
 def extract_table_names(text: str) -> list[str]:
     """Nomi tabella PostgREST referenziati dal client Supabase nel bundle (§8).
 
@@ -156,6 +190,9 @@ def extract_table_names(text: str) -> list[str]:
     # quei `.from(` non sono PostgREST. group(1) è `.from(`, quindi il suo start
     # è l'offset del punto — lo stesso punto da cui parte il match-tabella.
     builtin_dots = {m.start(1) for m in _JS_BUILTIN_FROM_RE.finditer(text)}
+    # Idem per `.storage.from('bucket')`: è un bucket (extract_bucket_names), non una
+    # tabella — altrimenti finirebbe anche nel RLS test via bundle.
+    builtin_dots |= {m.start(1) for m in _STORAGE_DOT_FROM_RE.finditer(text)}
 
     names: set[str] = set()
     for m in _TABLE_FROM_RE.finditer(text):
@@ -287,7 +324,10 @@ def fingerprint(target: str, run_dir: Path | None = None) -> Fingerprint:
 
     supabase_url: str | None = None
     anon_key: str | None = None
+    key_kind: str | None = None
     discovered: set[str] = set()
+    buckets_acc: set[str] = set()
+    rpcs_acc: set[str] = set()
     api_paths_acc: set[str] = set()
     for url in js_urls:
         # Owned-only (§7/§4.2): non scarichiamo bundle su host esterni non
@@ -300,7 +340,18 @@ def fingerprint(target: str, run_dir: Path | None = None) -> Fingerprint:
         if jresp is None:
             continue
         supabase_url = supabase_url or extract_supabase_url(jresp.text)
-        anon_key = anon_key or extract_anon_key(jresp.text)
+        # §4.2 M5: la chiave pubblica può essere il JWT legacy `role:anon` oppure la
+        # nuova `sb_publishable_…`. `anon_key` porta ENTRAMBI i tipi; `key_kind` ne
+        # registra il formato. La service_role resta ignorata (extract_anon_key).
+        if anon_key is None:
+            k, kk = extract_public_key(jresp.text)
+            if k is not None:
+                anon_key, key_kind = k, kk
+        # Scoperta bucket/RPC dal bundle same-host (§4.2): funzioni PURE su testo in
+        # memoria, nessun nuovo download (owned-only, §7). Fallback quando lo storage
+        # non elenca all'anon e l'OpenAPI è chiusa (usati dai sottomoduli, Task 21).
+        buckets_acc.update(extract_bucket_names(jresp.text))
+        rpcs_acc.update(extract_rpc_names(jresp.text))
         # Table discovery (§8): aggrega i nomi `.from('...')` da TUTTI i bundle
         # same-host già scaricati. Funzione PURA su testo in memoria: nessun nuovo
         # download (owned-only). Non c'è break su url/anon_key — altrimenti i
@@ -325,7 +376,10 @@ def fingerprint(target: str, run_dir: Path | None = None) -> Fingerprint:
         # modulo supabase senza un URL su cui mappare la superficie (§9/§11.1).
         is_supabase=supabase_url is not None,
         supabase_url=supabase_url,
+        supabase_key_kind=key_kind,
         discovered_tables=discovered_tables,
+        discovered_buckets=sorted(buckets_acc),
+        discovered_rpcs=sorted(rpcs_acc),
         discovered_api_paths=discovered_api_paths,
         anon_key=anon_key,
         cloudflare_fronted=cloudflare,

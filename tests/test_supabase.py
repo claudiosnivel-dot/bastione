@@ -57,7 +57,8 @@ def make_cfg(*, name="gestionale", supabase_url=None, expectations=None):
 
 
 def make_fp(*, is_supabase=True, supabase_url=SUPA_URL, anon_key=ANON,
-            discovered_tables=None):
+            discovered_tables=None, supabase_key_kind=None,
+            discovered_buckets=None, discovered_rpcs=None):
     return Fingerprint(
         target="gestionale",
         resolved_urls=["https://staging.example/"],
@@ -65,7 +66,26 @@ def make_fp(*, is_supabase=True, supabase_url=SUPA_URL, anon_key=ANON,
         supabase_url=supabase_url,
         anon_key=anon_key,
         discovered_tables=discovered_tables or [],
+        supabase_key_kind=supabase_key_kind,
+        discovered_buckets=discovered_buckets or [],
+        discovered_rpcs=discovered_rpcs or [],
     )
+
+
+def make_anon_jwt() -> str:
+    """JWT HS256 con `role=anon` (chiave pubblica legacy), come `make_jwt` in
+    test_recon.py. Serve a verificare SUPABASE_JWT_LEGACY_HS256 (§4.3): `_jwt_alg`
+    deve leggere alg=HS256 dall'header."""
+    import base64
+
+    def _seg(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    header = _seg(b'{"alg":"HS256","typ":"JWT"}')
+    payload = _seg(json.dumps(
+        {"iss": "supabase", "ref": "abcdefghijklmnopqrst",
+         "role": "anon", "iat": 1, "exp": 2}).encode())
+    return f"{header}.{payload}.{_seg(b'signature')}"
 
 
 def make_ctx(*, fp=None, cfg=None, tmp_path: Path | None = None,
@@ -142,6 +162,32 @@ def install_router(monkeypatch, *, schema, rows):
     return calls
 
 
+# ─── neutralizza i sottomoduli M5 di DEFAULT (offline + isolamento del core) ─
+#
+# I quattro sottomoduli PROBE/READ_ONLY (storage/rpc/auth_posture/graphql) sono
+# cablati da `run` (Task 21) via `_run_submodules`. In questo file testiamo il CORE
+# (RLS surface map + canary §11.2): di default li neutralizziamo a no-op così i test
+# del core restano OFFLINE e isolati (nessuna rete, §4.10) — ESATTAMENTE come prima
+# del wiring. In particolare `auth_posture` è READ_ONLY e NON si auto-gata: senza
+# questo stub tenterebbe una GET reale a /auth/v1/settings. I test del wiring
+# (`test_submodules_wired`) o di un singolo sottomodulo sovrascrivono lo stub con il
+# PROPRIO `monkeypatch.setattr` (stesso fixture → l'ultimo set vince).
+
+_SUBMODULE_ENTRYPOINTS = {
+    "storage": "run_storage_checks",
+    "rpc": "run_rpc_checks",
+    "auth_posture": "run_auth_posture_checks",
+    "graphql": "run_graphql_checks",
+}
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_submodules(monkeypatch):
+    for mod_name, fn_name in _SUBMODULE_ENTRYPOINTS.items():
+        monkeypatch.setattr(getattr(supa, mod_name), fn_name,
+                            lambda *a, **k: ([], []))
+
+
 # ─── should_run (§9) ────────────────────────────────────────────────────────
 
 def test_should_run_true_with_supabase_and_anon():
@@ -153,9 +199,19 @@ def test_should_run_false_without_supabase():
     assert supa.SupabaseModule().should_run(fp, make_cfg()) is False
 
 
-def test_should_run_false_without_anon_key():
+def test_should_run_true_without_anon_key_to_emit_honest_signal():
+    # §4.3 M5: gira anche senza chiave (is_supabase vero) per emettere il segnale
+    # onesto SUPABASE_KEY_NOT_FOUND (R6) invece di tacere. Prima del M5 era False.
     fp = make_fp(anon_key=None)
-    assert supa.SupabaseModule().should_run(fp, make_cfg()) is False
+    assert supa.SupabaseModule().should_run(fp, make_cfg()) is True
+
+
+def test_should_run_true_with_cfg_supabase_url_only():
+    # Nessun fingerprint Supabase ma il TOML dichiara supabase_url → gira comunque
+    # (per poi emettere SUPABASE_KEY_NOT_FOUND se la chiave manca).
+    fp = make_fp(is_supabase=False, supabase_url=None, anon_key=None)
+    cfg = make_cfg(supabase_url=SUPA_URL)
+    assert supa.SupabaseModule().should_run(fp, cfg) is True
 
 
 # ─── identità del modulo (§9/§11) ──────────────────────────────────────────
@@ -1940,3 +1996,169 @@ def test_via_bundle_matrix_conformance_suppresses_finding(monkeypatch):
     assert "§15" in pcs[0].detail
     # il finding onesto di copertura parziale resta (enumerazione via bundle)
     assert any(f.rule_id == "SUPABASE_SCHEMA_VIA_BUNDLE" for f in res.findings)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TASK 21 (§4.3 M5) — key kind, INFO onesti, legacy/HS256, GRANT-fragile, wiring
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_url_not_found_emits_info(monkeypatch):
+    # §4.3 M5 (R6): nessun URL Supabase (né recon né TOML) → INFO onesto, nessuna
+    # probe (ritorno immediato prima di qualunque I/O).
+    fp = make_fp(is_supabase=True, supabase_url=None)
+    cfg = make_cfg(supabase_url=None)
+    res = supa.SupabaseModule().run(make_ctx(fp=fp, cfg=cfg))
+    urlnf = [f for f in res.findings if f.rule_id == "SUPABASE_URL_NOT_FOUND"]
+    assert len(urlnf) == 1
+    assert urlnf[0].severity is Severity.INFO
+    assert urlnf[0].intrusion_used is IntrusionLevel.READ_ONLY
+
+
+def test_key_not_found_emits_info(monkeypatch):
+    # §4.3 M5 (R6): URL presente ma nessuna chiave pubblica → INFO onesto
+    # SUPABASE_KEY_NOT_FOUND, la verifica RLS NON è stata fatta.
+    fp = make_fp(is_supabase=True, anon_key=None, supabase_url=SUPA_URL)
+    res = supa.SupabaseModule().run(make_ctx(fp=fp))
+    assert any(f.rule_id == "SUPABASE_KEY_NOT_FOUND" and f.severity is Severity.INFO
+               for f in res.findings)
+
+
+def test_legacy_jwt_emits_migration_info(monkeypatch):
+    # §4.3 M5: chiave legacy JWT HS256 role=anon → due INFO di migrazione.
+    fp = make_fp(anon_key=make_anon_jwt(), supabase_url=SUPA_URL)
+    fp.supabase_key_kind = "legacy_jwt"
+    install_router(monkeypatch, schema=openapi_schema({"t": ["id"]}),
+                   rows={"t": (200, [])})
+    res = supa.SupabaseModule().run(make_ctx(fp=fp))
+    rids = {f.rule_id for f in res.findings}
+    assert "SUPABASE_LEGACY_KEYS_IN_USE" in rids and "SUPABASE_JWT_LEGACY_HS256" in rids
+    # entrambi INFO/READ_ONLY (§4.3)
+    legacy = [f for f in res.findings
+              if f.rule_id in ("SUPABASE_LEGACY_KEYS_IN_USE", "SUPABASE_JWT_LEGACY_HS256")]
+    assert all(f.severity is Severity.INFO for f in legacy)
+    # P8: la chiave (anon_key) NON compare in nessuna evidence
+    assert all(fp.anon_key not in f.evidence for f in res.findings)
+
+
+def test_publishable_key_no_legacy_info(monkeypatch):
+    # §4.3 M5: una chiave publishable (`sb_publishable_…`) NON emette gli INFO legacy
+    # né il finding HS256 (`_jwt_alg` ritorna None su non-JWT).
+    fp = make_fp(anon_key="sb_publishable_AbC123", supabase_url=SUPA_URL)
+    fp.supabase_key_kind = "publishable"
+    install_router(monkeypatch, schema=openapi_schema({"t": ["id"]}),
+                   rows={"t": (200, [])})
+    res = supa.SupabaseModule().run(make_ctx(fp=fp))
+    rids = {f.rule_id for f in res.findings}
+    assert "SUPABASE_LEGACY_KEYS_IN_USE" not in rids
+    assert "SUPABASE_JWT_LEGACY_HS256" not in rids
+
+
+def test_protected_fragile_note_on_401(monkeypatch):
+    # §4.3 M5 "protetto ma fragile" (30/10): una tabella protetta con 401 → la
+    # posture passa ma con nota su GRANT / fragilità (verifica definitiva in M8).
+    install_router(monkeypatch, schema=openapi_schema({"clienti": ["id"]}),
+                   rows={"clienti": (401, None)})
+    res = supa.SupabaseModule().run(make_ctx())
+    pc = next(p for p in res.posture_checks if p.check_id == "POSTURE_RLS_clienti")
+    assert pc.passed and ("GRANT" in pc.detail or "fragile" in pc.detail.lower())
+
+
+def test_protected_empty_200_keeps_classic_note(monkeypatch):
+    # REGRESSIONE: un 200 vuoto (non 401/403) NON è "fragile" → nota classica.
+    install_router(monkeypatch, schema=openapi_schema({"clienti": ["id"]}),
+                   rows={"clienti": (200, [])})
+    res = supa.SupabaseModule().run(make_ctx())
+    pc = next(p for p in res.posture_checks if p.check_id == "POSTURE_RLS_clienti")
+    assert pc.passed is True
+    assert "fragile" not in pc.detail.lower() and "GRANT" not in pc.detail
+
+
+def test_submodules_wired(monkeypatch):
+    # §4.3 M5: dopo RLS+canary, `run` invoca storage/rpc/auth_posture/graphql. Qui
+    # il sottomodulo storage è stubbato per restituire un finding sentinella: deve
+    # comparire nel risultato (prova del wiring). Gli stub di default sono
+    # sovrascritti dai setattr espliciti sotto (stesso monkeypatch).
+    install_router(monkeypatch, schema=openapi_schema({"t": ["id"]}),
+                   rows={"t": (200, [])})
+    from bastione.models import Finding, Location
+    sentinel = Finding(finding_id="s" * 16, module="supabase",
+                       rule_id="STORAGE_PUBLIC_LISTABLE", title="x",
+                       severity=Severity.HIGH, confidence=Confidence.FIRM,
+                       target="gestionale",
+                       location=Location(endpoint="/storage/v1/object/list/b"),
+                       evidence="e", description="d")
+    monkeypatch.setattr(supa.storage, "run_storage_checks", lambda *a, **k: ([sentinel], []))
+    monkeypatch.setattr(supa.rpc, "run_rpc_checks", lambda *a, **k: ([], []))
+    monkeypatch.setattr(supa.auth_posture, "run_auth_posture_checks", lambda *a, **k: ([], []))
+    monkeypatch.setattr(supa.graphql, "run_graphql_checks", lambda *a, **k: ([], []))
+    ctx = make_ctx(fp=make_fp(discovered_buckets=["b"]),
+                   max_intrusion=IntrusionLevel.PROBE, ownership_verified=True)
+    res = supa.SupabaseModule().run(ctx)
+    assert any(f.rule_id == "STORAGE_PUBLIC_LISTABLE" for f in res.findings)
+
+
+def test_submodules_union_of_buckets_and_rpcs(monkeypatch):
+    # §4.3 M5: buckets/rpcs passati ai sottomoduli = UNIONE (bundle ∪ TOML ∪ attese),
+    # ordinata e deduplicata.
+    from bastione.models import BucketExpectation, RpcExpectation
+    install_router(monkeypatch, schema=openapi_schema({"t": ["id"]}),
+                   rows={"t": (200, [])})
+    seen = {}
+
+    def _storage(ctx, base, headers, buckets, target):
+        seen["buckets"] = buckets
+        return [], []
+
+    def _rpc(ctx, base, headers, rpcs, target):
+        seen["rpcs"] = rpcs
+        return [], []
+
+    monkeypatch.setattr(supa.storage, "run_storage_checks", _storage)
+    monkeypatch.setattr(supa.rpc, "run_rpc_checks", _rpc)
+    cfg = make_cfg()
+    cfg.supabase_buckets = ["avatars"]
+    cfg.supabase_rpcs = ["get_listino"]
+    cfg.expect_buckets = [BucketExpectation(name="docs")]
+    cfg.expect_rpcs = [RpcExpectation(name="rpc_b")]
+    fp = make_fp(discovered_buckets=["avatars", "public"], discovered_rpcs=["rpc_a"])
+    ctx = make_ctx(fp=fp, cfg=cfg, max_intrusion=IntrusionLevel.PROBE,
+                   ownership_verified=True)
+    supa.SupabaseModule().run(ctx)
+    assert seen["buckets"] == ["avatars", "docs", "public"]      # unione ordinata dedup
+    assert seen["rpcs"] == ["get_listino", "rpc_a", "rpc_b"]
+
+
+def test_submodule_exception_is_isolated(monkeypatch):
+    # §4.7 resilienza: un sottomodulo che esplode viene saltato, NON fa crashare la
+    # run né blocca gli altri.
+    install_router(monkeypatch, schema=openapi_schema({"t": ["id"]}),
+                   rows={"t": (200, [])})
+
+    def boom(*a, **k):
+        raise RuntimeError("submodule boom")
+
+    monkeypatch.setattr(supa.storage, "run_storage_checks", boom)
+    ctx = make_ctx(fp=make_fp(), max_intrusion=IntrusionLevel.PROBE,
+                   ownership_verified=True)
+    res = supa.SupabaseModule().run(ctx)  # non deve sollevare
+    assert res is not None
+
+
+
+def test_submodule_gate_denial_propagates(monkeypatch):
+    """Una negazione del gate da un sottomodulo NON va inghiottita dall'isolamento
+    per resilienza: IntrusionDenied propaga (la run aborta, §7)."""
+    import pytest
+    from bastione.gate import IntrusionDenied
+    install_router(monkeypatch, schema=openapi_schema({"t": ["id"]}),
+                   rows={"t": (200, [])})
+
+    def deny(*a, **k):
+        raise IntrusionDenied("negata")
+
+    monkeypatch.setattr(supa.rpc, "run_rpc_checks", deny)
+    ctx = make_ctx(fp=make_fp(), max_intrusion=IntrusionLevel.PROBE,
+                   ownership_verified=True)
+    with pytest.raises(IntrusionDenied):
+        supa.SupabaseModule().run(ctx)

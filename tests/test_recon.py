@@ -427,3 +427,72 @@ def test_parse_whatweb_skips_malformed_line_keeps_valid():
     stdout = '{"plugins": {"WordPress": {"version": ["6.4"]}}}\nNON-JSON garbage\n'
     techs = _parse_whatweb(stdout)
     assert {"name": "WordPress", "version": "6.4", "confidence": "whatweb"} in techs
+
+
+# ─── M5 (Task 3): chiavi pubbliche 2026 + scoperta bucket/rpc dal bundle ─────
+
+from bastione.recon.fingerprint import (
+    extract_public_key, extract_rpc_names, extract_bucket_names)
+
+
+def test_extract_public_key_legacy_jwt():
+    anon = make_jwt("anon")
+    assert extract_public_key(f'createClient(u,"{anon}")') == (anon, "legacy_jwt")
+
+
+def test_extract_public_key_publishable():
+    assert extract_public_key('createClient(u,"sb_publishable_AbC123xyz")') == (
+        "sb_publishable_AbC123xyz", "publishable")
+
+
+def test_extract_public_key_prefers_legacy_when_both():
+    anon = make_jwt("anon")
+    assert extract_public_key(f'{anon} ... sb_publishable_AbC1')[1] == "legacy_jwt"
+
+
+def test_extract_public_key_ignores_service_role():   # Review Focus #1
+    svc = make_jwt("service_role")
+    assert extract_public_key(f'const S="{svc}";') == (None, None)
+
+
+def test_extract_rpc_and_bucket_names():
+    js = "supabase.rpc('get_listino',{x:1}); supabase.storage.from('avatars').list()"
+    assert extract_rpc_names(js) == ["get_listino"]
+    assert extract_bucket_names(js) == ["avatars"]
+
+
+def test_fingerprint_publishable_and_discovery(monkeypatch, tmp_path):
+    import bastione.recon.fingerprint as fp_mod
+    page = "https://app.example/"
+    html = '<script src="/assets/app.js"></script>'
+    js = ('const u="https://abcdefghijklmnopqrst.supabase.co";'
+          'const k="sb_publishable_AbC123";'
+          "supabase.rpc('get_listino');supabase.storage.from('avatars').list();")
+    def fake_fetch(url):
+        if url.rstrip("/") == page.rstrip("/"):
+            return fake_resp(url=page, headers={}, text=html)
+        if url == "https://app.example/assets/app.js":
+            return fake_resp(url="https://app.example/assets/app.js", headers={}, text=js)
+        return None
+    monkeypatch.setattr(fp_mod, "_fetch", fake_fetch)
+    monkeypatch.setattr(fp_mod, "_run_whatweb", lambda t: [])
+    monkeypatch.setattr(fp_mod, "_run_katana", lambda t: [])
+    fp = fp_mod.fingerprint(page, tmp_path)
+    assert fp.supabase_key_kind == "publishable"
+    assert fp.anon_key == "sb_publishable_AbC123"
+    assert fp.discovered_rpcs == ["get_listino"]
+    assert fp.discovered_buckets == ["avatars"]
+    # un bucket non è una tabella: niente RLS test su /rest/v1/avatars
+    assert fp.discovered_tables == []
+
+
+def test_storage_from_is_not_a_table():
+    """`.storage.from('x')` è un bucket: resta fuori da discovered_tables, mentre un
+    `.from('x')` vero accanto resta una tabella (nessun falso negativo)."""
+    from bastione.recon.fingerprint import extract_bucket_names, extract_table_names
+    text = "s.storage.from('avatars').list();s.storage .from(\"docs\");s.from('clienti')"
+    assert extract_table_names(text) == ["clienti"]
+    assert extract_bucket_names(text) == ["avatars", "docs"]
+    # stesso nome usato sia come bucket sia come tabella → resta tabella
+    both = "s.storage.from('avatars');s.from('avatars').select()"
+    assert extract_table_names(both) == ["avatars"]

@@ -47,11 +47,14 @@ il gate (§7) e il recon (§8). Nessun target live nei test.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json as _json
 import logging
 
 from bastione.enums import Confidence, IntrusionLevel, Severity
-from bastione.gate import authorize
+from bastione.gate import IntrusionDenied, authorize
 from bastione.models import (
     Finding,
     Fingerprint,
@@ -63,6 +66,11 @@ from bastione.models import (
     TargetConfig,
 )
 from bastione.modules.base import Module, register
+# §4.3 M5: i quattro sottomoduli PROBE/READ_ONLY cablati da `_run_submodules`.
+# Import a livello di modulo (non dentro la funzione) così i test possono
+# monkeypatchare `supa.storage.run_storage_checks` ecc. Nessun ciclo: i sottomoduli
+# non importano `module.py`.
+from bastione.modules.supabase import auth_posture, graphql, rpc, storage
 
 log = logging.getLogger("bastione.supabase")
 
@@ -231,6 +239,22 @@ def _finding_id(module: str, rule_id: str, location: Location) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+def _jwt_alg(token: str) -> str | None:
+    """Algoritmo di firma (`alg`) dall'header di un JWT, o None se non decodificabile.
+
+    Funzione PURA (nessuna I/O): legge SOLO il segmento header (`token.split('.')[0]`),
+    mai payload o firma. Per una chiave publishable (`sb_publishable_…`), che NON è un
+    JWT, ritorna None → nessun falso finding HS256 (§4.3). Helper locale per non
+    riaprire `recon/fingerprint.py` (zero cross-task)."""
+    try:
+        head = token.split(".")[0]
+        head += "=" * (-len(head) % 4)
+        data = _json.loads(base64.urlsafe_b64decode(head))
+    except (IndexError, ValueError, binascii.Error):
+        return None
+    return data.get("alg") if isinstance(data, dict) else None
+
+
 # ─── il modulo (§9/§11) ─────────────────────────────────────────────────────
 
 @register
@@ -249,32 +273,65 @@ class SupabaseModule(Module):
     # ── selezione (§9) ──────────────────────────────────────────────────────
 
     def should_run(self, fp: Fingerprint, cfg: TargetConfig) -> bool:
-        """Gira solo se il recon ha rilevato Supabase E ha estratto la anon key
-        (§9): senza anon key non c'è nulla da sondare come anonimo, senza
-        is_supabase non è una superficie PostgREST."""
-        return fp.is_supabase and fp.anon_key is not None
+        """§4.3 M5: gira anche SENZA chiave, per emettere il segnale onesto
+        `SUPABASE_KEY_NOT_FOUND` (R6) invece di tacere. Basta che il recon abbia
+        rilevato Supabase OPPURE che il TOML dichiari un `supabase_url`."""
+        return fp.is_supabase or (cfg.supabase_url is not None)
 
     # ── run (§11): surface map + RLS read test (§11.1), poi canary (§11.2) ───
 
     def run(self, ctx: RunContext) -> ModuleResult:
         findings: list[Finding] = []
-        posture_checks: list[PostureCheck] = []
-
-        supabase_url = ctx.fingerprint.supabase_url or ctx.target_cfg.supabase_url
+        posture: list[PostureCheck] = []
+        cfg = ctx.target_cfg
+        target = cfg.name
+        supabase_url = ctx.fingerprint.supabase_url or cfg.supabase_url
         anon = ctx.fingerprint.anon_key
-        if not supabase_url or not anon:
-            # should_run dovrebbe averlo escluso; difesa in profondità (P8).
-            log.warning("supabase_url o anon_key assenti: probe saltata (§11.1)")
-            return ModuleResult(findings, posture_checks)
+
+        # §4.3 M5 — INFO onesti (R6): niente URL / niente chiave → NON si tace, si
+        # dichiara che la relativa verifica NON è stata fatta, poi si esce.
+        if supabase_url is None:
+            findings.append(self._not_found_info(
+                "SUPABASE_URL_NOT_FOUND", "URL Supabase non trovato", target,
+                "Nessun URL Supabase (né dal recon né dal TOML): la verifica "
+                "Supabase NON è stata fatta."))
+        if anon is None:
+            findings.append(self._not_found_info(
+                "SUPABASE_KEY_NOT_FOUND", "Chiave pubblica Supabase non trovata",
+                target,
+                "Nessuna chiave pubblica (legacy o publishable) estratta: la "
+                "verifica RLS NON è stata fatta."))
+        if supabase_url is None or anon is None:
+            return ModuleResult(findings, posture)
 
         base = supabase_url.rstrip("/")
         headers = {"apikey": anon, "Authorization": f"Bearer {anon}"}
-        target = ctx.target_cfg.name
-
         # Registro delle tabelle trovate RLS-LEGGIBILI in questa run: è metà della
         # superficie LIMITATA del canary (§11.2 invariante 3). Lo popola il read test.
         read_open: set[str] = set()
 
+        self._emit_key_kind_info(ctx, supabase_url, target, findings)
+        self._run_rls_surface(ctx, base, headers, supabase_url, target,
+                              findings, posture, read_open)
+        self._run_submodules(ctx, base, headers, target, findings, posture)
+        return ModuleResult(findings, posture)
+
+    def _run_rls_surface(
+        self,
+        ctx: RunContext,
+        base: str,
+        headers: dict[str, str],
+        supabase_url: str,
+        target: str,
+        findings: list[Finding],
+        posture_checks: list[PostureCheck],
+        read_open: set[str],
+    ) -> None:
+        """Surface map + RLS read test (§11.1) e canary (§11.2), estratti da `run`
+        (§4.3 M5). Appende a `findings`/`posture_checks`/`read_open` passati — NON
+        ritorna un ModuleResult (lo compone `run`). La logica RLS/canary è INVARIATA
+        rispetto a prima del wiring dei sottomoduli: i `return` interni escono solo da
+        questo helper."""
         # 1) SURFACE MAP — GET <supabase_url>/rest/v1/ → schema OpenAPI PostgREST.
         schema, detail = self._fetch_surface(base, headers)
         if schema is None:
@@ -323,7 +380,7 @@ class SupabaseModule(Module):
                 self._maybe_canary(
                     ctx, base, headers, target, synthetic, read_open,
                     findings, posture_checks, via_bundle=True)
-                return ModuleResult(findings, posture_checks)
+                return
             # Nessun nome tabella NEMMENO nel bundle: NON tacere (sarebbe
             # fuorviante). Emettiamo UN segnale onesto — Supabase rilevato ma RLS
             # NON verificabile via introspezione, verifica INCOMPLETA (§11.1).
@@ -334,7 +391,7 @@ class SupabaseModule(Module):
                 supabase_url, detail, target))
             # Nessuna superficie nota: niente schema, niente nomi tabella → il
             # canary non avrebbe nulla su cui agire. Lo si salta del tutto.
-            return ModuleResult(findings, posture_checks)
+            return
 
         tables, rpc_count = _enumerate_surface(schema)
         log.info("Supabase surface map: %d tabelle/view, %d RPC (non invocate, §11.1)",
@@ -358,7 +415,88 @@ class SupabaseModule(Module):
             ctx, base, headers, target, tables, read_open,
             findings, posture_checks)
 
-        return ModuleResult(findings, posture_checks)
+        return
+
+    # ── nuovi helper M5 (§4.3): INFO onesti, legacy keys, wiring sottomoduli ──
+
+    @staticmethod
+    def _not_found_info(rule_id, title, target, detail) -> Finding:
+        """INFO onesto (R6) quando manca l'URL o la chiave pubblica Supabase: non si
+        tace, si dichiara che la relativa verifica NON è stata fatta (INCOMPLETA).
+        Evidence/description NON segrete (P8). Stessa formula `finding_id` LOCKED."""
+        loc = Location(endpoint="/rest/v1/")
+        return Finding(
+            finding_id=_finding_id("supabase", rule_id, loc), module="supabase",
+            rule_id=rule_id, title=title, severity=Severity.INFO,
+            confidence=Confidence.TENTATIVE, target=target, location=loc,
+            evidence=detail, description=detail + " (R6: verifica INCOMPLETA)",
+            remediation_ref=None, owasp=["A05:2021"],
+            intrusion_used=IntrusionLevel.READ_ONLY)
+
+    def _emit_key_kind_info(self, ctx, supabase_url, target, findings) -> None:
+        """Chiavi legacy ancora in uso → INFO di migrazione (§4.3). Se la chiave è un
+        JWT HS256 (firma legacy) aggiunge un secondo INFO. Per una chiave publishable
+        (`sb_publishable_…`), `supabase_key_kind` non è "legacy_jwt" → nessun INFO
+        (e `_jwt_alg` ritornerebbe comunque None)."""
+        if ctx.fingerprint.supabase_key_kind != "legacy_jwt":
+            return
+        loc = Location(endpoint="/rest/v1/", url=supabase_url)
+        findings.append(Finding(
+            finding_id=_finding_id("supabase", "SUPABASE_LEGACY_KEYS_IN_USE", loc),
+            module="supabase", rule_id="SUPABASE_LEGACY_KEYS_IN_USE",
+            title="Chiavi Supabase legacy ancora in uso", severity=Severity.INFO,
+            confidence=Confidence.FIRM, target=target, location=loc,
+            evidence="chiave pubblica in formato legacy JWT (eyJ…)",
+            description="Il progetto usa ancora la chiave pubblica legacy (JWT). Le "
+                        "legacy saranno rimosse 'late 2026': migra a "
+                        "sb_publishable_/sb_secret_.",
+            remediation_ref=None, owasp=["A05:2021"],
+            intrusion_used=IntrusionLevel.READ_ONLY))
+        # alg del JWT: HS256 = firma legacy (helper locale puro, zero cross-task).
+        if _jwt_alg(ctx.fingerprint.anon_key or "") == "HS256":
+            findings.append(Finding(
+                finding_id=_finding_id(
+                    "supabase", "SUPABASE_JWT_LEGACY_HS256", loc),
+                module="supabase", rule_id="SUPABASE_JWT_LEGACY_HS256",
+                title="JWT Supabase con firma legacy HS256", severity=Severity.INFO,
+                confidence=Confidence.FIRM, target=target, location=loc,
+                evidence="alg=HS256",
+                description="La chiave pubblica è un JWT HS256 (schema legacy). Con "
+                            "le nuove chiavi la firma passa ad asimmetrica: pianifica "
+                            "la migrazione.",
+                remediation_ref=None, owasp=["A05:2021"],
+                intrusion_used=IntrusionLevel.READ_ONLY))
+
+    def _run_submodules(self, ctx, base, headers, target, findings, posture) -> None:
+        """Invoca i sottomoduli PROBE/READ_ONLY (storage/rpc/auth/graphql). Ognuno si
+        auto-gated (§4.0.7): con un tetto < PROBE o ownership non verificata le probe
+        PROBE restituiscono liste vuote senza alcuna I/O (nessuna IntrusionDenied
+        sfugge). Isolamento per resilienza (§4.7): un sottomodulo che esplode viene
+        loggato e saltato, NON blocca gli altri né fa crashare la run.
+
+        Buckets/RPC = UNIONE di (bundle ∪ TOML ∪ attese), ordinata e deduplicata."""
+        cfg = ctx.target_cfg
+        buckets = sorted(set(ctx.fingerprint.discovered_buckets)
+                         | set(cfg.supabase_buckets)
+                         | {b.name for b in cfg.expect_buckets})
+        rpcs = sorted(set(ctx.fingerprint.discovered_rpcs)
+                      | set(cfg.supabase_rpcs)
+                      | {r.name for r in cfg.expect_rpcs})
+        for fn, args in (
+            (storage.run_storage_checks, (ctx, base, headers, buckets, target)),
+            (rpc.run_rpc_checks, (ctx, base, headers, rpcs, target)),
+            (auth_posture.run_auth_posture_checks, (ctx, base, headers, target)),
+            (graphql.run_graphql_checks, (ctx, base, headers, target)),
+        ):
+            try:
+                f, p = fn(*args)
+                findings.extend(f)
+                posture.extend(p)
+            except IntrusionDenied:
+                raise  # il gate ABORTA, non si declassa a "sottomodulo fallito" (§7)
+            except Exception:  # noqa: BLE001 — un sottomodulo non blocca gli altri
+                log.warning("supabase: sottomodulo %s fallito, saltato",
+                            getattr(fn, "__name__", fn), exc_info=True)
 
     # ── passi interni ───────────────────────────────────────────────────────
 
@@ -576,6 +714,7 @@ class SupabaseModule(Module):
           passed (l'anon non legge → RLS sta proteggendo)."""
         endpoint = f"/rest/v1/{table}"
         resp = _get(f"{base}{endpoint}?limit=1", headers)
+        status = getattr(resp, "status_code", None)
 
         rows = self._readable_rows(resp)
         if rows is not None and len(rows) > 0:
@@ -615,8 +754,9 @@ class SupabaseModule(Module):
                 table, endpoint, target, severity))
             return
 
-        # protetto (vuoto / 401 / 403 / irraggiungibile) → posture positiva
-        posture_checks.append(self._rls_protected_posture(table, target))
+        # protetto (vuoto / 401 / 403 / irraggiungibile) → posture positiva. Lo
+        # status è propagato per la nota "protetto ma fragile" sul 401/403 (§4.3).
+        posture_checks.append(self._rls_protected_posture(table, target, status))
 
     @staticmethod
     def _readable_rows(resp) -> list | None:
@@ -765,19 +905,39 @@ class SupabaseModule(Module):
         )
 
     @staticmethod
-    def _rls_protected_posture(table: str, target: str) -> PostureCheck:
-        """Costruisce il PostureCheck positivo `POSTURE_RLS_<tabella>` (§11.1.2):
-        l'anon NON legge la tabella → RLS sta proteggendo."""
+    def _rls_protected_posture(
+        table: str, target: str, status: int | None = None,
+    ) -> PostureCheck:
+        """PostureCheck positivo `POSTURE_RLS_<tabella>` (§11.1.2): l'anon NON legge
+        la tabella → RLS sta proteggendo.
+
+        §4.3 M5 "protetto ma fragile" (30/10/2026): un `401/403` può derivare dalla
+        SOLA assenza di GRANT (nuovo default Supabase), non da una policy RLS
+        esplicita. La posture passa comunque (l'anon non legge), ma con una NOTA e la
+        raccomandazione di abilitare la RLS esplicitamente (verifica definitiva in
+        M8). Uno status diverso (vuoto 200, irraggiungibile, ecc.) resta la nota
+        classica."""
+        fragile = status in (401, 403)
+        if fragile:
+            detail = (
+                f"GET anonima a /rest/v1/{table}?limit=1 → {status}: tabella "
+                "protetta, ma la protezione potrebbe derivare dalla SOLA assenza di "
+                "GRANT (default Supabase dal 30/10/2026), non da una policy RLS "
+                "esplicita → 'protetto ma fragile'. Raccomandazione: abilita la RLS "
+                "esplicitamente. Verifica definitiva in M8."
+            )
+        else:
+            detail = (
+                f"GET anonima a /rest/v1/{table}?limit=1 non ha restituito righe: "
+                "l'anon non legge la tabella → RLS protegge (§11.1)."
+            )
         return PostureCheck(
             check_id=f"POSTURE_RLS_{table}",
             title=f"RLS attiva sulla tabella '{table}'",
             passed=True,
             severity_if_failed=Severity.HIGH,
             target=target,
-            detail=(
-                f"GET anonima a /rest/v1/{table}?limit=1 non ha restituito righe "
-                f"(vuoto/401/403): l'anon non legge la tabella → RLS protegge (§11.1)."
-            ),
+            detail=detail,
             remediation_ref="RLS_DISABLED",
         )
 
