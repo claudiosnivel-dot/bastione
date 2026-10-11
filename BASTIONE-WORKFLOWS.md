@@ -117,7 +117,7 @@ I task si organizzano in un **grafo di dipendenze**; gli indipendenti girano in 
 
 ## 7 · Milestone → workflow (fan-out reale)
 
-> Conteggi presi da `BASTIONE-SESSION-STATE.md` — fatti, non stime. Stato attuale: **925 test verdi**, tutto offline.
+> Conteggi presi da `BASTIONE-SESSION-STATE.md` — fatti, non stime. Stato attuale: **1386 test verdi**, tutto offline.
 
 | Milestone | Stato | Task/step | Gate di milestone | File di dettaglio |
 |---|---|---|---|---|
@@ -126,6 +126,7 @@ I task si organizzano in un **grafo di dipendenze**; gli indipendenti girano in 
 | **M2 · Sistema di difesa continuo** | ✅ **code-complete (offline)** · capstone live pendente | 7 step | **629 test verdi** + canary §11.2 offline + oracolo/notifier/CI-gate/portfolio/monitoring | SESSION-STATE §3-ter |
 | **M3 · Espansioni** | ✅ **code-complete** · ✅ **corsie validate live** (S11) · ✅ **O06/O07 risolte** (S12) · push DefectDojo trigger-gated | 5 step (T0 + 4 corsie + integraz.) + O06/O07 | **859 test verdi** + semgrep/trivy §14 (incl. trivy Secrets→Finding INFO P8 + scanner misconfig) + attack-surface §16 (`surface`) + DefectDojo §19 exporter+push gated (`export-defectdojo`) | SESSION-STATE §3-quater/§7 |
 | **M4 · Bastione autenticato** (NUOVO, oltre il canone §27) | ✅ **code-complete (offline) 5/5** (M4.0+M4.1 S12-cont · M4.2/4.3/4.4 S13) · esecuzione live gated | 5 step (M4.0 fondamenta + M4.1 IDOR + M4.2 login_hardening + M4.3 zap_active + M4.4 server_exposure) | **925 test verdi** + auth/session §7 + api_surface §8 + IDOR cross-tenant §11.2/§15 + login_hardening (PROBE) + zap_active (MUTATING, policy vincolata enforced fail-closed) + server_exposure (PROBE) | SESSION-STATE §3-quinquies · spec/plan in `docs/superpowers/` |
+| **M5 · Supabase 2026 + segreti + correttezza** | ✅ **code-complete (offline) 24/24** (build S14-cont via workflow interrotto · T22/T24 + triage + fix S15 inline) · validazione live M4+M5 gated | 24 task in 4 onde (W0 · L1–L6 · integrazione · wiring) | **1386 test verdi** (3.14 e 3.11 da lockfile) | SESSION-STATE §3-sexies · spec/plan in `docs/superpowers/` |
 
 ## 8 · Task-graph M3 — ✅ COSTRUITO (Sessione 10), esecuzioni live trigger-gated
 

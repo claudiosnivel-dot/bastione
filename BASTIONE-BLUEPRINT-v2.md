@@ -975,6 +975,10 @@ L'onestà qui *è* una feature: il posture score non gonfia, e un finding `TENTA
 
 **M3 — Espansioni (deferred, trigger-based).** DefectDojo *solo* al primo cliente che paga per report ricorrenti; corsia **white-box** (Semgrep/trivy sul sorgente); **attack-surface inventory** tracciato nel tempo (subdomain/endpoint/bucket).
 
+**M4 — Bastione autenticato** (oltre il canone, S12–S13). IDOR cross-tenant, robustezza del login, DAST autenticato con policy vincolata, segreti lato server. ✅ code-complete offline; esecuzione live gated.
+
+**M5–M9 — aggiornamento 2026** (spec `docs/superpowers/specs/2026-10-11-bastione-m5-m9-design.md`, approvata S14). **M5 — Supabase 2026 + segreti + correttezza** ✅ code-complete offline (S15): chiavi `sb_publishable_`/`sb_secret_`, sonde storage/RPC/auth/GraphQL oracle-first, catalogo segreti con liveness, `server_exposure` esteso, `zap_active`/`idor` corretti, supply-chain dei tool (`toolcheck`, lockfile con hash, action per SHA), fix-plan dai posture falliti. Poi: validazione live M4+M5 → **M6** perimetro → **M7** framework/supply chain → **M8** dall'interno con token → **M9** agent-safety/AI/rumore.
+
 > **Ordine d'oro per Claude Code:** non saltare avanti. M0 deve girare end-to-end (anche con un solo detector e la sola RLS read) **prima** di toccare M1. La tentazione di implementare tutto il catalogo o le scritture subito è l'over-engineering contro cui questo blueprint mette in guardia (P5).
 
 > **Esecuzione (il *come*):** ogni milestone si chiude con **un dynamic workflow** (non uno per step) — task-graph, ondate parallele per ownership di file, blind-review Opus, ground-truth coi test. La metodologia è normata in **`BASTIONE-WORKFLOWS.md`** (§7 mappa milestone→workflow; §8 il task-graph forward di M3).
