@@ -64,6 +64,13 @@ _ENTROPY_MIN = 4.0
 # una stringa esadecimale di queste lunghezze è quasi certamente un hash.
 _HASH_HEX_LENGTHS = (32, 40, 56, 64, 96, 128)
 
+# Chiavi Supabase 2026 (S16): la publishable è pubblica per design (come la anon
+# legacy) e la `sb_secret_` ha già il detector CRITICAL dedicato → l'alta entropia
+# non le ri-segnala (rumore / doppio conteggio). Si tolgono dal testo PRIMA di
+# cercare i candidati: in `KEY=valore` o `?apikey=valore` il candidato include ciò
+# che precede la chiave e un controllo sul solo prefisso non basterebbe.
+_KNOWN_KEY_RE = re.compile(r"sb_(?:publishable|secret)_[A-Za-z0-9_-]{20,}")
+
 
 # ─── confine I/O della liveness (monkeypatchabile nei test, §10.2) ──────────
 
@@ -174,7 +181,8 @@ class HighEntropyDetector(Detector):
 
     def scan(self, asset: TextAsset) -> list[RawSecret]:
         out: list[RawSecret] = []
-        for cand in _CANDIDATE_RE.findall(asset.content):
+        content = _KNOWN_KEY_RE.sub(" ", asset.content)
+        for cand in _CANDIDATE_RE.findall(content):
             if cand.isdigit():
                 continue
             if _HEX_RE.match(cand) and len(cand) in _HASH_HEX_LENGTHS:

@@ -9,7 +9,10 @@ from bastione.enums import Severity
 from bastione.models import Location, RawSecret, TextAsset
 from bastione.modules.secrets.detectors.base import Detector, register_detector
 
-_RE = re.compile(r"sb_secret_[A-Za-z0-9]+")
+# Formato reale (S16): 22 caratteri base64url (anche `-`/`_`) + `_` + 8 di checksum.
+# Con `[A-Za-z0-9]+` il valore veniva troncato e le chiavi che iniziano con `-`/`_`
+# sfuggivano. `{20,}` evita identificatori e segnaposto (`sb_secret_key`, `…_xxx`).
+_RE = re.compile(r"sb_secret_[A-Za-z0-9_-]{20,}")
 
 
 @register_detector

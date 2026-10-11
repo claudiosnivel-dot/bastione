@@ -483,3 +483,31 @@ def test_module_liveness_io_failure_does_not_crash_or_enrich(
     assert {f.rule_id for f in result.findings} == _MODULE_RULES
     assert all(f.intrusion_used == IntrusionLevel.READ_ONLY for f in result.findings)
     _assert_p8(result, caplog)
+
+
+# Composta a runtime: nel sorgente non c'è mai una stringa con la forma di una
+# chiave segreta Supabase (la push protection di GitHub la bloccherebbe).
+_SB_SECRET_CLI = "sb_" + "secret_" + "N7UND0UgjKTVK-Uodkm0Hg_xSvEMPvz"
+
+
+def test_high_entropy_skips_supabase_2026_keys():
+    # S16: la publishable è pubblica per design (come la anon legacy) e la secret ha
+    # il suo detector CRITICAL dedicato: l'alta entropia non deve ri-segnalarle.
+    # Valori = default PUBBLICI dello stack locale della Supabase CLI.
+    from bastione.models import TextAsset
+    from bastione.modules.secrets.detectors.misc import HighEntropyDetector
+    content = ('const k="sb_publishable_ACJWlzQHlZjBrEguHvfOxg_3BJgxAaH";'
+               f'const s="{_SB_SECRET_CLI}";')
+    assert HighEntropyDetector().scan(TextAsset(source="a.js", content=content)) == []
+
+
+def test_high_entropy_skips_supabase_keys_glued_to_names_and_urls():
+    # Blind-review S16: in `.env` esposti (`KEY=valore`) e negli URL (`?apikey=`) il
+    # candidato include ciò che precede la chiave e il solo `startswith` non bastava.
+    from bastione.models import TextAsset
+    from bastione.modules.secrets.detectors.misc import HighEntropyDetector
+    content = ("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_ACJWlzQHlZjBrEguHvfOxg_3BJgxAaH\n"
+               f"SUPABASE_SECRET_KEY={_SB_SECRET_CLI}\n"
+               "wss://x.supabase.co/realtime/v1/websocket?apikey="
+               "sb_publishable_ACJWlzQHlZjBrEguHvfOxg_3BJgxAaH&vsn=1.0.0\n")
+    assert HighEntropyDetector().scan(TextAsset(source=".env", content=content)) == []

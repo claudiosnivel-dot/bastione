@@ -12,6 +12,36 @@ def test_supabase_secret_key_critical():
     assert ss.SupabaseSecretKeyDetector().severity == Severity.CRITICAL
 
 
+# Prefisso composto a runtime: nel sorgente non c'è mai una stringa con la forma di
+# una chiave segreta Supabase (la push protection di GitHub la bloccherebbe).
+_SB_SECRET = "sb_" + "secret_"
+
+
+def test_supabase_secret_key_full_value_real_format():
+    # S16: formato reale (22 base64url + `_` + 8 di checksum), con la forma del
+    # default PUBBLICO dello stack locale della Supabase CLI (Defaults.ts). Prima la
+    # regex `[A-Za-z0-9]+` la troncava al primo `-`.
+    key = _SB_SECRET + "N7UND0UgjKTVK-Uodkm0Hg_xSvEMPvz"
+    s = ss.SupabaseSecretKeyDetector().scan(TextAsset(source="app.js",
+        content=f'const k="{key}";'))
+    assert [x.value for x in s] == [key]
+
+
+def test_supabase_secret_key_starting_with_dash_or_underscore_detected():
+    # ~3% delle chiavi (2 caratteri su 64) iniziano con `-`/`_`: prima sfuggivano.
+    for key in (_SB_SECRET + "-7UND0UgjKTVKaUodkm0Hg_xSvEMPvz",
+                _SB_SECRET + "_7UND0UgjKTVKaUodkm0Hg_xSvEMPvz"):
+        s = ss.SupabaseSecretKeyDetector().scan(TextAsset(source="a.js",
+            content=f"k='{key}'"))
+        assert [x.value for x in s] == [key]
+
+
+def test_supabase_secret_key_ignores_identifiers_and_placeholders():
+    content = "const sb_secret_key = env.X; // es. sb_secret_xxx"
+    assert ss.SupabaseSecretKeyDetector().scan(
+        TextAsset(source="a.js", content=content)) == []
+
+
 def test_stripe_live_critical_test_high_webhook_high():   # D4
     d = st.StripeDetector()
     live = d.scan(TextAsset(source="x", content='sk_live_ABCdef0123456789XYZ'))

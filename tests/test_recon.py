@@ -440,9 +440,41 @@ def test_extract_public_key_legacy_jwt():
     assert extract_public_key(f'createClient(u,"{anon}")') == (anon, "legacy_jwt")
 
 
+# Formato reale delle chiavi 2026 (S16, verificato su fonti primarie): prefisso +
+# 22 caratteri base64url (anche `-`/`_`) + `_` + 8 di checksum. Quella sotto è la
+# chiave publishable PUBBLICA di default dello stack locale della Supabase CLI
+# (supabase/cli packages/stack/src/Defaults.ts): non un segreto.
+REAL_PUBLISHABLE = "sb_publishable_ACJWlzQHlZjBrEguHvfOxg_3BJgxAaH"
+
+
 def test_extract_public_key_publishable():
-    assert extract_public_key('createClient(u,"sb_publishable_AbC123xyz")') == (
-        "sb_publishable_AbC123xyz", "publishable")
+    assert extract_public_key(f'createClient(u,"{REAL_PUBLISHABLE}")') == (
+        REAL_PUBLISHABLE, "publishable")
+
+
+def test_extract_public_key_publishable_keeps_full_key_with_dash_and_underscore():
+    # Prima di S16 la regex `[A-Za-z0-9]+` troncava al primo `-`/`_`: la chiave
+    # estratta era sbagliata → ogni probe riceveva 401 → bucket/RPC/tabelle
+    # dichiarati "protetti" su un progetto 2026 (falso negativo totale).
+    k1 = "sb_publishable_aYXtBMH-rmzJyOyi4eMM8A_zdAA6ItP"
+    k2 = "sb_publishable__Tugx1tY8JaYWcKRLUAdug_NxY00GOR"   # inizia con `_`
+    assert extract_public_key(f'const k="{k1}";') == (k1, "publishable")
+    assert extract_public_key(f"const k='{k2}';") == (k2, "publishable")
+    assert extract_public_key(f"k=`{k1}`") == (k1, "publishable")
+
+
+def test_extract_public_key_prefers_exact_format_over_long_placeholder():
+    # Blind-review S16: un segnaposto lungo prima della chiave vera la scavalcava
+    # (`search` prende il primo match) → chiave sbagliata → tutto 401 → falsi "protetto".
+    js = (f'/* es. "sb_publishable_your_publishable_key_here" */'
+          f'const k="{REAL_PUBLISHABLE}";')
+    assert extract_public_key(js) == (REAL_PUBLISHABLE, "publishable")
+
+
+def test_extract_public_key_skips_placeholder_before_real_key():
+    js = f'/* es: "sb_publishable_YOUR_KEY" */ const k="{REAL_PUBLISHABLE}";'
+    assert extract_public_key(js) == (REAL_PUBLISHABLE, "publishable")
+    assert extract_public_key('const k="sb_publishable_YOUR_KEY";') == (None, None)
 
 
 def test_extract_public_key_prefers_legacy_when_both():
@@ -466,7 +498,7 @@ def test_fingerprint_publishable_and_discovery(monkeypatch, tmp_path):
     page = "https://app.example/"
     html = '<script src="/assets/app.js"></script>'
     js = ('const u="https://abcdefghijklmnopqrst.supabase.co";'
-          'const k="sb_publishable_AbC123";'
+          f'const k="{REAL_PUBLISHABLE}";'
           "supabase.rpc('get_listino');supabase.storage.from('avatars').list();")
     def fake_fetch(url):
         if url.rstrip("/") == page.rstrip("/"):
@@ -479,7 +511,7 @@ def test_fingerprint_publishable_and_discovery(monkeypatch, tmp_path):
     monkeypatch.setattr(fp_mod, "_run_katana", lambda t: [])
     fp = fp_mod.fingerprint(page, tmp_path)
     assert fp.supabase_key_kind == "publishable"
-    assert fp.anon_key == "sb_publishable_AbC123"
+    assert fp.anon_key == REAL_PUBLISHABLE
     assert fp.discovered_rpcs == ["get_listino"]
     assert fp.discovered_buckets == ["avatars"]
     # un bucket non è una tabella: niente RLS test su /rest/v1/avatars

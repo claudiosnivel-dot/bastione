@@ -101,8 +101,15 @@ _JS_FROM_BUILTINS: tuple[str, ...] = (
 _JS_BUILTIN_FROM_RE = re.compile(
     r"(?:^|[^A-Za-z0-9_$])(?:" + "|".join(_JS_FROM_BUILTINS) + r")\s*(\.from\()"
 )
-# Chiave pubblica nel formato nuovo 2026 (§4.2): `sb_publishable_<token>`.
-_PUBLISHABLE_RE = re.compile(r"sb_publishable_[A-Za-z0-9]+")
+# Chiave pubblica nel formato nuovo 2026 (§4.2): `sb_publishable_<token>`. Formato
+# reale (S16, fonti primarie: default della Supabase CLI e chiavi pubbliche note):
+# 22 caratteri base64url — anche `-` e `_` — più `_` e 8 di checksum. La classe
+# base64url DEVE includere `-`/`_`: troncare la chiave la rende invalida (ogni probe
+# → 401 → falsi "protetto"). `{20,}` scarta segnaposto come `sb_publishable_YOUR_KEY`.
+_PUBLISHABLE_RE = re.compile(r"sb_publishable_[A-Za-z0-9_-]{20,}")
+# Formato esatto (22 + `_` + 8): preferito a qualunque altro match, così un
+# segnaposto lungo che precede la chiave vera non la scavalca.
+_PUBLISHABLE_EXACT_RE = re.compile(r"\Asb_publishable_[A-Za-z0-9_-]{22}_[A-Za-z0-9_-]{8}\Z")
 # `.rpc('fn')` / `.rpc("fn", {...})` — entry RPC del client Supabase (§3/§4.2).
 _RPC_FROM_RE = re.compile(r"\.rpc\(\s*(['\"])([A-Za-z_][A-Za-z0-9_]*)\1")
 # `.storage.from('bucket')` — entry storage del client (nomi bucket, §4.2).
@@ -158,9 +165,12 @@ def extract_public_key(text: str) -> tuple[str | None, str | None]:
     legacy = extract_anon_key(text)
     if legacy is not None:
         return legacy, "legacy_jwt"
-    m = _PUBLISHABLE_RE.search(text)
-    if m is not None:
-        return m.group(0), "publishable"
+    candidates = _PUBLISHABLE_RE.findall(text)
+    for key in candidates:
+        if _PUBLISHABLE_EXACT_RE.match(key):
+            return key, "publishable"
+    if candidates:
+        return candidates[0], "publishable"
     return None, None
 
 
