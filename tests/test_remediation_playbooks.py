@@ -16,6 +16,7 @@ così i test puntano a una dir temporanea nota.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ import pytest
 from bastione.enums import Confidence, Severity, Status
 from bastione.models import Finding, Location, PostureCheck
 from bastione.remediation import playbooks
+from bastione.remediation.playbooks import render_playbook
 
 
 # ─── Fixture: una playbooks-root temporanea con template noti ─────────────────
@@ -317,3 +319,191 @@ def test_render_playbook_funziona_con_cwd_diversa(tmp_path, monkeypatch):
     md = playbooks.render_playbook("RLS_DISABLED", ctx)
     assert md is not None
     assert "bastione verify" in md
+
+
+# ─── M5 (§4.8): playbook per i rule_id M4+M5 ──────────────────────────────────
+#
+# Gli "altri" rule_id INFO/limite non hanno playbook (cadono nel fallback, §4.8):
+# qui si pina l'insieme di quelli che DEVONO renderizzare con i template bundled reali.
+
+_M5_RULE_IDS = [
+    "RPC_DATA_EXPOSED", "RPC_ANON_INVOCABLE", "SUPABASE_GRAPHQL_INTROSPECTION",
+    "SIGNUP_NO_EMAIL_CONFIRM", "ANON_SIGNIN_ENABLED",
+    "SENSITIVE_ENDPOINT_EXPOSED", "SOURCEMAP_EXPOSED", "CORS_MISCONFIG",
+    "DEV_SERVER_EXPOSED", "API_SPEC_EXPOSED",
+    "IDOR_CROSS_TENANT_READ", "IDOR_CROSS_TENANT_WRITE",
+    "SECRET_SUPABASE_SECRET_KEY", "SECRET_AWS_AKIA", "SECRET_GITHUB", "SECRET_NPM",
+    "SECRET_UPSTASH", "SECRET_OPENAI", "SECRET_ANTHROPIC", "SECRET_TELEGRAM_BOT",
+    "SECRET_PRIVATE_KEY", "SECRET_GOOGLE_API_KEY", "SECRET_HIGH_ENTROPY",
+]
+_M5_SECRET_IDS = [r for r in _M5_RULE_IDS if r.startswith("SECRET_")]
+
+
+@pytest.mark.parametrize("rid", _M5_RULE_IDS)
+def test_m5_playbook_renders(rid):
+    ctx = {"title": "T", "severity": "HIGH", "target": "t", "rule_id": rid,
+           "location": {"url": None, "endpoint": "/x", "file": "app.js", "line": None},
+           "table": "clienti", "evidence": "redacted"}
+    out = render_playbook(rid, ctx)
+    assert out is not None and "bastione verify --target t" in out
+
+
+def _m5_ctx(rid, *, endpoint=None, file=None, evidence="[REDACTED]", rule_id=None):
+    """Context REALE (`context_from_finding`) di un finding il cui playbook è `rid`.
+
+    `rule_id` = il rule_id del finding quando differisce dalla chiave del playbook
+    (es. RPC_ANON_WRITE_CAPABLE e RPC_NOT_VERIFIABLE usano il playbook
+    RPC_ANON_INVOCABLE, IDOR_CLEANUP_FAILED usa IDOR_CROSS_TENANT_WRITE)."""
+    f = Finding(
+        finding_id="abc123", module="m5", rule_id=rule_id or rid, title="T",
+        severity=Severity.HIGH, confidence=Confidence.FIRM, target="t",
+        location=Location(endpoint=endpoint, file=file), evidence=evidence,
+        description="desc", remediation_ref=rid, status=Status.NEW,
+    )
+    return playbooks.context_from_finding(f)
+
+
+@pytest.mark.parametrize("rid", _M5_RULE_IDS)
+def test_m5_playbook_chiude_con_verify_ed_evidence_redatta(rid):
+    """Ogni playbook M5 chiude SEMPRE col loop di verifica (§18) e con la riga
+    evidence: il valore (già redatto a monte, P8) entra invariato."""
+    md = render_playbook(rid, _m5_ctx(rid, evidence="[REDACTED:SENTINEL]"))
+    assert md is not None
+    assert md.rstrip().endswith(
+        "<sub>Evidence (già redatta): `[REDACTED:SENTINEL]`</sub>")
+    assert md.index("bastione verify --target t") < md.index("<sub>Evidence")
+
+
+@pytest.mark.parametrize("rid", _M5_RULE_IDS)
+def test_m5_playbook_senza_none_ne_code_span_vuoti(rid):
+    """Con location senza endpoint/file (posture drift, finding sintetici) il render
+    non stampa il letterale `None` né inline-code vuoti (stessa guardia di
+    RLS_DISABLED.md)."""
+    md = render_playbook(rid, _m5_ctx(rid))
+    assert md is not None
+    assert not re.search(r"(?<![=\w])None\b", md)     # `=None` in un esempio di codice è ok
+    assert not re.search(r"(?<!`)``(?!`)", md)        # `` isolati = code span vuoto (i fence ``` sono ok)
+
+
+@pytest.mark.parametrize("rid", _M5_SECRET_IDS)
+def test_m5_playbook_segreto_impone_rotazione_e_cita_il_file(rid):
+    """§4.4 LOCKED: la remediation di un segreto è sempre ROTAZIONE (passo umano) +
+    spostamento lato server; rimuoverlo dal codice NON basta. Cita il file."""
+    md = render_playbook(rid, _m5_ctx(rid, file="assets/app.js"))
+    assert md is not None
+    assert "assets/app.js" in md
+    assert "ruot" in md.lower()
+    assert "NON basta" in md
+    assert "lato server" in md
+
+
+# P8 sui SORGENTI dei playbook: nessun esempio che somigli a un segreto reale
+# (scanner del repo, copia-incolla di una chiave "finta" che poi sembra vera).
+_SECRET_LIKE = [
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bnpm_[A-Za-z0-9]{30,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}"),
+    re.compile(r"\bwhsec_[A-Za-z0-9]{10,}"),
+    re.compile(r"\bsb_secret_[A-Za-z0-9_-]{10,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}"),
+    re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\."),
+    re.compile(r"-{5}BEGIN [A-Z ]*PRIVATE KEY-{5}"),
+]
+
+
+def test_playbook_bundled_non_contengono_valori_simil_segreto():
+    files = sorted(playbooks.PLAYBOOKS_DIR.glob("*.md"))
+    assert files, "nessun playbook trovato"
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for rx in _SECRET_LIKE:
+            assert not rx.search(text), f"{path.name}: valore simil-segreto ({rx.pattern})"
+
+
+# ─── RPC: nome funzione concreto nello SQL, ma solo se è un identificatore ─────
+
+@pytest.mark.parametrize("rid", ["RPC_DATA_EXPOSED", "RPC_ANON_INVOCABLE"])
+def test_rpc_playbook_sql_concreto_e_revoca_anche_da_public(rid):
+    """Il nome funzione (ultimo segmento di /rest/v1/rpc/<fn>) entra nello SQL, e la
+    REVOKE copre anche PUBLIC: Postgres concede EXECUTE a PUBLIC di default (anon lo
+    eredita), quindi revocarlo solo da `anon` non chiuderebbe nulla."""
+    md = render_playbook(rid, _m5_ctx(rid, endpoint="/rest/v1/rpc/get_listino"))
+    assert "REVOKE EXECUTE ON FUNCTION public.get_listino(" in md
+    assert "FROM PUBLIC, anon" in md
+
+
+@pytest.mark.parametrize("rid", ["RPC_DATA_EXPOSED", "RPC_ANON_INVOCABLE"])
+def test_rpc_playbook_nome_con_maiuscole_e_quotato(rid):
+    """`public.getListino` si piega in `getlistino` (≠ la funzione creata fra
+    virgolette): con le maiuscole l'identificatore va quotato."""
+    md = render_playbook(rid, _m5_ctx(rid, endpoint="/rest/v1/rpc/getListino"))
+    assert 'public."getListino"(' in md
+
+
+@pytest.mark.parametrize("rid", ["RPC_DATA_EXPOSED", "RPC_ANON_INVOCABLE"])
+def test_rpc_playbook_nome_non_identificatore_non_entra_nello_sql(rid):
+    """Il nome arriva dal bundle del target: se non è un identificatore NON va
+    interpolato nello SQL da copiare-incollare (cade sul segnaposto `<fn>`)."""
+    md = render_playbook(rid, _m5_ctx(rid, endpoint="/rest/v1/rpc/x;DROP TABLE users"))
+    sql = "\n".join(re.findall(r"```sql\n(.*?)```", md, re.S))
+    assert sql and "DROP TABLE" not in sql
+    assert "<fn>" in sql
+
+
+_RPC_MARKERS = {
+    "RPC_ANON_WRITE_CAPABLE": "tentato una scrittura",
+    "RPC_NOT_VERIFIABLE": "non ha potuto verificare",
+    "RPC_ANON_INVOCABLE": "non è dichiarata pubblica",
+}
+
+
+@pytest.mark.parametrize("rule_id", sorted(_RPC_MARKERS))
+def test_rpc_playbook_variante_per_rule_id(rule_id):
+    """RPC_ANON_WRITE_CAPABLE / RPC_NOT_VERIFIABLE condividono il remediation_ref
+    RPC_ANON_INVOCABLE: il playbook racconta la variante giusta, e solo quella."""
+    md = render_playbook(
+        "RPC_ANON_INVOCABLE",
+        _m5_ctx("RPC_ANON_INVOCABLE", endpoint="/rest/v1/rpc/f", rule_id=rule_id))
+    assert _RPC_MARKERS[rule_id] in md
+    for altro, marker in _RPC_MARKERS.items():
+        if altro != rule_id:
+            assert marker not in md
+
+
+def test_idor_write_playbook_variante_cleanup_non_confermato():
+    """IDOR_CLEANUP_FAILED usa il playbook IDOR_CROSS_TENANT_WRITE: la variante dice
+    di rimuovere a mano la canary (marker `bastione-idor-canary`)."""
+    ep = "/api/items/{id}"
+    base = render_playbook(
+        "IDOR_CROSS_TENANT_WRITE", _m5_ctx("IDOR_CROSS_TENANT_WRITE", endpoint=ep))
+    pulizia = render_playbook(
+        "IDOR_CROSS_TENANT_WRITE",
+        _m5_ctx("IDOR_CROSS_TENANT_WRITE", endpoint=ep, rule_id="IDOR_CLEANUP_FAILED"))
+    assert "bastione-idor-canary" not in base
+    assert "bastione-idor-canary" in pulizia
+
+
+def test_playbook_segreti_non_promettono_cio_che_il_detector_non_fa():
+    """I playbook descrivono il comportamento REALE dei detector (§4.4, R6):
+    - Google: la promozione LOW→HIGH su liveness è RIMANDATA → il playbook non deve
+      dire che la severità 'sale'; la conferma finisce solo nella description;
+    - Upstash: il detector è ancorato all'URL REST `*.upstash.io` (il token sta accanto,
+      non è il match) → il playbook parla dell'URL e non dichiara di aver trovato il token."""
+    google = render_playbook("SECRET_GOOGLE_API_KEY", _m5_ctx("SECRET_GOOGLE_API_KEY"))
+    assert "sale se" not in google
+    upstash = render_playbook("SECRET_UPSTASH", _m5_ctx("SECRET_UPSTASH"))
+    assert "URL REST" in upstash
+    assert "È stato trovato un **token REST" not in upstash
+
+
+def test_playbook_chiavi_toml_coincidono_con_i_modelli():
+    """Le chiavi TOML citate nei playbook esistono davvero nei modelli (§15)."""
+    from bastione.models import AuthExpectation, RpcExpectation
+    anon = render_playbook("ANON_SIGNIN_ENABLED", _m5_ctx("ANON_SIGNIN_ENABLED"))
+    assert "anonymous_signin" in anon and "anonymous_signin" in AuthExpectation.model_fields
+    rpc = render_playbook("RPC_DATA_EXPOSED", _m5_ctx("RPC_DATA_EXPOSED"))
+    assert "anon_execute" in rpc and "anon_execute" in RpcExpectation.model_fields

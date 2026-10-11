@@ -946,3 +946,30 @@ def test_notify_triggers_on_drift_only(tmp_path: Path, monkeypatch):
     assert state.counts["new"] == 0
     assert state.counts["drift"] >= 1
     assert "NOTIFY" in state.phases_completed, "NOTIFY non scattata sul solo DRIFT"
+
+
+def test_remediate_forwards_failed_posture_checks_to_fix_plan(tmp_path: Path, monkeypatch):
+    """M5 Task 24 (§4.1/§4.8): REMEDIATE passa i PostureCheck della run a
+    `build_fix_plan` → un posture FALLITO con builder registrato (POSTURE_HSTS) entra
+    nel bundle; uno PASSATO no."""
+    finding = _finding(module="supabase", rule_id="RLS_DISABLED", endpoint="/rest/v1/clienti")
+    hsts_failed = PostureCheck(check_id="POSTURE_HSTS", title="HSTS", passed=False,
+                               severity_if_failed=Severity.MEDIUM, target="g",
+                               detail="HSTS assente")
+    csp_passed = PostureCheck(check_id="POSTURE_CSP", title="CSP", passed=True,
+                              severity_if_failed=Severity.MEDIUM, target="g", detail="ok")
+    stub = _StubModule("supabase", findings=[finding], posture=[hsts_failed, csp_passed])
+    _patch_offline(monkeypatch, plan_modules=[stub])
+
+    runs = tmp_path / "runs"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING), runs_root=runs,
+                        baselines_root=tmp_path / "baselines")
+    state = orch.run("g")
+
+    assert "REMEDIATE" in state.phases_completed
+    run_dir = next((runs / "g").glob("*/"))
+    plan = json.loads((run_dir / "fix" / "fix-plan.json").read_text(encoding="utf-8"))
+    rule_ids = {f["rule_id"] for f in plan["fixes"]}
+    assert "RLS_DISABLED" in rule_ids
+    assert "POSTURE_HSTS" in rule_ids          # posture fallito → fix nel bundle
+    assert "MISSING_CSP" not in rule_ids and "POSTURE_CSP" not in rule_ids   # passato → niente

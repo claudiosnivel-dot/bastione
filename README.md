@@ -24,9 +24,15 @@ propositi:
 
 ## Stato
 
-**Milestone M0** — vista read-only dell'attaccante. In corso di costruzione (build
-order in `BASTIONE-SESSION-STATE.md` §2). In M0 è **tutto read-only**: nessuna
-scrittura, le scritture canary sono M2.
+Stato per milestone in `BASTIONE-SESSION-STATE.md`. Read-only di default: le uniche
+scritture sono il canary §11.2 (M2), `idor` WRITE e `zap_active` (M4), tutte gated.
+
+**M5 (2026):** il recon riconosce le chiavi `sb_publishable_`/`sb_secret_`; sonde
+Supabase storage/RPC/auth/GraphQL (PROBE, oracle-first: un'apertura è un finding solo
+se viola un'attesa dichiarata nel TOML); catalogo segreti esteso con liveness presso i
+provider; `toolcheck` fail-closed sulle versioni dei tool (trivy ≥0.72, nuclei ≥3.10);
+il fix-plan consuma anche i posture falliti; in CI dipendenze installate dal
+`requirements.lock` con hash.
 
 ## Requisiti & setup
 

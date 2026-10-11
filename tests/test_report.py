@@ -5,6 +5,8 @@ Verifichiamo che `to_markdown` produca:
 - sezione NEW (in testa, con i finding NEW) e DRIFT (posture check con drift=True);
 - sezione KNOWN (finding known/accepted);
 - sezione FIXED (vittorie);
+- sezione "Limiti di verifica (§26)" (M5/R6): i finding INFO che dichiarano ciò che
+  Bastione NON ha potuto verificare (`*_SKIPPED`, `*_NOT_VERIFIABLE`, ...);
 - checklist posture (passed/failed) con icona;
 - icona di drift evidente sui check regrediti;
 - evidence mostrata così com'è (già redatta), senza de-redazione.
@@ -14,9 +16,11 @@ Tutti test OFFLINE: nessuna rete, oggetti sintetici coi veri tipi pydantic.
 
 from __future__ import annotations
 
+import pytest
+
 from bastione.enums import Confidence, Severity, Status
 from bastione.models import Finding, Location, PostureCheck
-from bastione.report.markdown import to_markdown
+from bastione.report.markdown import is_verification_limit, to_markdown
 
 
 # ─── Fixture sintetiche ──────────────────────────────────────────────────────
@@ -357,3 +361,143 @@ def test_report_senza_finding_non_crasha():
     )
     assert "vuoto.it" in md
     assert "100.0" in md or "100" in md
+
+
+# ─── Limiti di verifica (§26 / R6) ───────────────────────────────────────────
+# Onestà difensiva: ciò che Bastione NON ha potuto verificare (i `*_SKIPPED` e gli
+# INFO "non determinabile / non dichiarato") va reso ESPLICITO nel report, in una
+# sezione dedicata — mai silenzio, e mai presentato come difetto.
+
+def _f(rule_id, sev=Severity.INFO, status=Status.NEW, *, title=None, evidence="e"):
+    return Finding(finding_id=rule_id, module="m", rule_id=rule_id, title=title or rule_id,
+                   severity=sev, confidence=Confidence.TENTATIVE, target="t",
+                   location=Location(), evidence=evidence, description="d", status=status)
+
+
+def _md_limiti(**kwargs) -> str:
+    """Report MD con i soli `findings` dati (resto neutro)."""
+    defaults: dict = dict(target="t", posture_score=100.0, findings=[], fixed=[],
+                          posture_checks=[], counts={})
+    defaults.update(kwargs)
+    return to_markdown(**defaults)
+
+
+def _sezione_limiti_md(md: str) -> str:
+    """Testo della sezione 'Limiti di verifica' (dal suo header al prossimo '## ')."""
+    inizio = md.index("## Limiti di verifica")
+    resto = md[inizio + 3:]
+    fine = resto.find("\n## ")
+    return resto if fine == -1 else resto[:fine]
+
+
+def test_is_verification_limit_predicate():
+    assert is_verification_limit(_f("NUCLEI_SKIPPED"))
+    assert is_verification_limit(_f("RPC_NOT_VERIFIABLE"))
+    assert is_verification_limit(_f("AUTH_EXPECTATION_UNDECLARED"))
+    assert not is_verification_limit(_f("RLS_DISABLED", sev=Severity.CRITICAL))
+
+
+@pytest.mark.parametrize("rule_id", [
+    # per suffisso
+    "NUCLEI_SKIPPED", "TRIVY_SKIPPED", "ZAP_ACTIVE_SKIPPED",
+    "SUPABASE_KEY_NOT_FOUND", "SUPABASE_URL_NOT_FOUND",
+    "AUTH_SETTINGS_NOT_READABLE", "SUPABASE_SCHEMA_NOT_ENUMERABLE",
+    "RPC_NOT_VERIFIABLE", "AUTH_EXPECTATION_UNDECLARED", "STORAGE_LISTABLE_UNDECLARED",
+    "TLS_UNDETERMINED", "STORAGE_NOT_VERIFIABLE", "SUPABASE_GRAPHQL_NOT_VERIFIABLE",
+    # SKIPPED come infisso (corsie MUTATING)
+    "CANARY_SKIPPED_NO_SCHEMA", "IDOR_WRITE_SKIPPED_NO_CANARY",
+    # per rule_id esplicito
+    "SUPABASE_SCHEMA_VIA_BUNDLE", "SUPABASE_LEGACY_KEYS_IN_USE", "SUPABASE_JWT_LEGACY_HS256",
+    "MODULE_ERROR",
+])
+def test_is_verification_limit_riconosce_i_limiti_info(rule_id):
+    assert is_verification_limit(_f(rule_id))
+
+
+@pytest.mark.parametrize("sev", [Severity.LOW, Severity.MEDIUM, Severity.HIGH, Severity.CRITICAL])
+@pytest.mark.parametrize("rule_id", ["NUCLEI_SKIPPED", "SUPABASE_JWT_LEGACY_HS256"])
+def test_is_verification_limit_solo_se_info(rule_id, sev):
+    """Un limite è un INFO onesto, non un difetto: sopra INFO non è mai un limite."""
+    assert not is_verification_limit(_f(rule_id, sev=sev))
+
+
+@pytest.mark.parametrize("rule_id", ["RLS_DISABLED", "SECRET_SERVICE_ROLE", "POSTURE_HSTS"])
+def test_is_verification_limit_guarda_il_rule_id_non_solo_la_severita(rule_id):
+    """INFO da solo non basta: un INFO ordinario (rule_id non-limite) non è un limite."""
+    assert not is_verification_limit(_f(rule_id, sev=Severity.INFO))
+
+
+def test_markdown_has_limits_section():
+    md = to_markdown(target="t", posture_score=100.0,
+                     findings=[_f("RPC_NOT_VERIFIABLE"), _f("RLS_DISABLED", Severity.CRITICAL)],
+                     fixed=[], posture_checks=[], counts={})
+    assert "Limiti di verifica" in md and "RPC_NOT_VERIFIABLE" in md
+
+
+def test_markdown_limiti_elenca_rule_id_titolo_ed_evidence():
+    md = _md_limiti(findings=[
+        _f("RPC_NOT_VERIFIABLE", title="RPC non verificabile", evidence="endpoint /rest/v1/rpc/x")])
+    sezione = _sezione_limiti_md(md)
+    assert "RPC_NOT_VERIFIABLE" in sezione
+    assert "RPC non verificabile" in sezione
+    assert "endpoint /rest/v1/rpc/x" in sezione
+
+
+def test_markdown_limiti_non_include_i_difetti():
+    """Nella sezione compaiono SOLO i limiti: un difetto resta nelle sue sezioni."""
+    md = _md_limiti(findings=[
+        _f("RPC_NOT_VERIFIABLE"),
+        _f("RLS_DISABLED", Severity.CRITICAL, title="Difetto-RLS"),
+        _f("SECRET_FOO", Severity.INFO, title="Info-ordinario"),
+    ])
+    sezione = _sezione_limiti_md(md)
+    assert "RPC_NOT_VERIFIABLE" in sezione
+    assert "RLS_DISABLED" not in sezione and "Difetto-RLS" not in sezione
+    assert "SECRET_FOO" not in sezione and "Info-ordinario" not in sezione
+
+
+def test_markdown_limiti_assente_se_nessun_limite():
+    """Senza limiti niente sezione vuota né intestazione orfana."""
+    md = _md_limiti(findings=[_f("RLS_DISABLED", Severity.CRITICAL), _f("SECRET_FOO")])
+    assert "Limiti di verifica" not in md
+
+
+def test_markdown_limiti_assente_senza_finding():
+    assert "Limiti di verifica" not in _md_limiti(findings=[])
+
+
+def test_markdown_limiti_dopo_fixed_e_prima_della_checklist_posture():
+    md = _md_limiti(findings=[_f("NUCLEI_SKIPPED")],
+                    fixed=[make_finding(finding_id="fix01", status=Status.FIXED)],
+                    posture_checks=[make_posture(passed=True)])
+    pos_fixed = md.index("## FIXED")
+    pos_limiti = md.index("## Limiti di verifica")
+    pos_posture = md.index("## Checklist Posture")
+    assert pos_fixed < pos_limiti < pos_posture
+
+
+def test_markdown_limiti_include_anche_i_finding_known_e_accepted():
+    """Il limite è una proprietà della run, non del delta: vale per ogni status emesso."""
+    md = _md_limiti(findings=[
+        _f("NUCLEI_SKIPPED", status=Status.KNOWN),
+        _f("TRIVY_SKIPPED", status=Status.ACCEPTED),
+    ])
+    sezione = _sezione_limiti_md(md)
+    assert "NUCLEI_SKIPPED" in sezione and "TRIVY_SKIPPED" in sezione
+
+
+def test_markdown_limiti_non_elenca_un_limite_fixed():
+    """Un limite FIXED non si applica più a questa run: non va dichiarato come limite."""
+    md = _md_limiti(
+        findings=[_f("NUCLEI_SKIPPED")],
+        fixed=[_f("TRIVY_SKIPPED", status=Status.FIXED)],
+    )
+    sezione = _sezione_limiti_md(md)
+    assert "NUCLEI_SKIPPED" in sezione
+    assert "TRIVY_SKIPPED" not in sezione
+
+
+def test_markdown_limiti_evidence_redatta_mostrata_tale_quale():
+    """P8: l'evidence (già redatta a monte) compare invariata anche nei limiti."""
+    md = _md_limiti(findings=[_f("RPC_NOT_VERIFIABLE", evidence="[REDACTED:SECRET_KEY]")])
+    assert "[REDACTED:SECRET_KEY]" in _sezione_limiti_md(md)

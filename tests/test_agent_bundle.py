@@ -18,7 +18,7 @@ Tutti i test sono OFFLINE e deterministici: `now` e `run_dir` sono passati, mai
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -30,6 +30,7 @@ from bastione.models import (
     FixType,
     Finding,
     Location,
+    PostureCheck,
     TargetConfig,
 )
 from bastione.remediation import agent_bundle as ab
@@ -598,3 +599,72 @@ def test_fix_plan_md_rollback_multilinea_reso_in_fenced_block():
     for sql_line in rls.instructions["rollback_sql"].splitlines():
         if sql_line.strip():
             assert f"  {sql_line}" in md
+
+
+# ─── M5 (§4.8): posture consumate + rotazioni M5 + RLS/GRANT ──────────────────
+# Helper locali rinominati (`_m5`) per non adombrare il `_cfg`/`NOW` del resto del
+# file (il `_cfg` esistente ha firma e name diversi: la ridefinizione romperebbe i
+# test che asseriscono `plan.target == "gestionale"`).
+
+def _cfg_m5() -> TargetConfig:
+    return TargetConfig(name="t", base_url="https://s.example", environment="staging",
+                        ownership="owned")
+
+
+def _now_m5() -> datetime:
+    return datetime(2026, 10, 11, tzinfo=timezone.utc)
+
+
+def test_failed_posture_hsts_becomes_fix():
+    pc = PostureCheck(check_id="POSTURE_HSTS", title="HSTS mancante", passed=False,
+                      severity_if_failed=Severity.MEDIUM, target="t", detail="assente")
+    plan = ab.build_fix_plan([], _cfg_m5(), now=_now_m5(), run_dir="r", posture_checks=[pc])
+    assert any(fx.rule_id == "POSTURE_HSTS" for fx in plan.fixes)
+
+
+def test_posture_csp_aliases_to_missing_csp():
+    pc = PostureCheck(check_id="POSTURE_CSP", title="CSP mancante", passed=False,
+                      severity_if_failed=Severity.MEDIUM, target="t", detail="assente")
+    plan = ab.build_fix_plan([], _cfg_m5(), now=_now_m5(), run_dir="r", posture_checks=[pc])
+    assert len(plan.fixes) == 1 and plan.fixes[0].fix_type.value == "config_change"
+
+
+def test_passed_posture_ignored():
+    pc = PostureCheck(check_id="POSTURE_HSTS", title="ok", passed=True,
+                      severity_if_failed=Severity.MEDIUM, target="t", detail="presente")
+    assert ab.build_fix_plan([], _cfg_m5(), now=_now_m5(), run_dir="r", posture_checks=[pc]).fixes == []
+
+
+def test_rls_migration_includes_grant():
+    f = Finding(finding_id="a"*16, module="supabase", rule_id="RLS_DISABLED", title="RLS",
+                severity=Severity.CRITICAL, confidence=Confidence.FIRM, target="t",
+                location=Location(endpoint="/rest/v1/clienti"), evidence="1 riga",
+                description="", status=Status.NEW)
+    plan = ab.build_fix_plan([f], _cfg_m5(), now=_now_m5(), run_dir="r")
+    sql = plan.fixes[0].instructions["migration_sql"]
+    # lo statement eseguibile, non il solo commento esplicativo
+    assert "EXECUTE $q$GRANT SELECT ON public.clienti TO authenticated$q$" in sql
+    # rollback: la tabella era già leggibile (aveva i GRANT) → niente REVOKE
+    assert "REVOKE" not in plan.fixes[0].instructions["rollback_sql"]
+
+
+def test_posture_csp_and_real_missing_csp_dedup_to_one_fix():
+    """Alias: un Finding MISSING_CSP reale e un PostureCheck POSTURE_CSP fallito sono
+    lo stesso fix → un'unica voce nel bundle."""
+    f = Finding(finding_id="c"*16, module="headers", rule_id="MISSING_CSP", title="CSP",
+                severity=Severity.HIGH, confidence=Confidence.FIRM, target="t",
+                location=Location(), evidence="assente", description="", status=Status.NEW)
+    pc = PostureCheck(check_id="POSTURE_CSP", title="CSP mancante", passed=False,
+                      severity_if_failed=Severity.HIGH, target="t", detail="assente")
+    plan = ab.build_fix_plan([f], _cfg_m5(), now=_now_m5(), run_dir="r", posture_checks=[pc])
+    assert len(plan.fixes) == 1
+
+
+def test_new_secret_rotation_builder():
+    f = Finding(finding_id="b"*16, module="secrets", rule_id="SECRET_OPENAI", title="OpenAI",
+                severity=Severity.HIGH, confidence=Confidence.FIRM, target="t",
+                location=Location(file="app.js"), evidence="sk-...", description="", status=Status.NEW)
+    plan = ab.build_fix_plan([f], _cfg_m5(), now=_now_m5(), run_dir="r")
+    fx = plan.fixes[0]
+    assert fx.fix_type.value == "secret_rotation" and fx.priority == 1
+    assert fx.applicable_by.value == "agent+human"

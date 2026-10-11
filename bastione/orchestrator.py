@@ -658,6 +658,8 @@ class Orchestrator:
             self._cfg,
             now=self._now(),
             run_dir=str(self._run_dir),
+            # M5 (§4.8): anche i posture FALLITI diventano fix verificabili.
+            posture_checks=self._result.posture_checks,
         )
         write_fix_bundle(plan, self._run_dir)
         log.info("REMEDIATE: bundle fix/ generato (%d fix) in %s",

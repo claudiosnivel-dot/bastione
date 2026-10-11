@@ -16,7 +16,10 @@ Sezioni del documento:
      DRIFT — posture check con drift=True (regressioni da baseline).
   3. KNOWN — finding con status KNOWN o ACCEPTED (già noti, monitorati).
   4. FIXED — finding risolti rispetto alla baseline (vittorie).
-  5. Checklist posture — tutti i PostureCheck con icona verde/rossa.
+  5. Limiti di verifica (§26) — ciò che Bastione NON ha potuto verificare in questa
+     run (i `*_SKIPPED` e gli INFO "non determinabile / non dichiarato", R6): onestà
+     difensiva, resa esplicita invece di tacere. Assente se non ci sono limiti.
+  6. Checklist posture — tutti i PostureCheck con icona verde/rossa.
 """
 
 from __future__ import annotations
@@ -90,7 +93,10 @@ def to_markdown(
     # ── 4. FIXED (vittorie — risolti rispetto alla baseline) ──────────────────
     sezioni.append(_sezione_fixed(fixed))
 
-    # ── 5. Checklist posture (tutti i check, con icona) ───────────────────────
+    # ── 5. Limiti di verifica (§26/R6 — ciò che NON è stato verificato) ───────
+    sezioni.append(_sezione_limiti(findings))
+
+    # ── 6. Checklist posture (tutti i check, con icona) ───────────────────────
     sezioni.append(_checklist_posture(posture_checks))
 
     return "\n\n".join(s for s in sezioni if s) + "\n"
@@ -192,6 +198,45 @@ def _no_playbook(rule_id: str | None, context: dict) -> None:
     """Renderer no-op (§18): per le sezioni dove il playbook non va iniettato
     (es. FIXED, già risolti)."""
     return None
+
+
+# ─── Limiti di verifica (§26 / R6) ────────────────────────────────────────────
+
+# Suffissi/rule_id che denotano un LIMITE di verifica (R6/§26): non un difetto, ma
+# qualcosa che Bastione NON ha potuto verificare.
+_LIMIT_SUFFIXES = ("_SKIPPED", "_NOT_FOUND", "_NOT_READABLE", "_NOT_ENUMERABLE",
+                   "_NOT_VERIFIABLE", "_UNDECLARED", "_UNDETERMINED")
+_LIMIT_RULE_IDS = {"SUPABASE_SCHEMA_VIA_BUNDLE", "SUPABASE_LEGACY_KEYS_IN_USE",
+                   "SUPABASE_JWT_LEGACY_HS256",
+                   # un modulo fallito non ha verificato nulla (§4.7)
+                   "MODULE_ERROR"}
+# SKIPPED anche come INFISSO: CANARY_SKIPPED_NO_SCHEMA, IDOR_WRITE_SKIPPED_NO_CANARY…
+_LIMIT_INFIX = "_SKIPPED_"
+
+
+def is_verification_limit(f: Finding) -> bool:
+    """True se il finding è un LIMITE di verifica onesto (INFO), non un difetto (§26)."""
+    if f.severity is not Severity.INFO:
+        return False
+    return (f.rule_id in _LIMIT_RULE_IDS or f.rule_id.endswith(_LIMIT_SUFFIXES)
+            or _LIMIT_INFIX in f.rule_id)
+
+
+def _sezione_limiti(findings: list[Finding]) -> str:
+    """Sezione "Limiti di verifica (§26)": ciò che Bastione NON ha potuto verificare.
+
+    Ritorna stringa vuota se non ci sono limiti (nessuna sezione orfana: il join di
+    `to_markdown` scarta le sezioni vuote). L'evidence è mostrata così com'è, già
+    redatta a monte (P8)."""
+    limiti = [f for f in findings if is_verification_limit(f)]
+    if not limiti:
+        return ""
+    righe = ["## Limiti di verifica (§26)",
+             "_Ciò che Bastione **non** ha potuto verificare in questa run (onestà difensiva R6):_",
+             ""]
+    for f in limiti:
+        righe.append(f"- ⚠️ **{f.rule_id}** — {f.title}: {f.evidence}")
+    return "\n".join(righe)
 
 
 # ─── Checklist posture ────────────────────────────────────────────────────────

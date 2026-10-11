@@ -37,13 +37,15 @@ import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from bastione.enums import Severity, Status
+from bastione.enums import Confidence, Severity, Status
 from bastione.models import (
     Applicability,
     FixEntry,
     FixPlan,
     FixType,
     Finding,
+    Location,
+    PostureCheck,
     TargetConfig,
     Verification,
 )
@@ -225,6 +227,8 @@ class RlsDisabledFix(FixBuilder):
             f"    EXECUTE $q$ALTER TABLE public.{table} ENABLE ROW LEVEL SECURITY$q$;\n"
             f"    EXECUTE $q$CREATE POLICY sel_own ON public.{table} "
             f"FOR SELECT USING (auth.uid() = user_id)$q$;\n"
+            f"    -- 30/10/2026: niente GRANT automatici sulle tabelle nuove → GRANT esplicito\n"
+            f"    EXECUTE $q$GRANT SELECT ON public.{table} TO authenticated$q$;\n"
             f"  ELSIF v_relkind IN ('v', 'm') THEN\n"
             f"    -- Vista/matview: niente RLS sulla relazione; si forza security_invoker\n"
             f"    -- così la vista eredita la RLS delle tabelle sorgente. La clausola vale\n"
@@ -246,7 +250,8 @@ class RlsDisabledFix(FixBuilder):
             f"$do$;"
         )
         # Rollback view-aware e idempotente: anch'esso ramifica sul relkind. Per la
-        # tabella rimuove la policy (DROP POLICY IF EXISTS — no-op se assente); per la
+        # tabella rimuove la policy (DROP POLICY IF EXISTS — no-op se assente; il GRANT
+        # resta, vedi il commento nell'SQL); per la
         # vista resetta la storage option security_invoker (RESET, guardato in un BEGIN
         # con EXCEPTION così non crasha se non applicabile). Resta un blocco DO.
         rollback_sql = (
@@ -262,6 +267,9 @@ class RlsDisabledFix(FixBuilder):
             f"\n"
             f"  IF v_relkind = 'r' THEN\n"
             f"    EXECUTE $q$DROP POLICY IF EXISTS sel_own ON public.{table}$q$;\n"
+            f"    -- Il GRANT SELECT ad authenticated NON si revoca: una tabella leggibile\n"
+            f"    -- dall'anon (RLS_DISABLED) aveva già i GRANT prima della migration —\n"
+            f"    -- revocarlo romperebbe l'accesso autenticato preesistente.\n"
             f"  ELSIF v_relkind IN ('v', 'm') THEN\n"
             f"    BEGIN\n"
             f"      EXECUTE $q$ALTER VIEW public.{table} RESET (security_invoker)$q$;\n"
@@ -427,6 +435,49 @@ class StripeKeyRotationFix(_SecretRotationFix):
     )
 
 
+# Rotazioni dei segreti M5 (§4.4): remediation = rotazione (umano) + spostamento
+# lato server. Registrazione data-driven per non ripetere la stessa classe.
+_M5_ROTATIONS = [
+    ("SECRET_SUPABASE_SECRET_KEY", "supabase", "secret key (sb_secret_)",
+     "Supabase → Project Settings → API keys → rigenera la secret key e revoca quella attuale.",
+     "Sposta la nuova chiave in env server-side; mai nel client. Usa la publishable nel frontend."),
+    ("SECRET_OPENAI", "openai", "API key",
+     "OpenAI → dashboard → API keys → revoca e rigenera la chiave esposta.",
+     "Sposta la chiave in env server-side; il client non chiama OpenAI direttamente."),
+    ("SECRET_ANTHROPIC", "anthropic", "API key",
+     "Anthropic Console → API Keys → revoca e rigenera la chiave esposta.",
+     "Sposta la chiave in env server-side; nessuna chiamata diretta dal client."),
+    ("SECRET_GITHUB", "github", "token",
+     "GitHub → Settings → Developer settings → revoca il token esposto e rigeneralo con scope minimo.",
+     "Sposta il token nei secret CI/env server; mai nel repo o nel bundle."),
+    ("SECRET_NPM", "npm", "token",
+     "npm → Access Tokens → revoca il token esposto e creane uno nuovo (read-only se basta).",
+     "Usa il token solo in CI via secret; rimuovilo da codice/.npmrc committati."),
+    ("SECRET_UPSTASH", "upstash", "REST token",
+     "Upstash → database → Details → rigenera il REST token.",
+     "Sposta URL+token in env server-side; non esporli nel client."),
+    ("SECRET_AWS_AKIA", "aws", "access key",
+     "AWS IAM → disattiva/elimina la access key esposta e creane una nuova con permessi minimi.",
+     "Usa ruoli/ambiente server; mai access key nel client o nel repo."),
+    ("SECRET_TELEGRAM_BOT", "telegram", "bot token",
+     "Telegram @BotFather → /revoke per il bot e genera un nuovo token.",
+     "Custodisci il token in env server-side; il bot risponde da un backend."),
+    ("SECRET_GOOGLE_API_KEY", "google", "API key",
+     "Google Cloud Console → Credentials → revoca la chiave e creane una ristretta (referrer/API).",
+     "Restringi la chiave e spostala server-side dove possibile."),
+    ("SECRET_PRIVATE_KEY", "generic", "private key",
+     "Revoca/ruota la chiave privata presso il suo emittente e rigenera la coppia.",
+     "Conserva la chiave privata solo lato server (secret manager), mai nel repo/bundle."),
+]
+for _rid, _prov, _kn, _ha, _af in _M5_ROTATIONS:
+    register_fix(type(f"_Rotation_{_rid}", (_SecretRotationFix,), {
+        "rule_id": _rid, "provider": _prov, "key_name": _kn,
+        "human_action": _ha, "agent_followup": _af,
+        "warning": "La chiave trapelata è COMPROMESSA: rimuoverla dal codice NON basta, "
+                   "va ruotata presso il provider (passo umano).",
+    }))
+
+
 # ─── Costruzione del piano (§18-bis.2/.4/.5) ──────────────────────────────────
 
 def _is_open(f: Finding) -> bool:
@@ -502,19 +553,60 @@ def _build_summary(fixes: list[FixEntry]) -> dict:
     }
 
 
+# Alias di rule_id → builder (§4.8): una posture fallita il cui check_id non ha un
+# builder omonimo viene instradata al builder equivalente. `POSTURE_HSTS` ha già il
+# suo builder (HstsFix); `POSTURE_CSP` riusa il `MissingCspFix`.
+_RULE_ALIASES = {"POSTURE_CSP": "MISSING_CSP"}
+
+
+def _finding_from_posture(c: PostureCheck) -> Finding:
+    """Sintetizza un ``Finding`` NEW da un ``PostureCheck`` FALLITO, così passa per lo
+    stesso loop di ``FixBuilder`` (§4.8).
+
+    ``severity`` = ``severity_if_failed``; ``location`` vuota (una posture non ha
+    endpoint/tabella propri → nel bundle resource/endpoint/file restano ``None``).
+    """
+    return Finding(
+        finding_id=f"posture:{c.check_id}",
+        module="posture",
+        rule_id=c.check_id,
+        title=c.title,
+        severity=c.severity_if_failed,
+        confidence=Confidence.FIRM,
+        target=c.target,
+        location=Location(),
+        evidence=c.detail,
+        description=c.detail,
+        remediation_ref=c.remediation_ref,
+        status=Status.NEW,
+    )
+
+
+def _builder_for(rule_id: str):
+    """Builder registrato per ``rule_id``, con fallback sugli alias (§4.8)."""
+    return FIX_BUILDERS.get(rule_id) or FIX_BUILDERS.get(_RULE_ALIASES.get(rule_id, ""))
+
+
 def build_fix_plan(
     findings: list[Finding],
     cfg: TargetConfig,
     *,
     now,
     run_dir: str,
+    posture_checks: list[PostureCheck] | None = None,
 ) -> FixPlan:
     """Costruisce il ``FixPlan`` dai finding aperti con un builder registrato (§18-bis).
 
     - Filtra i finding APERTI (``NEW``/``KNOWN``; mai ``ACCEPTED``/``FIXED``, §18-bis.2).
-    - Per ogni finding con un ``FixBuilder`` registrato per il suo ``rule_id`` costruisce
-      la ``FixEntry``; un ``rule_id`` senza builder è semplicemente saltato (il finding
-      resta nel report, solo senza voce nel bundle).
+    - Consuma anche i ``posture_checks`` FALLITI (``passed=False``, §4.8): ognuno è
+      sintetizzato in un ``Finding`` NEW (``rule_id=check_id``, ``severity=severity_if_failed``)
+      e passa per lo stesso loop di builder. Keyword-only con default ``None`` → i
+      chiamanti esistenti non si rompono finché Task 24 non lo valorizza.
+    - Per ogni finding con un ``FixBuilder`` registrato per il suo ``rule_id`` (o un
+      alias, ``_RULE_ALIASES``) costruisce la ``FixEntry``; un ``rule_id`` senza builder
+      è semplicemente saltato (il finding resta nel report, solo senza voce nel bundle).
+    - Dedup: un fix già prodotto da un Finding reale non viene duplicato dalla posture
+      (chiave ``(rule_id, resource, endpoint, file)``).
     - Resiliente (§4.7): un builder che solleva viene loggato e saltato, non crasha.
     - Ordina per priority poi severity desc, rispettando ``depends_on`` (un fix non
       è mai prima di una sua dipendenza, §18-bis.5); ``secret_rotation`` resta
@@ -525,23 +617,39 @@ def build_fix_plan(
     nessun ``datetime.now()`` reale qui.
     """
     fixes: list[FixEntry] = []
-    for f in findings:
+    seen: set[tuple] = set()
+
+    def _add(f: Finding) -> None:
         if not _is_open(f):
-            continue
-        builder = FIX_BUILDERS.get(f.rule_id)
+            return
+        builder = _builder_for(f.rule_id)
         if builder is None:
             log.debug(
                 "Nessun FixBuilder per rule_id=%r (finding %s): salto (§4.7).",
                 f.rule_id, f.finding_id,
             )
-            continue
+            return
         try:
-            fixes.append(builder.build(f, cfg))
+            fe = builder.build(f, cfg)
         except Exception as exc:  # noqa: BLE001 — resilienza §4.7: mai crash dal builder
             log.warning(
                 "FixBuilder %r ha sollevato sul finding %s: salto. (%s)",
                 f.rule_id, f.finding_id, exc,
             )
+            return
+        # rule_id CANONICO (alias risolto): POSTURE_CSP e MISSING_CSP sono lo stesso fix.
+        key = (_RULE_ALIASES.get(fe.rule_id, fe.rule_id), fe.context.get("resource"),
+               fe.context.get("endpoint"), fe.context.get("file"))
+        if key in seen:
+            return  # dedup: un fix identico da Finding+posture non si duplica
+        seen.add(key)
+        fixes.append(fe)
+
+    for f in findings:
+        _add(f)
+    for c in (posture_checks or []):
+        if not c.passed:
+            _add(_finding_from_posture(c))
 
     fixes = _order_fixes(fixes)
     return FixPlan(

@@ -11,7 +11,9 @@ per stato/severità. Verifichiamo:
   verso http, img esterne) — CSS e JS sono INLINE;
 - ESCAPING/XSS (CRITICO): ogni valore dinamico è HTML-escapato; un payload
   `<script>`/`onerror=` nel contenuto NON compare come HTML attivo;
-- filtri: marcatori dati (data-status/data-severity) presenti per pilotare il JS.
+- filtri: marcatori dati (data-status/data-severity) presenti per pilotare il JS;
+- sezione "Limiti di verifica (§26)" (M5/R6): ciò che Bastione NON ha potuto
+  verificare, stesso contenuto del MD, con ogni valore escapato (XSS).
 
 Tutti i test sono OFFLINE: oggetti sintetici coi veri tipi pydantic.
 """
@@ -23,6 +25,7 @@ import re
 from bastione.enums import Confidence, Severity, Status
 from bastione.models import Finding, Location, PostureCheck
 from bastione.report.html import to_html
+from bastione.report.markdown import to_markdown
 
 
 # ─── Fixture sintetiche ──────────────────────────────────────────────────────
@@ -493,3 +496,150 @@ def test_nessun_payload_attivo_globale():
     assert "alert(1)" not in re.sub(r"&lt;|&gt;|&quot;|&#x27;|&amp;", "", html) or \
         _XSS not in html
     assert _XSS not in html
+
+
+# ─── Limiti di verifica (§26 / R6) ───────────────────────────────────────────
+# Onestà difensiva: ciò che Bastione NON ha potuto verificare (i `*_SKIPPED` e gli
+# INFO "non determinabile / non dichiarato") è reso ESPLICITO in una sezione
+# dedicata, con lo stesso contenuto del MD. È un sink BROWSER: ogni valore escapato.
+
+def _limite(rule_id: str = "RPC_NOT_VERIFIABLE", **kw) -> Finding:
+    """Finding INFO che dichiara un limite di verifica (§26)."""
+    kw.setdefault("severity", Severity.INFO)
+    kw.setdefault("remediation_ref", None)
+    return make_finding(rule_id=rule_id, **kw)
+
+
+def _sezione_limiti_html(html: str) -> str:
+    """Contenuto della <section class="limiti"> (i valori dinamici sono escapati,
+    quindi non contengono mai un '</section>' spurio)."""
+    m = re.search(r'<section class="limiti">(.*?)</section>', html, re.DOTALL)
+    assert m, "sezione 'Limiti di verifica' non trovata"
+    return m.group(1)
+
+
+def test_html_ha_la_sezione_limiti_di_verifica():
+    html = _build_html(findings=[
+        _limite("RPC_NOT_VERIFIABLE"),
+        make_finding(rule_id="RLS_DISABLED", severity=Severity.CRITICAL),
+    ])
+    assert "Limiti di verifica" in html
+    assert "RPC_NOT_VERIFIABLE" in _sezione_limiti_html(html)
+
+
+def test_html_limiti_elenca_rule_id_titolo_ed_evidence():
+    html = _build_html(findings=[
+        _limite("RPC_NOT_VERIFIABLE", title="RPC non verificabile",
+                evidence="endpoint /rest/v1/rpc/x"),
+    ])
+    sezione = _sezione_limiti_html(html)
+    assert "RPC_NOT_VERIFIABLE" in sezione
+    assert "RPC non verificabile" in sezione
+    assert "endpoint /rest/v1/rpc/x" in sezione
+
+
+def test_html_limiti_non_include_i_difetti():
+    """Nella sezione compaiono SOLO i limiti: un difetto resta nelle sue sezioni."""
+    html = _build_html(findings=[
+        _limite("RPC_NOT_VERIFIABLE"),
+        make_finding(rule_id="RLS_DISABLED", severity=Severity.CRITICAL, title="Difetto-RLS"),
+        _limite("SECRET_FOO", title="Info-ordinario"),
+    ])
+    sezione = _sezione_limiti_html(html)
+    assert "RPC_NOT_VERIFIABLE" in sezione
+    assert "RLS_DISABLED" not in sezione and "Difetto-RLS" not in sezione
+    assert "SECRET_FOO" not in sezione and "Info-ordinario" not in sezione
+
+
+def test_html_limiti_assente_se_nessun_limite():
+    """Senza limiti niente sezione vuota né intestazione orfana."""
+    default = _build_html()   # un solo finding RLS_DISABLED HIGH: non è un limite
+    assert "Limiti di verifica" not in default
+    assert 'class="limiti"' not in default
+    senza_finding = _build_html(findings=[])
+    assert "Limiti di verifica" not in senza_finding
+
+
+def test_html_limiti_dopo_fixed_e_prima_della_checklist_posture():
+    html = _build_html(findings=[_limite("NUCLEI_SKIPPED")])
+    pos_fixed = html.index('class="block block-fixed"')
+    pos_limiti = html.index('class="limiti"')
+    pos_posture = html.index('class="block block-posture"')
+    assert pos_fixed < pos_limiti < pos_posture
+
+
+def test_html_limiti_non_sono_card_filtrabili():
+    """I limiti restano SEMPRE visibili (onestà): non sono card `.finding` e non
+    portano data-status/data-severity, quindi i filtri JS non li nascondono."""
+    html = _build_html(findings=[_limite("NUCLEI_SKIPPED")])
+    sezione = _sezione_limiti_html(html)
+    assert 'class="finding' not in sezione
+    assert "data-status" not in sezione and "data-severity" not in sezione
+
+
+def test_html_limiti_include_anche_i_finding_known_e_accepted():
+    html = _build_html(findings=[
+        _limite("NUCLEI_SKIPPED", status=Status.KNOWN),
+        _limite("TRIVY_SKIPPED", status=Status.ACCEPTED),
+    ])
+    sezione = _sezione_limiti_html(html)
+    assert "NUCLEI_SKIPPED" in sezione and "TRIVY_SKIPPED" in sezione
+
+
+def test_html_limiti_non_elenca_un_limite_fixed():
+    """Un limite FIXED non si applica più a questa run: non va dichiarato come limite."""
+    html = _build_html(
+        findings=[_limite("NUCLEI_SKIPPED")],
+        fixed=[_limite("TRIVY_SKIPPED", finding_id="fix01", status=Status.FIXED)],
+    )
+    sezione = _sezione_limiti_html(html)
+    assert "NUCLEI_SKIPPED" in sezione
+    assert "TRIVY_SKIPPED" not in sezione
+
+
+def test_html_limiti_evidence_redatta_mostrata_tale_quale():
+    """P8: l'evidence (già redatta a monte) compare invariata (solo escapata)."""
+    html = _build_html(findings=[_limite("RPC_NOT_VERIFIABLE", evidence="[REDACTED:SECRET_KEY]")])
+    assert "[REDACTED:SECRET_KEY]" in _sezione_limiti_html(html)
+
+
+def test_xss_nei_limiti_di_verifica_e_escapato():
+    """rule_id, title ed evidence possono derivare dal target: nella sezione
+    Limiti di verifica un <script> non deve mai comparire come HTML attivo."""
+    finding = _limite(f"X{_XSS}_SKIPPED", title=_XSS, evidence=_XSS)
+    html = _build_html(findings=[finding])
+    sezione = _sezione_limiti_html(html)
+    assert _XSS not in sezione, "payload <script> grezzo nella sezione limiti: XSS!"
+    assert "&lt;script&gt;" in sezione, "il payload deve comparire escapato"
+    assert _XSS not in html
+
+
+def test_xss_in_contesto_attributo_nei_limiti_e_neutralizzato():
+    finding = _limite("NUCLEI_SKIPPED", title=_ATTR_XSS, evidence=_ATTR_XSS)
+    html = _build_html(findings=[finding])
+    sezione = _sezione_limiti_html(html)
+    assert "<img src=x onerror=" not in sezione
+    assert "&lt;img" in sezione
+    assert "<img src=x onerror=" not in html
+
+
+def test_html_e_markdown_elencano_gli_stessi_limiti():
+    """Stesso CONTENUTO delle due rese (§23): gli stessi rule_id, nello stesso ordine."""
+    findings = [
+        _limite("NUCLEI_SKIPPED"),
+        make_finding(rule_id="RLS_DISABLED", severity=Severity.CRITICAL),
+        _limite("RPC_NOT_VERIFIABLE"),
+        _limite("SUPABASE_JWT_LEGACY_HS256"),
+    ]
+    args = dict(target="t", posture_score=100.0, findings=findings, fixed=[],
+                posture_checks=[], counts={})
+    md = to_markdown(**args)
+    html = to_html(**args)
+
+    md_sezione = md[md.index("## Limiti di verifica") + 3:].split("\n## ")[0]
+    ids_md = re.findall(r"^- ⚠️ \*\*(\w+)\*\*", md_sezione, re.MULTILINE)
+    ids_html = re.findall(r"<li>⚠️ <strong>(\w+)</strong>", _sezione_limiti_html(html))
+
+    atteso = ["NUCLEI_SKIPPED", "RPC_NOT_VERIFIABLE", "SUPABASE_JWT_LEGACY_HS256"]
+    assert ids_md == atteso
+    assert ids_html == atteso

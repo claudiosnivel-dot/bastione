@@ -7,8 +7,9 @@ e severità. È il formato condivisibile (§23 riga 899): un file solo, che si a
 offline identico.
 
 Specchio di `to_markdown` (§18/§23): stessa firma, stessi input, stesso ordine —
-header+score, NEW/DRIFT in testa, KNOWN, FIXED, checklist posture; ogni finding col
-suo playbook iniettabile (`render_playbook`, seam §18).
+header+score, NEW/DRIFT in testa, KNOWN, FIXED, limiti di verifica (§26, solo se ce
+ne sono), checklist posture; ogni finding col suo playbook iniettabile
+(`render_playbook`, seam §18).
 
 GUARDRAIL (LOCKED):
 
@@ -38,6 +39,7 @@ from typing import Callable
 from bastione.enums import Severity, Status
 from bastione.models import Finding, PostureCheck
 from bastione.remediation import playbooks
+from bastione.report.markdown import is_verification_limit
 
 log = logging.getLogger("bastione.report")
 
@@ -95,9 +97,10 @@ def to_html(
     corpo.append(_sezione_new(new_findings, drift_checks, render_playbook))
     corpo.append(_sezione_known(known_findings, render_playbook))
     corpo.append(_sezione_fixed(fixed))
+    corpo.append(_sezione_limiti_html(findings))   # §26/R6: vuota se nessun limite
     corpo.append(_checklist_posture(posture_checks))
 
-    main = "\n".join(corpo)
+    main = "\n".join(s for s in corpo if s)
     return (
         "<!doctype html>\n"
         '<html lang="it">\n'
@@ -300,6 +303,27 @@ def _sezione_fixed(fixed: list[Finding]) -> str:
 def _no_playbook(rule_id: str | None, context: dict) -> None:
     """Renderer no-op (§18): per le sezioni dove il playbook non va iniettato (FIXED)."""
     return None
+
+
+# ─── Limiti di verifica (§26 / R6) ────────────────────────────────────────────
+
+def _sezione_limiti_html(findings: list[Finding]) -> str:
+    """Sezione "Limiti di verifica (§26)": ciò che Bastione NON ha potuto verificare.
+
+    Stesso contenuto della sezione MD (stessa predicata `is_verification_limit`).
+    XSS GUARD (§23): rule_id, title ed evidence possono derivare dal target → ogni
+    valore dinamico passa per `_esc` (quote=True). Non sono card `.finding`: niente
+    `data-status`/`data-severity`, quindi i filtri JS non nascondono mai un limite.
+    Ritorna stringa vuota se non ci sono limiti (nessuna sezione orfana)."""
+    limiti = [f for f in findings if is_verification_limit(f)]
+    if not limiti:
+        return ""
+    items = "".join(
+        f"<li>⚠️ <strong>{_esc(f.rule_id)}</strong> — {_esc(f.title)}: {_esc(f.evidence)}</li>"
+        for f in limiti)
+    return ('<section class="limiti"><h2>Limiti di verifica (§26)</h2>'
+            '<p>Ciò che Bastione <em>non</em> ha potuto verificare (R6):</p>'
+            f'<ul>{items}</ul></section>')
 
 
 # ─── Checklist posture ────────────────────────────────────────────────────────
