@@ -54,6 +54,7 @@ def to_markdown(
     posture_checks: list[PostureCheck],
     counts: dict,
     render_playbook: PlaybookRenderer = playbooks.render_playbook,
+    not_reverified: list[Finding] | None = None,
 ) -> str:
     """Genera il report Markdown di una scan (§23).
 
@@ -68,6 +69,8 @@ def to_markdown(
                           context, ritorna il playbook Markdown renderizzato o `None`.
                           Default: il motore reale (`remediation.playbooks`). I test
                           passano una fake deterministica.
+        not_reverified  — (S16, R6) finding in baseline che questa run NON poteva
+                          ri-controllare: restano aperti, mai presentati come FIXED.
 
     Ritorna:
         Stringa Markdown UTF-8 pronta per essere scritta su file o inviata.
@@ -92,6 +95,9 @@ def to_markdown(
 
     # ── 4. FIXED (vittorie — risolti rispetto alla baseline) ──────────────────
     sezioni.append(_sezione_fixed(fixed))
+
+    # ── 4-bis. NON RI-VERIFICATI (S16, R6) — vuota se la run ha coperto tutto ─
+    sezioni.append(_sezione_non_riverificati(not_reverified or []))
 
     # ── 5. Limiti di verifica (§26/R6 — ciò che NON è stato verificato) ───────
     sezioni.append(_sezione_limiti(findings))
@@ -124,7 +130,10 @@ def _intestazione(target: str, posture_score: float, counts: dict) -> str:
         f"| NEW    | {counts.get('new', 0)} |\n"
         f"| KNOWN  | {counts.get('known', 0)} |\n"
         f"| FIXED  | {counts.get('fixed', 0)} |\n"
-        f"| DRIFT  | {counts.get('drift', 0)} |\n\n"
+        f"| DRIFT  | {counts.get('drift', 0)} |\n"
+        + (f"| NON RI-VERIFICATI | {counts['not_reverified']} |\n"
+           if counts.get("not_reverified") else "")
+        + "\n"
         f"**Per severità (finding emessi):**\n"
         f"{conteggi_sev}"
     )
@@ -198,6 +207,26 @@ def _no_playbook(rule_id: str | None, context: dict) -> None:
     """Renderer no-op (§18): per le sezioni dove il playbook non va iniettato
     (es. FIXED, già risolti)."""
     return None
+
+
+# ─── Sezione NON RI-VERIFICATI (S16, R6) ──────────────────────────────────────
+
+def _sezione_non_riverificati(items: list[Finding]) -> str:
+    """Finding in baseline non visti ora, ma che la run NON poteva ri-controllare
+    (livello d'intrusione più basso, modulo saltato o in errore). Non sono risolti:
+    dirlo sarebbe presentare come presente una protezione non verificata (R6)."""
+    if not items:
+        return ""
+    blocchi = [
+        "## NON RI-VERIFICATI — restano aperti",
+        "_Erano in baseline e non compaiono in questa run, ma questa run non poteva "
+        "ri-controllarli: **non sono risolti**. Rilancia con il livello indicato._",
+    ]
+    for f in items:
+        blocchi.append(
+            f"- `{f.rule_id}` (id `{f.finding_id}`, modulo `{f.module}`, stato "
+            f"{f.status.value.upper()}): {f.description}")
+    return "\n\n".join(blocchi)
 
 
 # ─── Limiti di verifica (§26 / R6) ────────────────────────────────────────────

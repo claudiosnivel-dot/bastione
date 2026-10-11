@@ -197,7 +197,8 @@ def _data_exposed_finding(name, cols, loc, target) -> Finding:
                      "L'anon legge dati che la RLS dovrebbe proteggere (§11.1.4). "
                      "(P8: solo i nomi colonna, mai i valori.)"),
         remediation_ref="RPC_DATA_EXPOSED", owasp=["A01:2021"],
-        gdpr_relevant=True, intrusion_used=IntrusionLevel.PROBE)
+        gdpr_relevant=True, intrusion_used=IntrusionLevel.PROBE,
+        verified_by=f"POSTURE_RPC_GATED_{name}")
 
 
 def _write_capable_finding(name, loc, target) -> Finding:
@@ -212,7 +213,7 @@ def _write_capable_finding(name, loc, target) -> Finding:
                      "In un contesto non-GET potrebbe scrivere: va limitata all'anon. "
                      "TENTATIVE — nessuna scrittura è stata eseguita (§4.0.3)."),
         remediation_ref="RPC_ANON_INVOCABLE", owasp=["A01:2021"],
-        intrusion_used=IntrusionLevel.PROBE)
+        intrusion_used=IntrusionLevel.PROBE, verified_by=f"POSTURE_RPC_GATED_{name}")
 
 
 def _invocable_finding(name, loc, target, *, declared: bool) -> Finding:
@@ -228,7 +229,7 @@ def _invocable_finding(name, loc, target, *, declared: bool) -> Finding:
         description=(f"La funzione '{name}' è eseguibile dall'anon ma non è dichiarata "
                      f"pubblica.{nudge} TENTATIVE: potrebbe essere voluta."),
         remediation_ref="RPC_ANON_INVOCABLE", owasp=["A01:2021"],
-        intrusion_used=IntrusionLevel.PROBE)
+        intrusion_used=IntrusionLevel.PROBE, verified_by=f"POSTURE_RPC_GATED_{name}")
 
 
 def _rpc_posture(name, target, passed, sev, detail) -> PostureCheck:

@@ -67,6 +67,10 @@ class Finding(BaseModel):
     gdpr_relevant: bool = False        # dati personali esposti? (rilevante per noi)
     cvss: float | None = None
     intrusion_used: IntrusionLevel = IntrusionLevel.READ_ONLY
+    # S16 (R6): check_id del PostureCheck che, se PASSA in una run successiva, prova
+    # la correzione. Se dichiarato, FIXED richiede quella prova positiva: la sola
+    # assenza del finding (asset non più testato, esito non conclusivo) non basta.
+    verified_by: str | None = None
     first_seen: datetime | None = None  # valorizzato in BASELINE
     last_seen: datetime | None = None
     status: Status = Status.NEW        # valorizzato in BASELINE

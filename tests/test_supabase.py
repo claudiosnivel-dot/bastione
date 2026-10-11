@@ -2162,3 +2162,103 @@ def test_submodule_gate_denial_propagates(monkeypatch):
                    ownership_verified=True)
     with pytest.raises(IntrusionDenied):
         supa.SupabaseModule().run(ctx)
+
+
+# ─── S16 (R6): esito RLS NON conclusivo → INFO, mai "RLS attiva" ────────────
+#
+# Prima: rete giù / 404 (tabella non esposta o nome sbagliato) / 5xx / body non
+# lista finivano nel ramo "protetto" con posture passed=True ("RLS attiva"): una
+# protezione mai verificata presentata come presente. Allineato a storage/RPC:
+# solo 200-lista-vuota, 401 e 403 provano che l'anon non legge.
+
+@pytest.mark.parametrize(
+    "status,payload",
+    [(None, None), (404, {"code": "PGRST205", "message": "Could not find the table"}),
+     (500, {"message": "boom"}), (200, {"not": "a list"}), (429, None)],
+    ids=["no-response", "404-not-exposed", "500", "200-non-list", "429"],
+)
+def test_rls_inconclusive_is_not_verifiable_never_protected(monkeypatch, status, payload):
+    schema = openapi_schema({"clienti": ["id", "email"]})
+
+    def router(url, headers):
+        if url.rstrip("/").endswith("/rest/v1"):
+            return fake_resp(status_code=200, payload=schema)
+        if status is None:
+            return None
+        return fake_resp(status_code=status, payload=payload)
+
+    monkeypatch.setattr(supa, "_get", router)
+    res = supa.SupabaseModule().run(make_ctx())
+
+    assert not [pc for pc in res.posture_checks if pc.check_id == "POSTURE_RLS_clienti"]
+    nv = [f for f in res.findings if f.rule_id == "RLS_NOT_VERIFIABLE"]
+    assert len(nv) == 1
+    f = nv[0]
+    assert f.severity is Severity.INFO
+    assert f.location.endpoint == "/rest/v1/clienti"
+    assert "clienti" in f.title
+    assert not [f for f in res.findings if f.rule_id == "RLS_DISABLED"]
+
+
+def test_rls_inconclusive_via_bundle_is_not_verifiable(monkeypatch):
+    # Path reale dei progetti moderni: OpenAPI chiusa (401) → tabelle dal bundle.
+    def router(url, headers):
+        if url.rstrip("/").endswith("/rest/v1"):
+            return fake_resp(status_code=401, payload={"message": "no"})
+        if "/rest/v1/fantasma?" in url:
+            return fake_resp(status_code=404, payload={"code": "PGRST205"})
+        if "/rest/v1/ordini?" in url:
+            return fake_resp(status_code=200, payload=[])
+        return None
+
+    monkeypatch.setattr(supa, "_get", router)
+    fp = make_fp(discovered_tables=["fantasma", "ordini"])
+    res = supa.SupabaseModule().run(make_ctx(fp=fp))
+    ids = {pc.check_id for pc in res.posture_checks}
+    assert "POSTURE_RLS_ordini" in ids              # 200 [] → protetta (invariato)
+    assert "POSTURE_RLS_fantasma" not in ids        # 404 → non verificata
+    assert [f.location.endpoint for f in res.findings
+            if f.rule_id == "RLS_NOT_VERIFIABLE"] == ["/rest/v1/fantasma"]
+
+
+# ─── S16 blind-review: un'eccezione non è silenzio (R6) ─────────────────────
+#
+# Un sottomodulo o il test di una tabella che esplode finiva solo nel log: il modulo
+# risultava "ok" e i finding in baseline di quell'asset diventavano FIXED. Ora resta
+# un finding-limite che la baseline usa per NON chiuderli.
+
+def test_rls_table_exception_emits_not_verifiable(monkeypatch):
+    schema = openapi_schema({"clienti": ["id"], "ordini": ["id"]})
+
+    def router(url, headers):
+        if url.rstrip("/").endswith("/rest/v1"):
+            return fake_resp(status_code=200, payload=schema)
+        if "/rest/v1/clienti?" in url:
+            raise RuntimeError("boom interno")
+        return fake_resp(status_code=200, payload=[])
+
+    monkeypatch.setattr(supa, "_get", router)
+    res = supa.SupabaseModule().run(make_ctx())
+    nv = [f for f in res.findings if f.rule_id == "RLS_NOT_VERIFIABLE"]
+    assert [f.location.endpoint for f in nv] == ["/rest/v1/clienti"]
+    assert "POSTURE_RLS_ordini" in {pc.check_id for pc in res.posture_checks}
+
+
+@pytest.mark.parametrize("sub,entry,endpoint,level", [
+    ("storage", "run_storage_checks", "/storage/v1/object/list/", IntrusionLevel.PROBE),
+    ("rpc", "run_rpc_checks", "/rest/v1/rpc/", IntrusionLevel.PROBE),
+    ("auth_posture", "run_auth_posture_checks", "/auth/v1/", IntrusionLevel.READ_ONLY),
+    ("graphql", "run_graphql_checks", "/graphql/", IntrusionLevel.PROBE),
+])
+def test_submodule_exception_emits_family_limit(monkeypatch, sub, entry, endpoint, level):
+    install_router(monkeypatch, schema=openapi_schema({"t": ["id"]}), rows={"t": (200, [])})
+
+    def _boom(*a, **k):
+        raise RuntimeError("sottomodulo esploso")
+
+    monkeypatch.setattr(getattr(supa, sub), entry, _boom)
+    res = supa.SupabaseModule().run(make_ctx(max_intrusion=IntrusionLevel.PROBE,
+                                             ownership_verified=True))
+    lim = [f for f in res.findings if f.rule_id == "SUPABASE_CHECK_NOT_VERIFIABLE"]
+    assert [(f.location.endpoint, f.intrusion_used) for f in lim] == [(endpoint, level)]
+    assert lim[0].severity is Severity.INFO

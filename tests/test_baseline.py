@@ -332,3 +332,342 @@ def test_counts_accepted_does_not_count_as_known():
     assert res.counts["known"] == 0
     # ma il finding accepted è comunque emesso e conta nel by_severity.
     assert res.counts["by_severity"]["high"] == 1
+
+
+# ─── FIXED solo se RI-VERIFICATO (R6, validazione live M4+M5 · S16) ─────────
+#
+# Un finding sparito dalla run è FIXED solo se la run POTEVA ri-osservarlo: il suo
+# modulo ha girato senza MODULE_ERROR/`*_SKIPPED` e il livello d'intrusione con cui
+# era stato trovato è ≤ al tetto della run corrente. Altrimenti NON è risolto: è
+# "non ri-verificato" (resta aperto, mai presentato come chiuso — Missione §5).
+
+from bastione.baseline.diff import ReverifyScope  # noqa: E402
+from bastione.enums import IntrusionLevel  # noqa: E402
+
+
+def _bl_entry(*, module="supabase", rule_id="STORAGE_PUBLIC_LISTABLE",
+              intrusion="probe", status="known"):
+    entry = {"status": status, "first_seen": EARLIER.isoformat(),
+             "last_seen": EARLIER.isoformat(), "rule_id": rule_id, "module": module}
+    if intrusion is not None:
+        entry["intrusion_used"] = intrusion
+    return entry
+
+
+def _scope(level=IntrusionLevel.READ_ONLY, modules=("supabase",)):
+    return ReverifyScope(max_intrusion=level, modules_ok=frozenset(modules))
+
+
+def test_probe_finding_not_fixed_by_read_only_run():
+    # Il cuore del difetto: `verify` (READ_ONLY) dava FIXED a un finding PROBE mai
+    # ri-controllato. Ora resta aperto come "non ri-verificato".
+    baseline = {"target": "g", "findings": {"id_p": _bl_entry()}, "posture": {}}
+    res = apply_baseline([], [], baseline, now=NOW, scope=_scope())
+    assert res.fixed == []
+    assert [f.finding_id for f in res.not_reverified] == ["id_p"]
+    shell = res.not_reverified[0]
+    assert shell.status is Status.KNOWN          # resta aperto (status ereditato)
+    assert shell.rule_id == "STORAGE_PUBLIC_LISTABLE"
+    assert shell.module == "supabase"
+    assert shell.first_seen == EARLIER
+    assert shell.last_seen == EARLIER            # NON visto ora: last_seen invariato
+    assert "probe" in shell.description
+    assert res.counts["fixed"] == 0
+    assert res.counts["not_reverified"] == 1
+
+
+def test_probe_finding_fixed_when_run_reaches_probe():
+    baseline = {"target": "g", "findings": {"id_p": _bl_entry()}, "posture": {}}
+    res = apply_baseline([], [], baseline, now=NOW,
+                         scope=_scope(IntrusionLevel.PROBE))
+    assert [f.finding_id for f in res.fixed] == ["id_p"]
+    assert res.not_reverified == []
+    assert res.counts["fixed"] == 1
+    assert res.counts["not_reverified"] == 0
+
+
+def test_mutating_finding_not_fixed_by_probe_run():
+    baseline = {"target": "g", "findings": {
+        "id_m": _bl_entry(rule_id="RLS_WRITE_OPEN", intrusion="mutating")}, "posture": {}}
+    res = apply_baseline([], [], baseline, now=NOW,
+                         scope=_scope(IntrusionLevel.PROBE))
+    assert res.fixed == []
+    assert [f.finding_id for f in res.not_reverified] == ["id_m"]
+
+
+def test_read_only_finding_fixed_by_read_only_run():
+    baseline = {"target": "g", "findings": {
+        "id_r": _bl_entry(rule_id="RLS_DISABLED", intrusion="read-only")}, "posture": {}}
+    res = apply_baseline([], [], baseline, now=NOW, scope=_scope())
+    assert [f.finding_id for f in res.fixed] == ["id_r"]
+
+
+def test_finding_not_fixed_when_its_module_did_not_run():
+    # Recon fallito / modulo non selezionato / MODULE_ERROR / *_SKIPPED: il modulo
+    # non ha ri-controllato nulla → nessun FIXED (prima: sito giù = tutto FIXED).
+    baseline = {"target": "g", "findings": {
+        "id_r": _bl_entry(rule_id="RLS_DISABLED", intrusion="read-only")}, "posture": {}}
+    res = apply_baseline([], [], baseline, now=NOW,
+                         scope=_scope(IntrusionLevel.MUTATING, modules=()))
+    assert res.fixed == []
+    assert [f.finding_id for f in res.not_reverified] == ["id_r"]
+    assert "supabase" in res.not_reverified[0].description
+
+
+def test_legacy_entry_without_intrusion_is_read_only():
+    # Baseline scritte prima di S16 non hanno `intrusion_used`: si assume READ_ONLY
+    # (comportamento storico) per non bloccarle per sempre in "non ri-verificato".
+    baseline = {"target": "g", "findings": {
+        "id_l": _bl_entry(rule_id="RLS_DISABLED", intrusion=None)}, "posture": {}}
+    res = apply_baseline([], [], baseline, now=NOW, scope=_scope())
+    assert [f.finding_id for f in res.fixed] == ["id_l"]
+
+
+def test_unknown_intrusion_value_is_conservative():
+    # Valore illeggibile/manomesso: non si concede un FIXED non guadagnato (R6).
+    baseline = {"target": "g", "findings": {
+        "id_x": _bl_entry(intrusion="boh")}, "posture": {}}
+    res = apply_baseline([], [], baseline, now=NOW,
+                         scope=_scope(IntrusionLevel.PROBE))
+    assert res.fixed == []
+    assert [f.finding_id for f in res.not_reverified] == ["id_x"]
+
+
+def test_accepted_entry_not_reverified_keeps_accepted_status():
+    baseline = {"target": "g", "findings": {"id_a": _bl_entry(status="accepted")},
+                "posture": {}}
+    res = apply_baseline([], [], baseline, now=NOW, scope=_scope())
+    assert res.not_reverified[0].status is Status.ACCEPTED
+
+
+def test_no_scope_keeps_legacy_behaviour():
+    # Senza scope (chiamanti storici) ogni id sparito resta FIXED come prima.
+    baseline = {"target": "g", "findings": {"id_p": _bl_entry()}, "posture": {}}
+    res = apply_baseline([], [], baseline, now=NOW)
+    assert [f.finding_id for f in res.fixed] == ["id_p"]
+    assert res.not_reverified == []
+
+
+def test_seen_finding_unaffected_by_scope():
+    # Un finding ri-osservato resta KNOWN a prescindere dallo scope.
+    f = make_finding(rule_id="STORAGE_PUBLIC_LISTABLE")
+    baseline = {"target": "g", "findings": {finding_id(f): _bl_entry()}, "posture": {}}
+    res = apply_baseline([f], [], baseline, now=NOW, scope=_scope())
+    assert [x.status for x in res.findings] == [Status.KNOWN]
+    assert res.fixed == [] and res.not_reverified == []
+
+
+# ─── S16 blind-review: limiti della run, livello legacy, livello di osservazione ─
+
+from bastione.baseline.diff import (  # noqa: E402
+    endpoint_keys,
+    observation_level,
+    reverify_scope_from_run,
+)
+
+
+def _limit_finding(rule_id, endpoint, *, module="supabase",
+                   level=IntrusionLevel.PROBE):
+    f = make_finding(module=module, rule_id=rule_id,
+                     location=Location(endpoint=endpoint), severity=Severity.INFO)
+    f.intrusion_used = level
+    return f
+
+
+def _entry_at(endpoint, *, rule_id="STORAGE_PUBLIC_LISTABLE", intrusion="probe",
+              module="supabase"):
+    e = _bl_entry(module=module, rule_id=rule_id, intrusion=intrusion)
+    e.update(endpoint_keys(module, endpoint))
+    return e
+
+
+def test_endpoint_keys_hide_asset_names():
+    # La baseline è committata: niente nomi di tabelle/bucket in chiaro (S5/P8).
+    keys = endpoint_keys("supabase", "/storage/v1/object/list/documenti_segreti")
+    assert keys["endpoint_family"] == "/storage/v1/object/list/"
+    assert "documenti_segreti" not in json.dumps(keys)
+    # il frammento (#signup) non cambia la chiave dell'endpoint
+    assert (endpoint_keys("supabase", "/auth/v1/settings#signup")["endpoint_key"]
+            == endpoint_keys("supabase", "/auth/v1/settings")["endpoint_key"])
+
+
+def test_not_verifiable_on_same_asset_blocks_fixed():
+    # Riprodotto dalla blind-review: STORAGE_PUBLIC_LISTABLE in baseline, la run PROBE
+    # emette STORAGE_NOT_VERIFIABLE sullo stesso bucket → prima: FIXED.
+    ep = "/storage/v1/object/list/documenti"
+    baseline = {"target": "g", "findings": {"id_s": _entry_at(ep)}, "posture": {}}
+    scope = reverify_scope_from_run(IntrusionLevel.PROBE, ["supabase"],
+                                    [_limit_finding("STORAGE_NOT_VERIFIABLE", ep)])
+    res = apply_baseline([], [], baseline, now=NOW, scope=scope)
+    assert res.fixed == []
+    assert "STORAGE_NOT_VERIFIABLE" in res.not_reverified[0].description
+
+
+def test_not_verifiable_on_other_asset_does_not_block():
+    # Precisione: un bucket non verificabile non blocca il FIXED di un altro bucket
+    # (altrimenti un limite permanente bloccherebbe tutto per sempre).
+    baseline = {"target": "g", "findings": {
+        "id_s": _entry_at("/storage/v1/object/list/documenti")}, "posture": {}}
+    scope = reverify_scope_from_run(
+        IntrusionLevel.PROBE, ["supabase"],
+        [_limit_finding("STORAGE_NOT_VERIFIABLE", "/storage/v1/object/list/altro")])
+    res = apply_baseline([], [], baseline, now=NOW, scope=scope)
+    assert [f.finding_id for f in res.fixed] == ["id_s"]
+
+
+def test_rls_not_verifiable_blocks_rls_finding_on_same_table():
+    baseline = {"target": "g", "findings": {"id_r": _entry_at(
+        "/rest/v1/orders", rule_id="RLS_DISABLED", intrusion="read-only")}, "posture": {}}
+    scope = reverify_scope_from_run(
+        IntrusionLevel.PROBE, ["supabase"],
+        [_limit_finding("RLS_NOT_VERIFIABLE", "/rest/v1/orders",
+                        level=IntrusionLevel.READ_ONLY)])
+    res = apply_baseline([], [], baseline, now=NOW, scope=scope)
+    assert res.fixed == []
+
+
+def test_family_wide_limit_blocks_the_whole_family():
+    # SUPABASE_SCHEMA_NOT_ENUMERABLE su /rest/v1/: nessuna tabella testata.
+    baseline = {"target": "g", "findings": {"id_r": _entry_at(
+        "/rest/v1/orders", rule_id="RLS_DISABLED", intrusion="read-only")}, "posture": {}}
+    scope = reverify_scope_from_run(
+        IntrusionLevel.READ_ONLY, ["supabase"],
+        [_limit_finding("SUPABASE_SCHEMA_NOT_ENUMERABLE", "/rest/v1/",
+                        level=IntrusionLevel.READ_ONLY)])
+    res = apply_baseline([], [], baseline, now=NOW, scope=scope)
+    assert res.fixed == []
+
+
+def test_write_test_skipped_blocks_mutating_findings_only():
+    # Riprodotto: RLS_WRITE_OPEN in baseline + CANARY_SKIPPED_NO_SCHEMA → prima FIXED.
+    baseline = {"target": "g", "findings": {
+        "id_w": _entry_at("/rest/v1/canary", rule_id="RLS_WRITE_OPEN", intrusion="mutating"),
+        "id_r": _entry_at("/rest/v1/orders", rule_id="RLS_DISABLED", intrusion="read-only"),
+    }, "posture": {}}
+    scope = reverify_scope_from_run(
+        IntrusionLevel.MUTATING, ["supabase"],
+        [_limit_finding("CANARY_SKIPPED_NO_SCHEMA", "/rest/v1/",
+                        level=IntrusionLevel.MUTATING)])
+    res = apply_baseline([], [], baseline, now=NOW, scope=scope)
+    assert [f.finding_id for f in res.not_reverified] == ["id_w"]
+    assert [f.finding_id for f in res.fixed] == ["id_r"]
+
+
+def test_not_found_limit_means_module_did_not_run():
+    baseline = {"target": "g", "findings": {
+        "id_s": _entry_at("/storage/v1/object/list/documenti")}, "posture": {}}
+    scope = reverify_scope_from_run(
+        IntrusionLevel.PROBE, ["supabase"],
+        [_limit_finding("SUPABASE_KEY_NOT_FOUND", "/rest/v1/",
+                        level=IntrusionLevel.READ_ONLY)])
+    res = apply_baseline([], [], baseline, now=NOW, scope=scope)
+    assert res.fixed == []
+
+
+def test_legacy_entry_level_inferred_from_rule():
+    # Le baseline pre-S16 non hanno intrusion_used: un finding di storage trovato a
+    # PROBE non deve chiudersi con un verify READ_ONLY (prima: READ_ONLY assunto).
+    baseline = {"target": "g", "findings": {
+        "id_s": _bl_entry(rule_id="STORAGE_PUBLIC_LISTABLE", intrusion=None),
+        "id_w": _bl_entry(rule_id="RLS_WRITE_OPEN", intrusion=None),
+        "id_r": _bl_entry(rule_id="RLS_DISABLED", intrusion=None),
+        "id_x": _bl_entry(module="server_exposure", rule_id="DEV_SERVER_EXPOSED",
+                          intrusion=None),
+    }, "posture": {}}
+    res = apply_baseline([], [], baseline, now=NOW,
+                         scope=_scope(modules=("supabase", "server_exposure")))
+    assert [f.finding_id for f in res.fixed] == ["id_r"]
+    assert sorted(f.finding_id for f in res.not_reverified) == ["id_s", "id_w", "id_x"]
+
+
+def test_secret_detection_is_observable_read_only_even_after_liveness():
+    # La liveness alza intrusion_used a PROBE, ma la RILEVAZIONE è READ_ONLY: un
+    # segreto rimosso deve potersi chiudere con un verify di default.
+    f = make_finding(module="secrets", rule_id="SECRET_STRIPE")
+    f.intrusion_used = IntrusionLevel.PROBE
+    assert observation_level(f) is IntrusionLevel.READ_ONLY
+    g = make_finding(module="supabase", rule_id="STORAGE_PUBLIC_LISTABLE")
+    g.intrusion_used = IntrusionLevel.PROBE
+    assert observation_level(g) is IntrusionLevel.PROBE
+
+
+# ─── S16 re-review: prova positiva, famiglia esatta, entry legacy, nomi in chiaro ─
+
+def _entry_with_proof(endpoint, proof_check, *, rule_id="RLS_WRITE_OPEN",
+                      intrusion="mutating"):
+    e = _entry_at(endpoint, rule_id=rule_id, intrusion=intrusion)
+    e.update(proof_keys(proof_check))
+    return e
+
+
+from bastione.baseline.diff import proof_keys  # noqa: E402
+
+
+def _posture(check_id, passed=True):
+    return PostureCheck(check_id=check_id, title="t", passed=passed,
+                        severity_if_failed=Severity.HIGH, target="g", detail="d")
+
+
+def test_fixed_requires_positive_proof_when_declared():
+    # Re-review: RLS_WRITE_OPEN su `ordini`, chiusa solo la SELECT → la tabella esce
+    # dalla superficie del canary, nessun test → prima: FIXED con INSERT aperto.
+    baseline = {"target": "g", "findings": {"id_w": _entry_with_proof(
+        "/rest/v1/ordini", "POSTURE_RLS_WRITE_ordini")}, "posture": {}}
+    no_proof = reverify_scope_from_run(IntrusionLevel.MUTATING, ["supabase"], [],
+                                       posture_checks=[_posture("POSTURE_RLS_WRITE_altra")])
+    res = apply_baseline([], [], baseline, now=NOW, scope=no_proof)
+    assert res.fixed == [] and [f.finding_id for f in res.not_reverified] == ["id_w"]
+    failed = reverify_scope_from_run(
+        IntrusionLevel.MUTATING, ["supabase"], [],
+        posture_checks=[_posture("POSTURE_RLS_WRITE_ordini", passed=False)])
+    assert apply_baseline([], [], baseline, now=NOW, scope=failed).fixed == []
+    proven = reverify_scope_from_run(
+        IntrusionLevel.MUTATING, ["supabase"], [],
+        posture_checks=[_posture("POSTURE_RLS_WRITE_ordini")])
+    res = apply_baseline([], [], baseline, now=NOW, scope=proven)
+    assert [f.finding_id for f in res.fixed] == ["id_w"]
+
+
+def test_proof_keys_do_not_store_names():
+    assert "ordini" not in json.dumps(proof_keys("POSTURE_RLS_WRITE_ordini"))
+    assert proof_keys(None) == {}
+
+
+def test_family_limit_does_not_block_the_family_root_finding():
+    # Re-review: SUPABASE_SCHEMA_NOT_ENUMERABLE (/rest/v1/) bloccava per sempre i
+    # finding sulla radice stessa (es. SUPABASE_LEGACY_KEYS_IN_USE) e le RPC.
+    baseline = {"target": "g", "findings": {
+        "id_k": _entry_at("/rest/v1/", rule_id="SUPABASE_LEGACY_KEYS_IN_USE",
+                          intrusion="read-only"),
+        "id_p": _entry_at("/rest/v1/rpc/lista", rule_id="RPC_ANON_INVOCABLE"),
+        "id_r": _entry_at("/rest/v1/clienti", rule_id="RLS_DISABLED",
+                          intrusion="read-only"),
+    }, "posture": {}}
+    scope = reverify_scope_from_run(
+        IntrusionLevel.PROBE, ["supabase"],
+        [_limit_finding("SUPABASE_SCHEMA_NOT_ENUMERABLE", "/rest/v1/",
+                        level=IntrusionLevel.READ_ONLY)])
+    res = apply_baseline([], [], baseline, now=NOW, scope=scope)
+    assert sorted(f.finding_id for f in res.fixed) == ["id_k", "id_p"]
+    assert [f.finding_id for f in res.not_reverified] == ["id_r"]
+
+
+def test_keyless_legacy_entry_only_blocked_by_module_wide_limits():
+    # Re-review: un limite ricorrente su un altro asset bloccava per sempre le entry
+    # pre-S16 (senza chiavi d'endpoint).
+    baseline = {"target": "g", "findings": {
+        "id_l": _bl_entry(rule_id="RLS_DISABLED", intrusion=None)}, "posture": {}}
+    asset_limit = reverify_scope_from_run(
+        IntrusionLevel.READ_ONLY, ["supabase"],
+        [_limit_finding("RLS_NOT_VERIFIABLE", "/rest/v1/ordini",
+                        level=IntrusionLevel.READ_ONLY)])
+    assert [f.finding_id for f in apply_baseline(
+        [], [], baseline, now=NOW, scope=asset_limit).fixed] == ["id_l"]
+
+
+def test_endpoint_family_only_for_known_supabase_families():
+    # Re-review: fuori da Supabase la "famiglia" conteneva URL e id reali.
+    assert endpoint_keys("idor", "/api/users/1234/orders")["endpoint_family"] == ""
+    assert endpoint_keys("login_hardening",
+                         "https://staging.example.com/api/auth/login")["endpoint_family"] == ""
+    assert endpoint_keys("supabase", "/rest/v1/rpc/lista")["endpoint_family"] == "/rest/v1/rpc/"

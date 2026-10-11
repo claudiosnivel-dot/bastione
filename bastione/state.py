@@ -45,6 +45,9 @@ def empty_counts() -> dict:
     NEW separato dal totale degli emessi."""
     return {
         "new": 0, "known": 0, "fixed": 0, "drift": 0,
+        # S16 (R6): in baseline ma NON ri-verificabili da questa run (tetto
+        # d'intrusione più basso o modulo non eseguito) → né FIXED né visti.
+        "not_reverified": 0,
         "by_severity": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
         "new_by_severity": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
     }

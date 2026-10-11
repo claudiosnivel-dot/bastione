@@ -119,7 +119,8 @@ def run_graphql_checks(ctx: RunContext, base: str, headers: dict[str, str],
                         "superficie (tipi, campi, relazioni) è enumerabile, allargando "
                         "la ricognizione di un attaccante. Disabilitala in produzione.",
             remediation_ref="SUPABASE_GRAPHQL_INTROSPECTION", owasp=["A05:2021"],
-            intrusion_used=IntrusionLevel.PROBE))
+            intrusion_used=IntrusionLevel.PROBE,
+            verified_by="POSTURE_GRAPHQL_INTROSPECTION"))
     posture.append(PostureCheck(
         check_id="POSTURE_GRAPHQL_INTROSPECTION",
         title="Introspezione GraphQL non esposta all'anon",

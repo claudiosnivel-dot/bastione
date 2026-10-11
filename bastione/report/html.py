@@ -78,6 +78,7 @@ def to_html(
     posture_checks: list[PostureCheck],
     counts: dict,
     render_playbook: PlaybookRenderer = playbooks.render_playbook,
+    not_reverified: list[Finding] | None = None,
 ) -> str:
     """Genera il report HTML single-file di una scan (§23, O02).
 
@@ -97,6 +98,7 @@ def to_html(
     corpo.append(_sezione_new(new_findings, drift_checks, render_playbook))
     corpo.append(_sezione_known(known_findings, render_playbook))
     corpo.append(_sezione_fixed(fixed))
+    corpo.append(_sezione_non_riverificati(not_reverified or []))  # S16: vuota se nulla
     corpo.append(_sezione_limiti_html(findings))   # §26/R6: vuota se nessun limite
     corpo.append(_checklist_posture(posture_checks))
 
@@ -139,6 +141,10 @@ def _intestazione(target: str, posture_score: float, counts: dict) -> str:
         f"<tr><td>KNOWN</td><td>{_esc(counts.get('known', 0))}</td></tr>\n"
         f"<tr><td>FIXED</td><td>{_esc(counts.get('fixed', 0))}</td></tr>\n"
         f"<tr><td>DRIFT</td><td>{_esc(counts.get('drift', 0))}</td></tr>\n"
+        + (f"<tr><td>NON RI-VERIFICATI</td>"
+           f"<td>{_esc(counts['not_reverified'])}</td></tr>\n"
+           if counts.get("not_reverified") else "")
+        +
         "</tbody>\n"
         "</table>"
     )
@@ -303,6 +309,30 @@ def _sezione_fixed(fixed: list[Finding]) -> str:
 def _no_playbook(rule_id: str | None, context: dict) -> None:
     """Renderer no-op (§18): per le sezioni dove il playbook non va iniettato (FIXED)."""
     return None
+
+
+# ─── Sezione NON RI-VERIFICATI (S16, R6) ──────────────────────────────────────
+
+def _sezione_non_riverificati(items: list[Finding]) -> str:
+    """Specchio HTML della sezione MD: finding in baseline che la run non poteva
+    ri-controllare. Tutto escapato: rule_id/modulo vengono dal file di baseline."""
+    if not items:
+        return ""
+    righe = [
+        '<section class="block block-known">',
+        "<h2>NON RI-VERIFICATI — restano aperti</h2>",
+        '<p class="empty">Erano in baseline e non compaiono in questa run, ma questa '
+        "run non poteva ri-controllarli: <strong>non sono risolti</strong>. Rilancia "
+        "con il livello indicato.</p>",
+        "<ul>",
+    ]
+    for f in items:
+        righe.append(
+            f"<li><code>{_esc(f.rule_id)}</code> (id <code>{_esc(f.finding_id)}</code>, "
+            f"modulo <code>{_esc(f.module)}</code>, stato "
+            f"{_esc(f.status.value.upper())}): {_esc(f.description)}</li>")
+    righe.extend(["</ul>", "</section>"])
+    return "\n".join(righe)
 
 
 # ─── Limiti di verifica (§26 / R6) ────────────────────────────────────────────

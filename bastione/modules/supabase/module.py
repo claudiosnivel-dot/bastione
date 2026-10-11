@@ -407,6 +407,11 @@ class SupabaseModule(Module):
             except Exception:  # noqa: BLE001 — resilienza (P8): un asset non blocca gli altri
                 log.warning("RLS read test fallito per la tabella %r: saltata",
                             table, exc_info=True)
+                # S16 (R6): la tabella NON è stata verificata → finding-limite (non
+                # silenzio), così la baseline non dà per FIXED i suoi finding.
+                findings.append(self._rls_not_verifiable_finding(
+                    table, f"/rest/v1/{table}", supabase_url, target, None,
+                    reason="errore interno durante il test"))
 
         # 3) CANARY WRITE TEST (§11.2, MUTATING 🔴) — schema noto (colonne dalle
         # `tables` di OpenAPI). Si auto-gata su ctx.max_intrusion: parte SOLO se la
@@ -482,11 +487,17 @@ class SupabaseModule(Module):
         rpcs = sorted(set(ctx.fingerprint.discovered_rpcs)
                       | set(cfg.supabase_rpcs)
                       | {r.name for r in cfg.expect_rpcs})
-        for fn, args in (
-            (storage.run_storage_checks, (ctx, base, headers, buckets, target)),
-            (rpc.run_rpc_checks, (ctx, base, headers, rpcs, target)),
-            (auth_posture.run_auth_posture_checks, (ctx, base, headers, target)),
-            (graphql.run_graphql_checks, (ctx, base, headers, target)),
+        # (funzione, argomenti, famiglia di endpoint e livello che copre) — la famiglia
+        # serve al finding-limite se il sottomodulo esplode (S16, R6).
+        for fn, args, family, level in (
+            (storage.run_storage_checks, (ctx, base, headers, buckets, target),
+             "/storage/v1/object/list/", IntrusionLevel.PROBE),
+            (rpc.run_rpc_checks, (ctx, base, headers, rpcs, target),
+             "/rest/v1/rpc/", IntrusionLevel.PROBE),
+            (auth_posture.run_auth_posture_checks, (ctx, base, headers, target),
+             "/auth/v1/", IntrusionLevel.READ_ONLY),
+            (graphql.run_graphql_checks, (ctx, base, headers, target),
+             "/graphql/", IntrusionLevel.PROBE),
         ):
             try:
                 f, p = fn(*args)
@@ -497,6 +508,28 @@ class SupabaseModule(Module):
             except Exception:  # noqa: BLE001 — un sottomodulo non blocca gli altri
                 log.warning("supabase: sottomodulo %s fallito, saltato",
                             getattr(fn, "__name__", fn), exc_info=True)
+                findings.append(self._check_not_verifiable_finding(
+                    family, level, ctx.fingerprint.supabase_url or cfg.supabase_url,
+                    target))
+
+    @staticmethod
+    def _check_not_verifiable_finding(family: str, level: IntrusionLevel,
+                                      supabase_url: str | None, target: str) -> Finding:
+        """S16 (R6): un sottomodulo è fallito → l'intera famiglia di controlli
+        (`family`) NON è stata verificata in questa run. INFO, nessun dettaglio
+        dell'eccezione (P8: potrebbe contenere header o chiavi)."""
+        loc = Location(endpoint=family, url=supabase_url)
+        return Finding(
+            finding_id=_finding_id("supabase", "SUPABASE_CHECK_NOT_VERIFIABLE", loc),
+            module="supabase", rule_id="SUPABASE_CHECK_NOT_VERIFIABLE",
+            title=f"Controlli Supabase su {family} non verificati",
+            severity=Severity.INFO, confidence=Confidence.TENTATIVE,
+            target=target, location=loc,
+            evidence=f"errore interno nel sottomodulo che verifica {family}",
+            description=(f"Il sottomodulo che verifica {family} si è interrotto per un "
+                         "errore interno: in questa run quei controlli NON sono stati "
+                         "eseguiti (R6). L'assenza di finding non indica protezione."),
+            remediation_ref=None, owasp=["A05:2021"], intrusion_used=level)
 
     # ── passi interni ───────────────────────────────────────────────────────
 
@@ -671,6 +704,9 @@ class SupabaseModule(Module):
             except Exception:  # noqa: BLE001 — resilienza (P8): un asset non blocca gli altri
                 log.warning("RLS read test (via bundle) fallito per la tabella %r: "
                             "saltata", table, exc_info=True)
+                findings.append(self._rls_not_verifiable_finding(
+                    table, f"/rest/v1/{table}", supabase_url, target, None,
+                    reason="errore interno durante il test"))
 
         # Finding onesto sulla copertura PARZIALE (§11.1): enumerazione via bundle.
         findings.append(self._schema_via_bundle_finding(
@@ -710,8 +746,11 @@ class SupabaseModule(Module):
               §11.1.2) + nota esplicita in description; confidence resta FIRM.
             * exp None → modo adversario invariato (euristica colonne: CRITICAL se
               dati personali, altrimenti HIGH; via_bundle senza colonne → HIGH).
-        - 200 vuoto / 401 / 403 / altro → PostureCheck `POSTURE_RLS_<tabella>`
-          passed (l'anon non legge → RLS sta proteggendo)."""
+        - 200 vuoto / 401 / 403 → PostureCheck `POSTURE_RLS_<tabella>` passed
+          (l'anon non legge → RLS sta proteggendo).
+        - S16 (R6) qualunque altro esito (nessuna risposta, 404 tabella non esposta
+          o nome sbagliato, 429, 5xx, body non lista) NON prova nulla → INFO
+          `RLS_NOT_VERIFIABLE` e nessuna posture: mai "RLS attiva" non verificata."""
         endpoint = f"/rest/v1/{table}"
         resp = _get(f"{base}{endpoint}?limit=1", headers)
         status = getattr(resp, "status_code", None)
@@ -754,9 +793,42 @@ class SupabaseModule(Module):
                 table, endpoint, target, severity))
             return
 
-        # protetto (vuoto / 401 / 403 / irraggiungibile) → posture positiva. Lo
-        # status è propagato per la nota "protetto ma fragile" sul 401/403 (§4.3).
+        # Protetto SOLO se la risposta lo prova (S16, R6, come storage/RPC): 200 con
+        # lista vuota, oppure un rifiuto esplicito 401/403. Il resto non è una prova.
+        if not (status in (401, 403) or rows is not None):
+            findings.append(self._rls_not_verifiable_finding(
+                table, endpoint, supabase_url, target, status))
+            return
+        # protetto (vuoto / 401 / 403) → posture positiva. Lo status è propagato per
+        # la nota "protetto ma fragile" sul 401/403 (§4.3).
         posture_checks.append(self._rls_protected_posture(table, target, status))
+
+    @staticmethod
+    def _rls_not_verifiable_finding(
+        table: str, endpoint: str, supabase_url: str, target: str, status: int | None,
+        reason: str | None = None,
+    ) -> Finding:
+        """INFO onesto (S16, R6): la GET anonima non ha dato un esito che provi né
+        l'esposizione né la protezione della tabella. Nessun valore di riga (P8)."""
+        motivo = reason or (f"risposta non conclusiva (HTTP {status})"
+                            if isinstance(status, int) else "nessuna risposta (rete/httpx)")
+        if status == 404 and reason is None:
+            motivo += (": tabella non trovata/non esposta dalla Data API, oppure nome "
+                       "dal bundle non corrispondente")
+        loc = Location(endpoint=endpoint, url=supabase_url)
+        return Finding(
+            finding_id=_finding_id("supabase", "RLS_NOT_VERIFIABLE", loc),
+            module="supabase", rule_id="RLS_NOT_VERIFIABLE",
+            title=f"RLS della tabella '{table}' non verificabile",
+            severity=Severity.INFO, confidence=Confidence.TENTATIVE,
+            target=target, location=loc,
+            evidence=f"GET {endpoint}?limit=1: {motivo}",
+            description=(f"Non è stato possibile stabilire se l'anon legge la tabella "
+                         f"'{table}': {motivo}. Onestà difensiva (R6): la verifica NON "
+                         "è stata eseguita, l'assenza di finding non significa che la "
+                         "RLS protegga la tabella."),
+            remediation_ref=None, owasp=["A01:2021"],
+            intrusion_used=IntrusionLevel.READ_ONLY)
 
     @staticmethod
     def _readable_rows(resp) -> list | None:
@@ -891,6 +963,7 @@ class SupabaseModule(Module):
             finding_id=_finding_id("supabase", "RLS_DISABLED", location),
             module="supabase",
             rule_id="RLS_DISABLED",
+            verified_by=f"POSTURE_RLS_{table}",
             title=title,
             severity=severity,
             confidence=Confidence.FIRM,
@@ -1501,6 +1574,7 @@ class SupabaseModule(Module):
             finding_id=_finding_id("supabase", "RLS_WRITE_OPEN", location),
             module="supabase",
             rule_id="RLS_WRITE_OPEN",
+            verified_by=f"POSTURE_RLS_WRITE_{table}",
             title=(f"RLS di scrittura aperta sulla tabella '{table}'"
                    + (" (viola la matrice §15)" if violates_matrix else "")
                    + (" (dati personali)" if personal and not violates_matrix else "")),

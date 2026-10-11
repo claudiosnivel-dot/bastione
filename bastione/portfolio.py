@@ -131,6 +131,9 @@ class PortfolioRow:
     known: int | None = None
     fixed: int | None = None
     error: str | None = None
+    # S16 (R6): finding in baseline che la run non poteva ri-controllare (es.
+    # scan-all READ_ONLY su finding PROBE): restano aperti, non vanno nascosti.
+    not_reverified: int = 0
 
     @classmethod
     def from_state(cls, target: str, state: RunState) -> "PortfolioRow":
@@ -149,6 +152,7 @@ class PortfolioRow:
             known=int(counts.get("known", 0)),
             fixed=int(counts.get("fixed", 0)),
             error=None,
+            not_reverified=int(counts.get("not_reverified", 0) or 0),
         )
 
     @classmethod
@@ -261,9 +265,11 @@ def render_portfolio_report(rows: list[PortfolioRow], *, now: datetime) -> str:
                 f"⚠️ error: {_escape_cell(r.error)} |")
         else:
             score = f"{r.score:.1f}" if r.score is not None else "—"
+            stato = (f"⚠️ {r.not_reverified} non ri-verificati" if r.not_reverified
+                     else "ok")
             lines.append(
                 f"| {r.target} | {score} | {r.critical_open} | {r.drift} | "
-                f"{r.new} | {r.known} | {r.fixed} | ok |")
+                f"{r.new} | {r.known} | {r.fixed} | {stato} |")
     lines.append("")
 
     # ── riepilogo del portfolio ─────────────────────────────────────────────

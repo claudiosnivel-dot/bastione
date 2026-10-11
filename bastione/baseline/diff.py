@@ -16,6 +16,9 @@ Pezzi:
 - `apply_baseline`: il diff vero e proprio (fasi BASELINE + POSTURE, §6):
   arricchisce i finding con status/first_seen/last_seen, emette i FIXED, marca il
   DRIFT dei posture check e calcola i `counts` (shape §24).
+- `ReverifyScope` (S16, R6): un finding sparito dalla run è FIXED solo se la run
+  poteva RI-OSSERVARLO (modulo eseguito senza errori/skip, livello d'intrusione
+  sufficiente). Altrimenti è "non ri-verificato": resta aperto, mai dato per chiuso.
 
 Nessun I/O di rete qui: input puri (liste di Finding/PostureCheck + dict baseline)
 → output puro. Solo `load/save` toccano il filesystem (lettura/scrittura JSON).
@@ -30,15 +33,45 @@ from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 
-from bastione.enums import Confidence, Severity, Status
+from bastione.enums import Confidence, IntrusionLevel, Severity, Status
 from bastione.models import Finding, Location, PostureCheck
-from bastione.state import empty_counts
+from bastione.state import empty_counts, intrusion_to_cli
 
 log = logging.getLogger("bastione.baseline")
 
 # Stati ereditabili dalla baseline (§16): un finding già visto può essere
 # `known` (riconosciuto, ancora aperto) o `accepted` (rumore noto silenziato).
 _INHERITABLE = {Status.KNOWN, Status.ACCEPTED}
+
+# Livello d'intrusione salvato in baseline (stringa CLI, §25) → IntrusionLevel.
+_CLI_TO_INTRUSION = {intrusion_to_cli(level): level for level in IntrusionLevel}
+
+# Limiti dichiarati da una run (S16, R6). Un modulo che emette MODULE_ERROR,
+# `*_SKIPPED` o `*_NOT_FOUND` non ha verificato nulla; `*_NOT_VERIFIABLE`,
+# `*_NOT_READABLE` e `*_NOT_ENUMERABLE` dicono QUALE asset (o famiglia di asset,
+# endpoint che finisce con "/") non è stato verificato; l'infisso `_SKIPPED_`
+# (CANARY_SKIPPED_NO_SCHEMA, IDOR_WRITE_SKIPPED_NO_CANARY) = test di scrittura saltato.
+_MODULE_NOT_RUN_SUFFIXES = ("_SKIPPED", "_NOT_FOUND")
+_ASSET_LIMIT_SUFFIXES = ("_NOT_VERIFIABLE", "_NOT_READABLE", "_NOT_ENUMERABLE")
+_WRITE_SKIPPED_INFIX = "_SKIPPED_"
+
+# Baseline scritte prima di S16 (senza `intrusion_used`): livello dedotto dal tipo di
+# controllo, mai un READ_ONLY concesso alla cieca a un controllo attivo.
+_LEGACY_MUTATING_RULES = ("RLS_WRITE_OPEN", "CANARY_", "IDOR_CROSS_TENANT_WRITE",
+                          "IDOR_CLEANUP", "IDOR_WRITE")
+_LEGACY_PROBE_RULES = ("STORAGE_", "RPC_", "SUPABASE_GRAPHQL_", "IDOR_")
+# Famiglie d'endpoint salvate in chiaro in baseline: solo quelle generiche di
+# Supabase (le uniche usate dai limiti). Altrove la "famiglia" può contenere URL o
+# id reali (es. /api/users/1234/) → stringa vuota.
+_KNOWN_FAMILIES = frozenset({"/rest/v1/", "/rest/v1/rpc/", "/storage/v1/object/list/",
+                             "/auth/v1/", "/graphql/"})
+
+_LEGACY_LEVEL_BY_MODULE = {
+    "zap_active": IntrusionLevel.MUTATING,
+    "server_exposure": IntrusionLevel.PROBE, "login_hardening": IntrusionLevel.PROBE,
+    "nuclei": IntrusionLevel.PROBE, "zap": IntrusionLevel.PROBE,
+    "semgrep": IntrusionLevel.PROBE, "trivy": IntrusionLevel.PROBE,
+}
 
 
 # ─── finding_id stabile (LOCKED, §16) ───────────────────────────────────────
@@ -153,6 +186,140 @@ class BaselineResult:
     fixed: list[Finding] = field(default_factory=list)
     posture_checks: list[PostureCheck] = field(default_factory=list)
     counts: dict = field(default_factory=empty_counts)
+    # S16 (R6): in baseline, non visti ora, ma la run NON poteva ri-osservarli →
+    # restano aperti (status ereditato), non sono FIXED. Gusci come i FIXED.
+    not_reverified: list[Finding] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class VerifyLimit:
+    """Un limite dichiarato dalla run (S16): il modulo `module` NON ha verificato
+    l'endpoint `endpoint` ("" = tutto il modulo; finale "/" = l'intera famiglia,
+    es. "/rest/v1/"; altrimenti l'asset esatto) per i controlli di livello
+    ≥ `min_level`. `rule_id` serve solo a spiegarlo nel report."""
+
+    module: str
+    endpoint: str
+    min_level: IntrusionLevel
+    rule_id: str
+
+
+@dataclass(frozen=True)
+class ReverifyScope:
+    """Ciò che la run corrente ha potuto RI-VERIFICARE (S16, R6 / Missione §5).
+
+    - `max_intrusion`: tetto della run. Un finding trovato a PROBE/MUTATING non può
+      sparire per merito di una run READ_ONLY (es. `verify`): quei controlli non
+      sono nemmeno partiti.
+    - `modules_ok`: moduli eseguiti senza `MODULE_ERROR` né `*_SKIPPED`. Se il modulo
+      che aveva trovato il problema non ha girato (recon fallito, tool assente,
+      eccezione), l'assenza del finding non prova nulla."""
+
+    max_intrusion: IntrusionLevel
+    modules_ok: frozenset[str]
+    limits: tuple[VerifyLimit, ...] = ()
+    # hash dei check_id dei PostureCheck PASSATI in questa run (prove positive).
+    passed_proofs: frozenset[str] = frozenset()
+
+
+def _strip_fragment(endpoint: str | None) -> str:
+    return (endpoint or "").split("#", 1)[0]
+
+
+def _endpoint_family(endpoint: str) -> str:
+    """"/rest/v1/clienti" → "/rest/v1/": la famiglia, senza il nome dell'asset. Solo
+    le famiglie note (`_KNOWN_FAMILIES`) finiscono in chiaro, le altre → ""."""
+    if "/" not in endpoint:
+        return ""
+    family = endpoint.rsplit("/", 1)[0] + "/"
+    return family if family in _KNOWN_FAMILIES else ""
+
+
+def _proof_hash(check_id: str) -> str:
+    return sha256(f"proof|{check_id}".encode()).hexdigest()[:16]
+
+
+def proof_keys(verified_by: str | None) -> dict[str, str]:
+    """Chiave della prova positiva (S16) da salvare in baseline: hash del check_id
+    (che contiene il nome dell'asset), mai il check_id in chiaro."""
+    return {"proof_key": _proof_hash(verified_by)} if verified_by else {}
+
+
+def _endpoint_hash(module: str, endpoint: str) -> str:
+    return sha256(f"{module}|{endpoint}".encode()).hexdigest()[:16]
+
+
+def endpoint_keys(module: str, endpoint: str | None) -> dict[str, str]:
+    """Chiavi d'endpoint salvate in baseline (S16) per collegare un finding ai
+    limiti di una run futura. La baseline è committata: l'asset (tabella, bucket,
+    RPC) NON compare in chiaro, solo la famiglia generica e un hash."""
+    ep = _strip_fragment(endpoint)
+    return {"endpoint_family": _endpoint_family(ep),
+            "endpoint_key": _endpoint_hash(module, ep)}
+
+
+def observation_level(finding: Finding) -> IntrusionLevel:
+    """Livello minimo con cui il finding si ri-osserva (S16). Per i segreti la
+    RILEVAZIONE è READ_ONLY anche quando la liveness (PROBE) l'ha arricchita: un
+    segreto rimosso si chiude con un verify di default."""
+    if finding.module == "secrets":
+        return IntrusionLevel.READ_ONLY
+    return finding.intrusion_used
+
+
+def reverify_scope_from_run(
+    max_intrusion: IntrusionLevel,
+    planned_modules,
+    findings: list[Finding],
+    posture_checks: list[PostureCheck] | None = None,
+) -> ReverifyScope:
+    """Costruisce lo scope di ri-verifica dai moduli pianificati e dai finding-limite
+    emessi dalla run (funzione pura, usata dall'orchestratore in BASELINE)."""
+    not_done: set[str] = set()
+    limits: list[VerifyLimit] = []
+    for f in findings:
+        rule = f.rule_id
+        if rule == "MODULE_ERROR" or rule.endswith(_MODULE_NOT_RUN_SUFFIXES):
+            not_done.add(f.module)
+        elif _WRITE_SKIPPED_INFIX in rule:
+            limits.append(VerifyLimit(f.module, "", IntrusionLevel.MUTATING, rule))
+        elif rule.endswith(_ASSET_LIMIT_SUFFIXES):
+            limits.append(VerifyLimit(
+                f.module, _strip_fragment(f.location.endpoint), f.intrusion_used, rule))
+    return ReverifyScope(
+        max_intrusion=max_intrusion,
+        modules_ok=frozenset(planned_modules) - not_done,
+        limits=tuple(limits),
+        passed_proofs=frozenset(_proof_hash(c.check_id)
+                                for c in (posture_checks or []) if c.passed),
+    )
+
+
+def _limit_covers(limit: VerifyLimit, entry: dict) -> bool:
+    """Il limite copre l'entry? "" = tutto il modulo; finale "/" = gli asset di
+    QUELLA famiglia (non la radice stessa né altre famiglie: un limite ricorrente non
+    deve bloccare per sempre finding che la run ri-osserva); altrimenti l'asset
+    esatto. Entry senza chiavi (pre-S16): solo i limiti di modulo."""
+    if not limit.endpoint:
+        return True
+    key = entry.get("endpoint_key")
+    if not isinstance(key, str):
+        return False
+    if limit.endpoint.endswith("/"):
+        return (entry.get("endpoint_family") == limit.endpoint
+                and key != _endpoint_hash(limit.module, limit.endpoint))
+    return key == _endpoint_hash(limit.module, limit.endpoint)
+
+
+def _legacy_level(module: object, rule_id: object) -> IntrusionLevel:
+    rule = rule_id if isinstance(rule_id, str) else ""
+    if rule.startswith(_LEGACY_MUTATING_RULES):
+        return IntrusionLevel.MUTATING
+    if isinstance(module, str) and module in _LEGACY_LEVEL_BY_MODULE:
+        return _LEGACY_LEVEL_BY_MODULE[module]
+    if rule.startswith(_LEGACY_PROBE_RULES):
+        return IntrusionLevel.PROBE
+    return IntrusionLevel.READ_ONLY
 
 
 # ─── diff (fasi BASELINE + POSTURE, §16) ────────────────────────────────────
@@ -175,6 +342,7 @@ def apply_baseline(
     baseline: dict,
     *,
     now: datetime,
+    scope: ReverifyScope | None = None,
 ) -> BaselineResult:
     """Diff dei finding e dei posture check contro la baseline (§16).
 
@@ -183,7 +351,9 @@ def apply_baseline(
     - presente in baseline → eredita `first_seen` e lo `status` (`known`/`accepted`),
       `last_seen=now`;
     - in baseline ma NON nella run → emesso come `FIXED` (`fixed`), `first_seen`
-      preservato, `last_seen=now`.
+      preservato, `last_seen=now`. Con uno `scope` (S16), SOLO se la run poteva
+      ri-osservarlo; altrimenti va in `not_reverified` (status ereditato,
+      `last_seen` invariato). Senza `scope` vale il comportamento storico.
 
     Posture: `drift=True` dove in baseline era `passed:true` e ora è `false`.
 
@@ -227,8 +397,16 @@ def apply_baseline(
         result.findings.append(finding)
 
     # ── finding in baseline ma non più nella run → FIXED (§16) ──────────────
+    # ...solo se la run poteva ri-osservarlo (S16, R6): altrimenti l'assenza non
+    # prova la correzione e il finding resta aperto come "non ri-verificato".
     for fid, prior in bl_findings.items():
         if fid in seen_ids:
+            continue
+        reason = _not_reverifiable_reason(prior, scope) if scope is not None else None
+        if reason is not None:
+            result.not_reverified.append(
+                _make_not_reverified_finding(fid, prior, baseline, reason, now))
+            counts["not_reverified"] += 1
             continue
         fixed = _make_fixed_finding(fid, prior, baseline, now)
         result.fixed.append(fixed)
@@ -258,6 +436,75 @@ def _inherited_status(raw: object) -> Status:
         if status in _INHERITABLE:
             return status
     return Status.KNOWN
+
+
+def _not_reverifiable_reason(prior: object, scope: ReverifyScope) -> str | None:
+    """Motivo per cui la run NON ha potuto ri-osservare il finding di baseline, o
+    None se poteva (→ FIXED legittimo). Conservativo (R6): un livello d'intrusione
+    illeggibile non concede il FIXED.
+
+    Compatibilità: le baseline scritte prima di S16 non hanno `intrusion_used` →
+    livello dedotto dal tipo di controllo (`_legacy_level`); senza `module` non si
+    può verificare il modulo → si salta quel controllo."""
+    entry = prior if isinstance(prior, dict) else {}
+    raw_level = entry.get("intrusion_used")
+    if raw_level is None:
+        level = _legacy_level(entry.get("module"), entry.get("rule_id"))
+    else:
+        level = _CLI_TO_INTRUSION.get(str(raw_level).strip().lower())
+        if level is None:
+            shown = str(raw_level)[:20]
+            return f"livello d'intrusione in baseline non riconosciuto ('{shown}')"
+    if level > scope.max_intrusion:
+        return (f"era stato trovato a livello '{intrusion_to_cli(level)}', la run "
+                f"corrente si è fermata a '{intrusion_to_cli(scope.max_intrusion)}' "
+                f"(rilancia con --max-intrusion {intrusion_to_cli(level)})")
+    module = entry.get("module")
+    if isinstance(module, str) and module and module not in scope.modules_ok:
+        return (f"il modulo '{module}' non ha completato la verifica in questa run "
+                "(non selezionato, saltato o in errore)")
+    for limit in scope.limits:
+        if limit.module == module and level >= limit.min_level and _limit_covers(limit, entry):
+            return (f"la run ha dichiarato un limite di verifica ({limit.rule_id}) "
+                    "sullo stesso controllo")
+    proof = entry.get("proof_key")
+    if isinstance(proof, str) and proof not in scope.passed_proofs:
+        return ("nessuna prova positiva della correzione in questa run: il controllo "
+                "che la conferma non è stato eseguito o non è passato")
+    return None
+
+
+def _make_not_reverified_finding(
+    fid: str, prior: object, baseline: dict, reason: str, now: datetime,
+) -> Finding:
+    """Guscio di un finding in baseline che la run NON ha potuto ri-osservare
+    (S16). Come per i FIXED la baseline non ha i dettagli (L05): si conservano id,
+    modulo, rule_id, date e lo status ereditato (resta aperto). `last_seen` NON
+    avanza: il problema non è stato visto ora, ma nemmeno escluso."""
+    entry = prior if isinstance(prior, dict) else {}
+    rule_id = entry.get("rule_id") if isinstance(entry.get("rule_id"), str) else None
+    module = entry.get("module") if isinstance(entry.get("module"), str) else None
+    first_seen = _parse_dt(entry.get("first_seen")) or now
+    last_seen = _parse_dt(entry.get("last_seen")) or first_seen
+    return Finding(
+        finding_id=fid,
+        module=module or "(baseline)",
+        rule_id=rule_id or "(non ri-verificato)",
+        title="Finding non ri-verificato in questa run",
+        severity=Severity.INFO,
+        confidence=Confidence.TENTATIVE,
+        target=baseline.get("target", "") if isinstance(baseline, dict) else "",
+        location=Location(),
+        evidence="",                       # mai evidenze in baseline (L05)
+        description=(
+            f"Presente in baseline ({rule_id or 'rule_id ignoto'}) ma NON "
+            f"ri-verificato: {reason}. Resta aperto finché una run in grado di "
+            "ri-controllarlo non lo conferma risolto (R6: mai un FIXED non "
+            "verificato)."),
+        first_seen=first_seen,
+        last_seen=last_seen,
+        status=_inherited_status(entry.get("status")),
+    )
 
 
 def _make_fixed_finding(fid: str, prior: dict, baseline: dict, now: datetime) -> Finding:

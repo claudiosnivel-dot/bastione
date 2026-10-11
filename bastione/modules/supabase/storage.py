@@ -158,7 +158,8 @@ def _listable_finding(bucket, count, loc, target, sev) -> Finding:
                if personal else "Nessun nome riconducibile a dati personali → HIGH.")
             + " (P8: i nomi non sono inclusi nel finding.)"),
         remediation_ref="STORAGE_PUBLIC_LISTABLE", owasp=["A01:2021"],
-        gdpr_relevant=personal, intrusion_used=IntrusionLevel.PROBE)
+        gdpr_relevant=personal, intrusion_used=IntrusionLevel.PROBE,
+        verified_by=f"POSTURE_STORAGE_PRIVATE_{bucket}")
 
 
 def _undeclared_finding(bucket, count, loc, target) -> Finding:

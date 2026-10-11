@@ -316,6 +316,9 @@ def _print_summary(state: RunState, run_dir: Path) -> None:
     status_table.add_column("conteggio", justify="right")
     for key in ("new", "known", "fixed", "drift"):
         status_table.add_row(key, str(counts.get(key, 0)))
+    # S16 (R6): finding in baseline che questa run non poteva ri-controllare.
+    if counts.get("not_reverified"):
+        status_table.add_row("not_reverified", str(counts["not_reverified"]))
     console.print(status_table)
 
     by_sev = counts.get("by_severity", {})
@@ -615,10 +618,29 @@ _VERIFY_LABEL = {
     Status.KNOWN: "still_open",   # già noto e ANCORA aperto: il fix non ha (ancora) chiuso
     Status.ACCEPTED: "still_open",  # rumore noto silenziato, ma sempre presente sul target
 }
+# S16 (R6): in baseline, non visto ora, ma la ri-scansione NON poteva ri-controllarlo
+# (livello più basso, modulo saltato/in errore) → resta aperto, MAI "FIXED".
+_VERIFY_NOT_REVERIFIED = "not_reverified"
+
+_MUTATING_CONFIRM_MSG = (
+    "[bold red]Errore:[/] --max-intrusion mutating richiede la conferma "
+    "esplicita [bold]--i-own-this-its-staging[/] (scritture canary §11.2, "
+    "🔴). Aggiungi il flag SOLO se il target è uno staging che possiedi: il "
+    "gate (§7) verificherà comunque staging+ownership e aborterà se non lo "
+    "sono.")
 
 
 def _rescan_read_only(target: str) -> Orchestrator:
-    """Ri-scansione READ_ONLY del target, riusabile da `verify` ed `export-defectdojo`.
+    """Ri-scansione READ_ONLY del target (usata da `export-defectdojo`): vedi `_rescan`."""
+    return _rescan(target, max_intrusion=IntrusionLevel.READ_ONLY)
+
+
+def _rescan(target: str, *, max_intrusion: IntrusionLevel) -> Orchestrator:
+    """Ri-scansione di sola verifica del target, riusabile da `verify` ed
+    `export-defectdojo`. `verify` può salire a PROBE (o MUTATING con conferma) per
+    ri-controllare i finding trovati a quel livello (S16): sotto, resterebbero
+    "non ri-verificati". Il gate (§7) resta l'autorità: ownership challenge sopra
+    READ_ONLY, staging-only per MUTATING.
 
     Esegue l'orchestratore con il tetto READ_ONLY, `--no-fix` (nessun bundle) e
     `notify=False`: è SOLO una ri-scansione di sola lettura del target — nessuna
@@ -640,8 +662,8 @@ def _rescan_read_only(target: str) -> Orchestrator:
     try:
         orch.run(
             target,
-            max_intrusion=IntrusionLevel.READ_ONLY,
-            no_fix=True,   # ri-scansione di sola lettura: non rigenera il bundle fix/
+            max_intrusion=max_intrusion,
+            no_fix=True,   # ri-scansione di sola verifica: non rigenera il bundle fix/
             notify=False,  # contratto outward-facing (§7/§19): nessun POST Telegram
         )
     except PreconditionDenied as exc:
@@ -665,6 +687,14 @@ def _rescan_read_only(target: str) -> Orchestrator:
 @app.command()
 def verify(
     target: str = typer.Option(..., "--target", help="Nome del target (config in targets/)."),
+    max_intrusion: IntrusionChoice = typer.Option(
+        IntrusionChoice.READ_ONLY, "--max-intrusion",
+        help="Livello della ri-scansione. Deve raggiungere quello con cui i finding "
+             "erano stati trovati (es. probe per storage/RPC/server_exposure): sotto, "
+             "restano NON RI-VERIFICATI, mai FIXED."),
+    i_own_this_its_staging: bool = typer.Option(
+        False, "--i-own-this-its-staging",
+        help="Richiesto per --max-intrusion mutating (come `scan`)."),
 ) -> None:
     """Ri-scansiona il target (READ_ONLY) e mostra lo stato di ogni finding (§18-bis.8).
 
@@ -684,10 +714,17 @@ def verify(
     uno ancora presente compare come `new`, non `still_open`. Il flusso completo del
     loop è dunque: `scan --accept-baseline` → applica i fix del bundle → `verify`.
 
-    READ_ONLY rispetto al target e senza generare bundle (`--no-fix`): è solo una
-    verifica. Errori gestiti come `scan` (niente stacktrace, §25): precondizione del
-    gate → exit 2, ownership challenge → exit 3, config target assente → exit 4."""
-    orch = _rescan_read_only(target)
+    Di default READ_ONLY e senza generare bundle (`--no-fix`): è solo una verifica.
+    S16 (R6): un finding trovato a PROBE/MUTATING si può dare per FIXED solo con una
+    ri-scansione allo stesso livello (`--max-intrusion probe`); a un livello più
+    basso resta `not_reverified` (aperto). Errori gestiti come `scan` (niente
+    stacktrace, §25): precondizione del gate → exit 2, ownership challenge → exit 3,
+    config target assente → exit 4."""
+    level = _CLI_TO_INTRUSION[max_intrusion]
+    if level >= IntrusionLevel.MUTATING and not i_own_this_its_staging:
+        err_console.print(_MUTATING_CONFIRM_MSG)
+        raise typer.Exit(code=2)
+    orch = _rescan(target, max_intrusion=level)
     _print_verify_table(target, orch._result)
 
 
@@ -699,6 +736,7 @@ def _print_verify_table(target: str, result) -> None:
     resta aperto (still_open/new) è ciò su cui agire."""
     emitted = list(result.findings) if result is not None else []
     fixed = list(result.fixed) if result is not None else []
+    not_reverified = list(getattr(result, "not_reverified", []) or [])
 
     console.print()
     console.print(f"[bold]Bastione verify[/] — target [cyan]{target}[/] (§18-bis.8)")
@@ -715,6 +753,9 @@ def _print_verify_table(target: str, result) -> None:
         table.add_row(
             f.finding_id, f.rule_id, f.severity.name.lower(), label)
         rows += 1
+    for f in not_reverified:
+        table.add_row(f.finding_id, f.rule_id, "?", _VERIFY_NOT_REVERIFIED)
+        rows += 1
 
     if rows == 0:
         console.print("[green]Nessun finding[/]: il target risulta pulito in questa "
@@ -729,6 +770,13 @@ def _print_verify_table(target: str, result) -> None:
     console.print(
         f"Riepilogo: [bold]{fixed_count}[/] FIXED, [bold]{open_count}[/] ancora aperti. "
         f"Un fix è chiuso solo quando il finding risulta [bold]FIXED[/].")
+    if not_reverified:
+        console.print(
+            f"[yellow]Attenzione:[/] [bold]{len(not_reverified)}[/] finding NON "
+            "RI-VERIFICATI: questa ri-scansione non poteva ri-controllarli (livello "
+            "più basso di quello con cui erano stati trovati, oppure modulo saltato o "
+            "in errore). Restano aperti: rilancia [italic]verify --max-intrusion "
+            "probe[/] (o il livello indicato nel report) per chiuderli.")
 
     # Precondizione del loop (§18-bis.8): FIXED si calcola per differenza contro la
     # BASELINE SALVATA. Se NON c'è alcun FIXED ma ci sono finding `new`, è il sintomo
@@ -1067,6 +1115,8 @@ def _print_portfolio_table(rows: list[PortfolioRow]) -> None:
             # su cui agire per prime (§21).
             warn = (r.critical_open or 0) > 0 or (r.drift or 0) > 0
             stato = "[red]attenzione[/]" if warn else "[green]ok[/]"
+            if r.not_reverified:
+                stato += f" · [yellow]{r.not_reverified} non ri-verificati[/]"
             table.add_row(
                 r.target, score, str(r.critical_open), str(r.drift),
                 str(r.new), str(r.known), str(r.fixed), stato)

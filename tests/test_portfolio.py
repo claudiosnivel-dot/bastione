@@ -352,3 +352,19 @@ def test_portfolio_row_ok_and_error_shapes():
     err = PortfolioRow.error_row("b", "boom")
     assert err.target == "b" and err.error == "boom"
     assert err.score is None and err.critical_open is None and err.drift is None
+
+
+# ─── S16 (R6): i non ri-verificati non spariscono dalla tabella di postura ───
+
+def test_portfolio_row_and_report_show_not_reverified(tmp_path):
+    from bastione.portfolio import PortfolioRow
+    st = _state("app", posture=100.0)
+    st.counts["not_reverified"] = 2
+    row = PortfolioRow.from_state("app", st)
+    assert row.not_reverified == 2
+    states = {"app": st}
+    report, rows = run_portfolio(
+        PortfolioConfig(targets=["app"], defaults={}),
+        orch_factory=_factory(states), runs_root=tmp_path / "runs",
+        baselines_root=tmp_path / "baselines", write=False)
+    assert "2 non ri-verificati" in report

@@ -740,14 +740,16 @@ def test_verify_real_pipeline_marks_notify_skipped(monkeypatch, tmp_path):
         _cli_orch_mod.notify, "dispatch", lambda cfg, summary: None, raising=True)
 
     captured: dict = {}
-    real_rescan = cli_mod._rescan_read_only
+    real_rescan = cli_mod._rescan
 
-    def _capturing_rescan(target):
-        orch = real_rescan(target)
+    def _capturing_rescan(target, *, max_intrusion):
+        orch = real_rescan(target, max_intrusion=max_intrusion)
         captured["state"] = RunState.load(orch._run_dir / "state.json")
         return orch
 
-    monkeypatch.setattr(cli_mod, "_rescan_read_only", _capturing_rescan)
+    # S16: verify passa per `_rescan` (livello configurabile), non più per il solo
+    # wrapper READ_ONLY usato da export-defectdojo.
+    monkeypatch.setattr(cli_mod, "_rescan", _capturing_rescan)
 
     out = runner.invoke(app, ["verify", "--target", "g"], color=False)
     assert out.exit_code == 0, out.output
@@ -1155,3 +1157,56 @@ def test_export_defectdojo_runs_read_only(monkeypatch, tmp_path):
     assert cap["no_fix"] is True
     # contratto outward-facing (§7/§19): export-defectdojo passa notify=False.
     assert cap["notify"] is False
+
+
+# ─── S16: verify al livello giusto + finding NON RI-VERIFICATI (R6) ─────────
+
+def test_verify_accepts_max_intrusion_probe(monkeypatch):
+    # Storage/RPC/GraphQL sono PROBE: `verify` deve poterli ri-controllare davvero.
+    cap: dict = {}
+    _patch_verify_run(monkeypatch, capture=cap)
+    out = runner.invoke(app, ["verify", "--target", "g", "--max-intrusion", "probe"])
+    assert out.exit_code == 0, out.output
+    assert cap["max_intrusion"] == IntrusionLevel.PROBE
+    assert cap["no_fix"] is True and cap["notify"] is False
+
+
+def test_verify_mutating_requires_explicit_staging_confirmation(monkeypatch):
+    cap: dict = {}
+    _patch_verify_run(monkeypatch, capture=cap)
+    out = runner.invoke(app, ["verify", "--target", "g", "--max-intrusion", "mutating"])
+    assert out.exit_code == 2, out.output
+    assert cap == {}                              # nessuna run partita
+    out = runner.invoke(app, ["verify", "--target", "g", "--max-intrusion", "mutating",
+                              "--i-own-this-its-staging"])
+    assert out.exit_code == 0, out.output
+    assert cap["max_intrusion"] == IntrusionLevel.MUTATING
+
+
+def test_verify_lists_not_reverified_as_open_never_fixed(monkeypatch):
+    shell = _vfinding("nrv444", rule_id="STORAGE_PUBLIC_LISTABLE", status=Status.KNOWN,
+                      severity=Severity.INFO)
+    result = BaselineResult(not_reverified=[shell])
+    _patch_verify_run(monkeypatch, result=result)
+    out = runner.invoke(app, ["verify", "--target", "g"], color=False)
+    assert out.exit_code == 0, out.output
+    text = out.output
+    assert "nrv444" in text and "not_reverified" in text
+    assert "0 FIXED" in text
+    assert "--max-intrusion" in text              # indica come ri-verificarli
+    assert "Nessun finding" not in text           # mai "target pulito" se restano dubbi
+
+
+def test_scan_summary_shows_not_reverified_when_present(tmp_path):
+    st = _state()
+    st.counts["not_reverified"] = 3
+    from io import StringIO
+    from rich.console import Console
+    buf = StringIO()
+    old = cli_mod.console
+    cli_mod.console = Console(file=buf, width=120, color_system=None)
+    try:
+        cli_mod._print_summary(st, tmp_path)
+    finally:
+        cli_mod.console = old
+    assert "not_reverified" in buf.getvalue()

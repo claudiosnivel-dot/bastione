@@ -973,3 +973,147 @@ def test_remediate_forwards_failed_posture_checks_to_fix_plan(tmp_path: Path, mo
     assert "RLS_DISABLED" in rule_ids
     assert "POSTURE_HSTS" in rule_ids          # posture fallito → fix nel bundle
     assert "MISSING_CSP" not in rule_ids and "POSTURE_CSP" not in rule_ids   # passato → niente
+
+
+# ─── S16: FIXED solo se ri-verificato (R6) — wiring orchestratore ───────────
+
+def _probe_finding(rule_id="STORAGE_PUBLIC_LISTABLE", endpoint="/storage/v1/object/list/doc"):
+    f = _finding(module="supabase", rule_id=rule_id, endpoint=endpoint)
+    f.intrusion_used = IntrusionLevel.PROBE
+    return f
+
+
+def _orch_with_baseline(tmp_path: Path) -> tuple[Orchestrator, Path]:
+    baselines = tmp_path / "baselines"
+    orch = Orchestrator(targets_dir=_targets(tmp_path, STAGING),
+                        runs_root=tmp_path / "runs", baselines_root=baselines)
+    return orch, baselines / "g.baseline.json"
+
+
+def _accept_probe_baseline(tmp_path: Path, monkeypatch) -> tuple[Orchestrator, Path]:
+    """Prima run PROBE (ownership simulata) che accetta la baseline con 1 finding PROBE."""
+    monkeypatch.setattr(orch_mod, "verify_ownership", lambda cfg: True)
+    _patch_offline(monkeypatch, plan_modules=[
+        _StubModule("supabase", findings=[_probe_finding()])])
+    orch, bl = _orch_with_baseline(tmp_path)
+    orch.run("g", max_intrusion=IntrusionLevel.PROBE, accept_baseline=True)
+    return orch, bl
+
+
+def test_accept_baseline_records_intrusion_used(tmp_path: Path, monkeypatch):
+    _orch, bl = _accept_probe_baseline(tmp_path, monkeypatch)
+    entries = list(json.loads(bl.read_text(encoding="utf-8"))["findings"].values())
+    assert [e["intrusion_used"] for e in entries] == ["probe"]
+
+
+def test_read_only_rerun_does_not_mark_probe_finding_fixed(tmp_path: Path, monkeypatch):
+    orch, _bl = _accept_probe_baseline(tmp_path, monkeypatch)
+    _patch_offline(monkeypatch, plan_modules=[_StubModule("supabase")])
+    state = orch.run("g")                         # READ_ONLY, come `verify`
+    assert state.counts["fixed"] == 0
+    assert state.counts["not_reverified"] == 1
+    assert orch._result.fixed == []
+    assert [f.rule_id for f in orch._result.not_reverified] == ["STORAGE_PUBLIC_LISTABLE"]
+    report = (orch._run_dir / "report.md").read_text(encoding="utf-8")
+    assert "NON RI-VERIFICATI" in report
+    assert "STORAGE_PUBLIC_LISTABLE" in report
+
+
+def test_probe_rerun_marks_probe_finding_fixed(tmp_path: Path, monkeypatch):
+    orch, _bl = _accept_probe_baseline(tmp_path, monkeypatch)
+    _patch_offline(monkeypatch, plan_modules=[_StubModule("supabase")])
+    state = orch.run("g", max_intrusion=IntrusionLevel.PROBE)
+    assert state.counts["fixed"] == 1
+    assert state.counts["not_reverified"] == 0
+
+
+def test_module_error_rerun_does_not_mark_fixed(tmp_path: Path, monkeypatch):
+    orch, _bl = _accept_probe_baseline(tmp_path, monkeypatch)
+    _patch_offline(monkeypatch, plan_modules=[_StubModule("supabase", boom=True)])
+    state = orch.run("g", max_intrusion=IntrusionLevel.PROBE)
+    assert state.counts["fixed"] == 0
+    assert state.counts["not_reverified"] == 1
+
+
+def test_skipped_module_rerun_does_not_mark_fixed(tmp_path: Path, monkeypatch):
+    orch, _bl = _accept_probe_baseline(tmp_path, monkeypatch)
+    skipped = _finding(module="supabase", rule_id="SUPABASE_SKIPPED")
+    _patch_offline(monkeypatch, plan_modules=[_StubModule("supabase", findings=[skipped])])
+    state = orch.run("g", max_intrusion=IntrusionLevel.PROBE)
+    assert state.counts["fixed"] == 0
+    assert state.counts["not_reverified"] == 1
+
+
+def test_module_absent_from_plan_does_not_mark_fixed(tmp_path: Path, monkeypatch):
+    # Es. recon fallito / Supabase non più rilevato: nessun modulo ha ri-controllato.
+    orch, _bl = _accept_probe_baseline(tmp_path, monkeypatch)
+    _patch_offline(monkeypatch, plan_modules=[])
+    state = orch.run("g", max_intrusion=IntrusionLevel.PROBE)
+    assert state.counts["fixed"] == 0
+    assert state.counts["not_reverified"] == 1
+
+
+def test_accept_baseline_preserves_not_reverified_entries(tmp_path: Path, monkeypatch):
+    # Un --accept-baseline a READ_ONLY non deve "dimenticare" i finding PROBE che
+    # non ha potuto ri-controllare (sarebbe un FIXED silenzioso).
+    orch, bl = _accept_probe_baseline(tmp_path, monkeypatch)
+    before = json.loads(bl.read_text(encoding="utf-8"))["findings"]
+    _patch_offline(monkeypatch, plan_modules=[_StubModule("supabase")])
+    orch.run("g", accept_baseline=True)
+    after = json.loads(bl.read_text(encoding="utf-8"))["findings"]
+    assert after == before
+
+
+def test_limit_on_same_asset_blocks_fixed_end_to_end(tmp_path: Path, monkeypatch):
+    # Blind-review S16: STORAGE_NOT_VERIFIABLE sullo stesso bucket → niente FIXED.
+    orch, bl = _accept_probe_baseline(tmp_path, monkeypatch)
+    entry = next(iter(json.loads(bl.read_text(encoding="utf-8"))["findings"].values()))
+    assert entry["endpoint_family"] == "/storage/v1/object/list/"
+    assert "doc" not in json.dumps(entry)            # niente nomi di asset in chiaro
+    limit = _finding(module="supabase", rule_id="STORAGE_NOT_VERIFIABLE",
+                     endpoint="/storage/v1/object/list/doc")
+    limit.intrusion_used = IntrusionLevel.PROBE
+    _patch_offline(monkeypatch, plan_modules=[_StubModule("supabase", findings=[limit])])
+    state = orch.run("g", max_intrusion=IntrusionLevel.PROBE)
+    assert state.counts["fixed"] == 0
+    assert state.counts["not_reverified"] == 1
+
+
+def test_accept_baseline_keeps_posture_checks_not_rerun(tmp_path: Path, monkeypatch):
+    # Un --accept-baseline a livello più basso non deve perdere i posture check che
+    # non ha rieseguito (altrimenti un DRIFT futuro sparisce).
+    monkeypatch.setattr(orch_mod, "verify_ownership", lambda cfg: True)
+    probe_check = PostureCheck(check_id="POSTURE_STORAGE_PRIVATE_doc", title="t",
+                               passed=True, severity_if_failed=Severity.HIGH, target="g",
+                               detail="d")
+    _patch_offline(monkeypatch, plan_modules=[_StubModule("supabase", posture=[probe_check])])
+    orch, bl = _orch_with_baseline(tmp_path)
+    orch.run("g", max_intrusion=IntrusionLevel.PROBE, accept_baseline=True)
+    _patch_offline(monkeypatch, plan_modules=[_StubModule("supabase")])
+    orch.run("g", accept_baseline=True)
+    posture = json.loads(bl.read_text(encoding="utf-8"))["posture"]
+    assert posture["POSTURE_STORAGE_PRIVATE_doc"] == {"passed": True}
+
+
+def test_fixed_needs_the_declared_positive_proof_end_to_end(tmp_path: Path, monkeypatch):
+    # Re-review S16: un finding che dichiara `verified_by` si chiude SOLO quando quel
+    # posture check passa (asset di nuovo testato e protetto), non per assenza.
+    monkeypatch.setattr(orch_mod, "verify_ownership", lambda cfg: True)
+    f = _probe_finding(rule_id="RLS_WRITE_OPEN", endpoint="/rest/v1/ordini")
+    f.intrusion_used = IntrusionLevel.MUTATING
+    f.verified_by = "POSTURE_RLS_WRITE_ordini"
+    _patch_offline(monkeypatch, plan_modules=[_StubModule("supabase", findings=[f])])
+    orch, bl = _orch_with_baseline(tmp_path)
+    orch.run("g", max_intrusion=IntrusionLevel.MUTATING, accept_baseline=True)
+    entry = next(iter(json.loads(bl.read_text(encoding="utf-8"))["findings"].values()))
+    assert "proof_key" in entry and "ordini" not in json.dumps(entry)
+
+    _patch_offline(monkeypatch, plan_modules=[_StubModule("supabase")])
+    state = orch.run("g", max_intrusion=IntrusionLevel.MUTATING)
+    assert state.counts["fixed"] == 0 and state.counts["not_reverified"] == 1
+
+    proof = PostureCheck(check_id="POSTURE_RLS_WRITE_ordini", title="t", passed=True,
+                         severity_if_failed=Severity.HIGH, target="g", detail="d")
+    _patch_offline(monkeypatch, plan_modules=[_StubModule("supabase", posture=[proof])])
+    state = orch.run("g", max_intrusion=IntrusionLevel.MUTATING)
+    assert state.counts["fixed"] == 1 and state.counts["not_reverified"] == 0

@@ -41,6 +41,11 @@ from pathlib import Path
 from typing import Callable
 
 from bastione.baseline.diff import (
+    ReverifyScope,
+    endpoint_keys,
+    observation_level,
+    proof_keys,
+    reverify_scope_from_run,
     BaselineResult,
     apply_baseline,
     finding_id,
@@ -587,8 +592,19 @@ class Orchestrator:
         viene rigenerato invece di essere saltato per counts a zero (§6/O05)."""
         baseline = load_baseline(self._baseline_path())
         self._result = apply_baseline(
-            self._raw_findings, self._raw_posture, baseline, now=self._now())
+            self._raw_findings, self._raw_posture, baseline, now=self._now(),
+            scope=self._reverify_scope())
         state.counts = self._result.counts
+
+    def _reverify_scope(self) -> ReverifyScope:
+        """Cosa questa run ha davvero potuto RI-VERIFICARE (S16, R6): il tetto
+        d'intrusione, i moduli del piano che hanno completato il lavoro (non in
+        `MODULE_ERROR`, `*_SKIPPED`, `*_NOT_FOUND`) e i limiti dichiarati sui singoli
+        asset (`*_NOT_VERIFIABLE`…). I finding in baseline coperti da questi limiti
+        non possono diventare FIXED in questa run."""
+        return reverify_scope_from_run(
+            self._max_intrusion, [m.name for m in self._plan], self._raw_findings,
+            posture_checks=self._raw_posture)
 
     def _baseline_path(self) -> Path:
         assert self._cfg is not None
@@ -626,6 +642,7 @@ class Orchestrator:
             fixed=result.fixed,
             posture_checks=result.posture_checks,
             counts=result.counts,
+            not_reverified=result.not_reverified,
         )
         report = to_markdown(**report_args)
         (self._run_dir / REPORT_FILENAME).write_text(report, encoding="utf-8")
@@ -737,11 +754,29 @@ class Orchestrator:
                 "last_seen": f.last_seen.isoformat() if f.last_seen else None,
                 "rule_id": f.rule_id,
                 "module": f.module,
+                # S16 (R6): livello con cui si ri-osserva → una run più bassa (es.
+                # `verify` READ_ONLY) non potrà darlo per FIXED. Le chiavi d'endpoint
+                # (famiglia + hash, niente nomi in chiaro) lo legano ai limiti futuri.
+                "intrusion_used": intrusion_to_cli(observation_level(f)),
+                **endpoint_keys(f.module, f.location.endpoint),
+                **proof_keys(f.verified_by),
             }
+        # S16: i finding che questa run NON ha potuto ri-controllare restano in
+        # baseline così com'erano (toglierli equivarrebbe a un FIXED silenzioso).
+        prior_baseline = load_baseline(self._baseline_path())
+        if self._result.not_reverified:
+            prior = prior_baseline.get("findings", {})
+            for f in self._result.not_reverified:
+                if f.finding_id in prior and f.finding_id not in findings_baseline:
+                    findings_baseline[f.finding_id] = prior[f.finding_id]
         posture_baseline: dict = {
             c.check_id: {"passed": c.passed}
             for c in self._result.posture_checks
         }
+        # S16: i posture check non rieseguiti (run a livello più basso, modulo non
+        # eseguito) restano in baseline, così un DRIFT futuro resta rilevabile.
+        for check_id, entry in prior_baseline.get("posture", {}).items():
+            posture_baseline.setdefault(check_id, entry)
         save_baseline(
             self._baseline_path(),
             target=self._cfg.name,
