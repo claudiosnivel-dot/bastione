@@ -27,15 +27,19 @@ log = logging.getLogger("bastione.modules.idor")
 _HTTP_TIMEOUT = 15.0
 
 
-def _http_request(method: str, url: str, *, json=None, headers=None):
-    """Confine I/O (monkeypatchato nei test). Ritorna response o None (§4.7)."""
+def _http_request(method: str, url: str, *, json=None, headers=None, cookies=None):
+    """Confine I/O (monkeypatchato nei test). Ritorna response o None (§4.7).
+
+    `cookies` (§4.6, Task 13): propaga i cookie di una sessione a cookie
+    (`acquire_session` ramo session_cookie) così la probe gira autenticata, non
+    come anonima. Default None = nessun cambiamento per i flussi a header."""
     try:
         import httpx
     except ImportError:
         log.warning("httpx non installato: idor non disponibile (M4.1)")
         return None
     try:
-        return httpx.request(method, url, json=json, headers=headers,
+        return httpx.request(method, url, json=json, headers=headers, cookies=cookies,
                              timeout=_HTTP_TIMEOUT, follow_redirects=False)
     except Exception as exc:  # noqa: BLE001
         log.warning("idor %s %s fallita: %s", method, url, exc)
@@ -97,11 +101,13 @@ class IdorModule(Module):
 
     def _request(self, method: str, url: str, sess: "AuthSession | None"):
         headers = dict(sess.headers) if sess else {}
-        return _http_request(method, url, headers=headers)
+        cookies = dict(sess.cookies) if sess else {}
+        return _http_request(method, url, headers=headers, cookies=cookies)
 
     def _request_json(self, method, url, sess, body):
         headers = dict(sess.headers) if sess else {}
-        return _http_request(method, url, json=body, headers=headers)
+        cookies = dict(sess.cookies) if sess else {}
+        return _http_request(method, url, json=body, headers=headers, cookies=cookies)
 
     # ── READ cross-tenant probe + oracolo isolamento (§15) ───────────────────
 

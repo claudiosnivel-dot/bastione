@@ -106,7 +106,7 @@ def _install_app(monkeypatch, *, leaky: bool):
             self.status_code = status; self._p = payload
         def json(self): return self._p
 
-    def router(method, url, *, json=None, headers=None):
+    def router(method, url, *, json=None, headers=None, cookies=None):
         role = (headers or {}).get("X-Test-Role")  # "A"/"B"/None(anon)
         if url.endswith("/api/orders"):
             # list: A vede [1]; B/anon vedono [1] solo se leaky
@@ -155,6 +155,66 @@ def test_read_probe_leaky_app_emits_critical(monkeypatch):
     assert "999" not in reads[0].description
 
 
+# ── Task 13 (M5): sessione a COOKIE rispettata (§4.6) ───────────────────────
+
+def _install_cookie_app(monkeypatch, *, leaky: bool):
+    """App sintetica a sessione COOKIE: senza cookie `sid` ogni richiesta è 401 (il
+    ruolo arriva SOLO dal cookie). Se i cookie venissero scartati, A non vedrebbe
+    nemmeno i propri ordini → nessun id da sondare → nessun finding: il test di
+    regressione è quindi discriminante (RED prima del fix Task 13)."""
+    import bastione.modules.idor.module as m
+    from bastione.models import AuthSession
+    def fake_acquire(account, *, _http=None):
+        return AuthSession(account_label=account.label, cookies={"sid": account.label},
+                           acquired_ok=True)
+    monkeypatch.setattr(m, "acquire_session", fake_acquire)
+
+    class _R:
+        def __init__(self, status, payload): self.status_code = status; self._p = payload
+        def json(self): return self._p
+    def router(method, url, *, json=None, headers=None, cookies=None):
+        role = (cookies or {}).get("sid")
+        if role is None:
+            return _R(401, {})
+        if url.endswith("/api/orders"):
+            if role == "A" or leaky:
+                return _R(200, [{"id": 1, "owner": "A"}])
+            return _R(200, [])
+        if url.endswith("/api/orders/1"):
+            if role == "A" or leaky:
+                return _R(200, {"id": 1, "owner": "A", "total": 999})
+            return _R(403, {})
+        return _R(404, {})
+    monkeypatch.setattr(m, "_http_request", router)
+
+
+def test_cookie_session_is_respected(monkeypatch):
+    """Sessione a COOKIE applicata: con app leaky l'IDOR si trova (prima del fix i
+    cookie erano scartati → 401 ovunque → nessun finding)."""
+    from bastione.models import ApiEndpoint
+    from bastione.modules.idor.module import IdorModule
+    _install_cookie_app(monkeypatch, leaky=True)
+    auth = _auth(endpoints=[ApiEndpoint(method="GET", path_template="/api/orders", kind="list"),
+                            ApiEndpoint(method="GET", path_template="/api/orders/{id}", kind="read")])
+    result = IdorModule().run(_ctx(cfg=_cfg(auth=auth)))
+    reads = [f for f in result.findings if f.rule_id == "IDOR_CROSS_TENANT_READ"]
+    assert reads
+    assert "999" not in reads[0].evidence and "sid" not in reads[0].evidence   # P8
+
+
+def test_cookie_session_isolated_app_no_finding(monkeypatch):
+    """Variante protetta a cookie: app isolata → nessun IDOR, posture di isolamento ok."""
+    from bastione.models import ApiEndpoint
+    from bastione.modules.idor.module import IdorModule
+    _install_cookie_app(monkeypatch, leaky=False)
+    auth = _auth(endpoints=[ApiEndpoint(method="GET", path_template="/api/orders", kind="list"),
+                            ApiEndpoint(method="GET", path_template="/api/orders/{id}", kind="read")])
+    result = IdorModule().run(_ctx(cfg=_cfg(auth=auth)))
+    assert not [f for f in result.findings if f.rule_id == "IDOR_CROSS_TENANT_READ"]
+    assert any(p.check_id.startswith("POSTURE_TENANT_ISOLATION") and p.passed
+               for p in result.posture_checks)
+
+
 # ── Task 7: WRITE cross-tenant — canary usa-e-getta + cleanup garantito ─────
 
 from bastione.gate import IntrusionDenied
@@ -172,7 +232,7 @@ def _install_write_app(monkeypatch, *, leaky_write: bool, cleanup_ok: bool = Tru
 
     state = {"canary_exists": False}
 
-    def router(method, url, *, json=None, headers=None):
+    def router(method, url, *, json=None, headers=None, cookies=None):
         role = (headers or {}).get("X-Test-Role")
         if method == "POST" and url.endswith("/api/notes") and role == "A":
             state["canary_exists"] = True
@@ -346,7 +406,7 @@ def _install_degenerate_app(monkeypatch, *, mode):
             self.status_code = status
         def json(self): raise ValueError("body non-JSON degenere")
 
-    def router(method, url, *, json=None, headers=None):
+    def router(method, url, *, json=None, headers=None, cookies=None):
         if mode == "none":
             return None  # tutto None: nessuna fase progredisce
         role = (headers or {}).get("X-Test-Role")

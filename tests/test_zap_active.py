@@ -133,6 +133,8 @@ class _FakeHttpx:
             return _FakeResp(status_code=500 if self._fail_disable else 200)
         if url.endswith("/ascan/action/scan/"):
             return _FakeResp(status_code=200, payload={"scan": "0"})
+        if url.endswith("/ascan/view/status/"):
+            return _FakeResp(status_code=200, payload={"status": "100"})
         if url.endswith("/core/view/alerts/"):
             return _FakeResp(status_code=200, payload={"alerts": []})
         return _FakeResp(status_code=200)
@@ -224,3 +226,133 @@ def test_m4_lanes_registered_via_orchestrator():
     assert {"login_hardening", "server_exposure", "zap_active"} <= set(REGISTRY)
     assert REGISTRY["zap_active"].max_intrusion.name == "MUTATING"
     assert REGISTRY["login_hardening"].max_intrusion.name == "PROBE"
+
+
+# ── Task 12 (M5): zap_active dice la verità (§4.6) ────────────────────────────
+class _FakeHttpx2:
+    """Fake ZAP daemon per i fix M5. Registra (url, params) e risponde a tutti gli
+    endpoint usati: disableScanners, replacer add/remove, accessUrl, scan, status, alerts,
+    removeScanPolicy. `alerts_payload` e `status_seq` configurabili."""
+    HTTPError = Exception
+    def __init__(self, alerts=None, status_seq=("100",)):
+        self.calls = []; self._alerts = alerts or []; self._status = list(status_seq)
+    def get(self, url, params=None, timeout=None):
+        self.calls.append((url, params or {}))
+        if url.endswith("/ascan/action/scan/"):
+            return _J({"scan": "1"})
+        if url.endswith("/ascan/view/status/"):
+            return _J({"status": self._status.pop(0) if len(self._status) > 1 else self._status[0]})
+        if url.endswith("/core/view/alerts/"):
+            return _J({"alerts": self._alerts})
+        return _J({})
+class _J:
+    # status_code=200 di default: `_apply_excluded_policy` lo controlla su
+    # disableScanners (che _FakeHttpx2 serve dal ramo generico).
+    def __init__(self, p, status_code=200): self._p = p; self.status_code = status_code
+    def json(self): return self._p
+
+def test_session_header_applied_before_scan(monkeypatch, tmp_path):
+    import bastione.modules.zap_active.module as m
+    monkeypatch.setenv("BASTIONE_ZAP_ADDR", "http://127.0.0.1:8080")
+    monkeypatch.setenv("BASTIONE_ZAP_API_KEY", "k")
+    fake = _FakeHttpx2(); monkeypatch.setitem(__import__("sys").modules, "httpx", fake)
+    m._run_zap_active("https://staging.example", {"Authorization": "Bearer x"},
+                      ["/api/orders"], str(tmp_path / "o.json"))
+    urls = [u for u, _ in fake.calls]
+    i_rule = next(i for i, u in enumerate(urls) if u.endswith("/replacer/action/addRule/"))
+    i_scan = next(i for i, u in enumerate(urls) if u.endswith("/ascan/action/scan/"))
+    assert i_rule < i_scan                                   # (a) sessione prima dello scan
+    _, rp = fake.calls[i_rule]
+    assert rp.get("matchString") == "Authorization" and rp.get("matchType") == "REQ_HEADER"
+
+def test_endpoints_seeded_before_scan(monkeypatch, tmp_path):
+    import bastione.modules.zap_active.module as m
+    monkeypatch.setenv("BASTIONE_ZAP_ADDR", "http://127.0.0.1:8080"); monkeypatch.setenv("BASTIONE_ZAP_API_KEY","k")
+    fake = _FakeHttpx2(); monkeypatch.setitem(__import__("sys").modules, "httpx", fake)
+    m._run_zap_active("https://staging.example", {}, ["/api/orders", "/api/notes"], str(tmp_path/"o.json"))
+    seeded = [p.get("url") for u, p in fake.calls if u.endswith("/core/action/accessUrl/")]
+    assert "https://staging.example/api/orders" in seeded and "https://staging.example/api/notes" in seeded
+
+def test_waits_for_status_before_alerts(monkeypatch, tmp_path):     # (c)
+    import bastione.modules.zap_active.module as m
+    monkeypatch.setenv("BASTIONE_ZAP_ADDR", "http://127.0.0.1:8080"); monkeypatch.setenv("BASTIONE_ZAP_API_KEY","k")
+    monkeypatch.setattr(m.time, "sleep", lambda *_: None)
+    fake = _FakeHttpx2(status_seq=("50", "100")); monkeypatch.setitem(__import__("sys").modules, "httpx", fake)
+    m._run_zap_active("https://staging.example", {}, [], str(tmp_path/"o.json"))
+    urls = [u for u, _ in fake.calls]
+    i_status = next(i for i, u in enumerate(urls) if u.endswith("/ascan/view/status/"))
+    i_alerts = next(i for i, u in enumerate(urls) if u.endswith("/core/view/alerts/"))
+    assert i_status < i_alerts
+
+def test_teardown_in_finally_even_on_error(monkeypatch, tmp_path):   # (d)
+    import bastione.modules.zap_active.module as m
+    monkeypatch.setenv("BASTIONE_ZAP_ADDR", "http://127.0.0.1:8080"); monkeypatch.setenv("BASTIONE_ZAP_API_KEY","k")
+    class _Boom(_FakeHttpx2):
+        def get(self, url, params=None, timeout=None):
+            if url.endswith("/core/view/alerts/"): raise RuntimeError("boom")
+            return super().get(url, params, timeout)
+    fake = _Boom(); monkeypatch.setitem(__import__("sys").modules, "httpx", fake)
+    m._run_zap_active("https://staging.example", {"Authorization": "x"}, [], str(tmp_path/"o.json"))
+    urls = [u for u, _ in fake.calls]
+    assert any(u.endswith("/replacer/action/removeRule/") for u in urls)
+    assert any(u.endswith("/ascan/action/removeScanPolicy/") for u in urls)
+
+def test_cookie_session_passed_to_boundary(monkeypatch):            # cookie non più scartati
+    import bastione.modules.zap_active.module as m
+    from bastione.models import AuthSession
+    monkeypatch.setattr(m, "acquire_session", lambda acc, *, _http=None: AuthSession(
+        account_label=acc.label, cookies={"sid": "abc"}, acquired_ok=True))
+    monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/zap")
+    seen = {}
+    monkeypatch.setattr(m, "_run_zap_active", lambda base, sh, eps, out: seen.setdefault("sh", sh) or [])
+    m.ZapActiveModule().run(_ctx())
+    assert "Cookie" in seen["sh"] and "sid=abc" in seen["sh"]["Cookie"]
+
+
+def test_teardown_removes_rules_added_before_partial_failure(monkeypatch, tmp_path):
+    """La 2a addRule fallisce: la 1a regola (che porta la credenziale) va rimossa
+    comunque nel finally — cleanup garantito anche su fallimento parziale (§4.6)."""
+    import bastione.modules.zap_active.module as m
+    monkeypatch.setenv("BASTIONE_ZAP_ADDR", "http://127.0.0.1:8080"); monkeypatch.setenv("BASTIONE_ZAP_API_KEY", "k")
+    class _BoomSecondRule(_FakeHttpx2):
+        n = 0
+        def get(self, url, params=None, timeout=None):
+            if url.endswith("/replacer/action/addRule/"):
+                type(self).n += 1
+                if type(self).n == 2:
+                    self.calls.append((url, params or {}))
+                    raise RuntimeError("addRule boom")
+            return super().get(url, params, timeout)
+    fake = _BoomSecondRule(); monkeypatch.setitem(__import__("sys").modules, "httpx", fake)
+    out = m._run_zap_active("https://staging.example",
+                            {"Authorization": "Bearer x", "Cookie": "sid=y"}, [],
+                            str(tmp_path / "o.json"))
+    assert out is None                                       # degrado, nessuno scan
+    removed = [p.get("description") for u, p in fake.calls
+               if u.endswith("/replacer/action/removeRule/")]
+    assert "bastione-auth-0" in removed
+    assert not any(u.endswith("/ascan/action/scan/") for u, _ in fake.calls)
+
+
+def test_session_rules_scoped_to_target_origin(monkeypatch, tmp_path):
+    """La credenziale è iniettata solo verso l'origin del target (owned-only §7)."""
+    import re as _re
+    import bastione.modules.zap_active.module as m
+    monkeypatch.setenv("BASTIONE_ZAP_ADDR", "http://127.0.0.1:8080"); monkeypatch.setenv("BASTIONE_ZAP_API_KEY", "k")
+    fake = _FakeHttpx2(); monkeypatch.setitem(__import__("sys").modules, "httpx", fake)
+    m._run_zap_active("https://staging.example", {"Authorization": "Bearer x"}, [],
+                      str(tmp_path / "o.json"))
+    scope = next(p["url"] for u, p in fake.calls if u.endswith("/replacer/action/addRule/"))
+    assert _re.search(scope, "https://staging.example/api/orders")
+    assert _re.search(scope, "https://staging.example")
+    assert not _re.search(scope, "https://staging.example.evil.com/x")
+    assert not _re.search(scope, "https://evil.example/?u=https://staging.example/")
+
+
+
+@pytest.mark.parametrize("raw,expected", [("600", 600), (" 900 ", 900), ("30m", 1800),
+                                          ("", 1800), ("-5", 1800), ("0", 1800)])
+def test_scan_deadline_env_parse_never_raises(monkeypatch, raw, expected):
+    import bastione.modules.zap_active.module as m
+    monkeypatch.setenv("BASTIONE_ZAP_SCAN_TIMEOUT", raw)
+    assert m._scan_deadline() == expected

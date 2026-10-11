@@ -12,8 +12,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
+import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from bastione.auth.session import acquire_session
 from bastione.enums import Confidence, IntrusionLevel, Severity
@@ -24,6 +27,28 @@ from bastione.modules.base import Module, register
 
 log = logging.getLogger("bastione.modules.zap_active")
 _ZAP_TIMEOUT = 1800  # l'active scan può richiedere tempo
+
+# §4.6/§11 decisione piano: deadline di completamento dello scan (NON il timeout
+# per-richiesta _ZAP_TIMEOUT). Default 30 min, configurabile via env.
+_ZAP_SCAN_DEADLINE_DEFAULT = 1800
+
+
+def _scan_deadline() -> int:
+    """Deadline da `BASTIONE_ZAP_SCAN_TIMEOUT` (secondi). Valutata all'import: un
+    valore non intero o ≤ 0 degrada al default con un warning, mai un'eccezione
+    (romperebbe l'import del modulo e quindi l'intera run, §4.7)."""
+    raw = os.getenv("BASTIONE_ZAP_SCAN_TIMEOUT", str(_ZAP_SCAN_DEADLINE_DEFAULT))
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        log.warning("BASTIONE_ZAP_SCAN_TIMEOUT=%r non è un intero: uso %ss",
+                    raw, _ZAP_SCAN_DEADLINE_DEFAULT)
+        return _ZAP_SCAN_DEADLINE_DEFAULT
+    return value if value > 0 else _ZAP_SCAN_DEADLINE_DEFAULT
+
+
+_ZAP_SCAN_DEADLINE = _scan_deadline()
+_ZAP_POLL_INTERVAL = 5
 
 _RISK_MAP = {"high": Severity.HIGH, "medium": Severity.MEDIUM,
              "low": Severity.LOW, "informational": Severity.INFO, "info": Severity.INFO}
@@ -98,59 +123,119 @@ def _apply_excluded_policy(httpx, addr: str, params: dict) -> bool:
         return False
 
 
+def _url_scope(base_url: str) -> str:
+    """Regex (ancorata) delle URL dell'origin del target: la credenziale di sessione
+    va iniettata SOLO verso l'host owned, mai verso host terzi (§7)."""
+    parts = urlsplit(base_url)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    return "^" + re.escape(origin) + r"([/?#].*)?$"
+
+
+def _apply_session_headers(httpx, addr, params, headers, rule_names, base_url) -> None:
+    """(a) Una regola Replacer REQ_HEADER per ogni header di sessione, limitata
+    all'origin del target. Niente header → nessuna regola.
+
+    Ogni nome entra in `rule_names` (lista del chiamante) PRIMA della addRule: se una
+    addRule successiva fallisce, il teardown in `finally` rimuove comunque le regole
+    già create — che portano il VALORE della credenziale e resterebbero nel daemon
+    (§4.6/§11.2: cleanup garantito). Rimuovere una regola mai creata è innocuo."""
+    scope = _url_scope(base_url)
+    for i, (k, v) in enumerate(headers.items()):
+        name = f"bastione-auth-{i}"
+        rule_names.append(name)
+        httpx.get(f"{addr}/JSON/replacer/action/addRule/", params={
+            **params, "description": name, "enabled": "true", "matchType": "REQ_HEADER",
+            "matchString": k, "matchRegex": "false", "replacement": v, "url": scope},
+            timeout=_ZAP_TIMEOUT)
+
+
+def _seed_endpoints(httpx, addr, params, base_url, endpoints) -> None:
+    """(b) Semina gli endpoint dichiarati nel site tree (accessUrl)."""
+    for ep in endpoints:
+        url = base_url + ep if ep.startswith("/") else ep
+        httpx.get(f"{addr}/JSON/core/action/accessUrl/",
+                  params={**params, "url": url, "followRedirects": "false"}, timeout=_ZAP_TIMEOUT)
+
+
+def _wait_scan_complete(httpx, addr, params, scan_id) -> None:
+    """(c) Poll ascan/view/status fino a 100 o deadline."""
+    deadline = time.monotonic() + _ZAP_SCAN_DEADLINE
+    while time.monotonic() < deadline:
+        r = httpx.get(f"{addr}/JSON/ascan/view/status/",
+                      params={**params, "scanId": scan_id}, timeout=_ZAP_TIMEOUT)
+        if str((r.json() or {}).get("status", "")) == "100":
+            return
+        time.sleep(_ZAP_POLL_INTERVAL)
+    log.warning("zap_active: deadline di scan raggiunta prima del 100%% (scanId=%s)", scan_id)
+
+
+def _teardown(httpx, addr, params, rule_names) -> None:
+    """(d) Rimuove le regole Replacer e la policy vincolata. Best-effort."""
+    for name in rule_names:
+        try:
+            httpx.get(f"{addr}/JSON/replacer/action/removeRule/",
+                      params={**params, "description": name}, timeout=_ZAP_TIMEOUT)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        httpx.get(f"{addr}/JSON/ascan/action/removeScanPolicy/",
+                  params={**params, "scanPolicyName": _CONSTRAINED_POLICY}, timeout=_ZAP_TIMEOUT)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _run_zap_active(base_url: str, session_headers: dict, endpoints: list, out_path: str):
-    """Invoca ZAP active con policy VINCOLATA e ritorna la lista di alert (§14).
+    """Invoca ZAP active con policy VINCOLATA e ritorna la lista di alert (§14/§4.6).
 
     Confine I/O monkeypatchato nei test. In produzione si parla col daemon ZAP via
-    la sua REST API (host/api-key da ENV: BASTIONE_ZAP_ADDR, BASTIONE_ZAP_API_KEY),
-    configurando la sessione autenticata (session_headers) e una scan policy che
-    DISABILITA le regole distruttive (_EXCLUDED_ASCAN) — detection-oriented.
+    la sua REST API (host/api-key da ENV: BASTIONE_ZAP_ADDR, BASTIONE_ZAP_API_KEY).
 
-    Sequenza fail-closed (§14): (1) applica la policy vincolata disabilitando gli
-    scanner distruttivi; SE NON riesce, lo scan NON parte (nessuna azione mutante
-    contro il target). (2) avvia l'active scan SOLO sulla policy vincolata. (3)
-    legge gli alert risultanti.
+    Sequenza fail-closed (§14/§4.6): (1) applica la policy vincolata disabilitando
+    gli scanner distruttivi; SE NON riesce, lo scan NON parte. (a) applica la
+    sessione autenticata via Replacer (REQ_HEADER per ogni header, Cookie incluso).
+    (b) semina gli endpoint dichiarati nel site tree. (2) avvia l'active scan SOLO
+    sulla policy vincolata. (c) ATTENDE la fine (poll status) prima di leggere gli
+    alert. (d) teardown in `finally`: rimuove regole Replacer e policy vincolata.
 
     Degrado grazioso (§4.7): qualunque errore / daemon assente → None (nessun
     alert), mai crash. Scrive il raw JSON in out_path."""
-    addr = os.getenv("BASTIONE_ZAP_ADDR")
-    api_key = os.getenv("BASTIONE_ZAP_API_KEY")
-    if not addr:
-        log.info("zap_active: BASTIONE_ZAP_ADDR assente, nessuno scan (M4.3)")
-        return None
     try:
         import httpx
     except ImportError:
-        log.warning("httpx non installato: zap_active non disponibile (M4.3)")
+        log.warning("httpx assente: zap_active non disponibile (§14)")
         return None
+    addr = os.getenv("BASTIONE_ZAP_ADDR")
+    if not addr:
+        log.warning("BASTIONE_ZAP_ADDR non impostato: zap_active non eseguito")
+        return None
+    params = {"apikey": os.getenv("BASTIONE_ZAP_API_KEY", "")}
+    rule_names: list[str] = []
     try:
-        params = {"apikey": api_key} if api_key else {}
-        # (1) GATE DI SICUREZZA: applica la policy vincolata PRIMA di scansionare.
-        #     fail-closed — se non si riesce a disabilitare le regole distruttive,
-        #     NON si avvia alcun active scan (mai azioni mutanti non controllate).
+        # policy vincolata PRIMA di tutto (fail-closed §4.6): se non applicata, stop.
         if not _apply_excluded_policy(httpx, addr, params):
-            log.warning("zap_active: policy vincolata non applicata, scan abortito (§14)")
+            log.warning("zap_active: policy vincolata non applicata → fail-closed, niente scan")
             return None
-        # (2) avvia l'active scan SOLO sulla scan policy vincolata (no regole distruttive).
-        scan_params = dict(params)
-        scan_params.update({"url": base_url, "scanPolicyName": _CONSTRAINED_POLICY,
-                            "recurse": "true", "inScopeOnly": "true"})
-        httpx.get(f"{addr}/JSON/ascan/action/scan/", params=scan_params,
-                  timeout=_ZAP_TIMEOUT)
-        # (3) leggi gli alert risultanti (lo stato di poll/avanzamento è gestito
-        #     dal daemon; qui in forma minimale/difensiva).
-        resp = httpx.get(f"{addr}/JSON/core/view/alerts/", params=params,
-                         timeout=_ZAP_TIMEOUT)
-        data = resp.json()
-        alerts = data.get("alerts", []) if isinstance(data, dict) else []
+        _apply_session_headers(httpx, addr, params, session_headers,               # (a)
+                               rule_names, base_url)
+        _seed_endpoints(httpx, addr, params, base_url, endpoints)                   # (b)
+        scan_params = {**params, "url": base_url, "scanPolicyName": _CONSTRAINED_POLICY,
+                       "recurse": "true", "inScopeOnly": "true"}
+        resp = httpx.get(f"{addr}/JSON/ascan/action/scan/", params=scan_params, timeout=_ZAP_TIMEOUT)
+        scan_id = str((resp.json() or {}).get("scan", ""))
+        if scan_id:
+            _wait_scan_complete(httpx, addr, params, scan_id)                       # (c)
+        resp = httpx.get(f"{addr}/JSON/core/view/alerts/", params=params, timeout=_ZAP_TIMEOUT)
+        alerts = (resp.json() or {}).get("alerts", [])
         try:
             Path(out_path).write_text(json.dumps(alerts), encoding="utf-8")
-        except OSError as exc:
-            log.warning("zap_active: raw non scritto %s: %s", out_path, exc)
-        return alerts if isinstance(alerts, list) else None
+        except OSError:
+            pass
+        return alerts
     except Exception as exc:  # noqa: BLE001
         log.warning("zap_active: scan fallito, degrado a None (§4.7): %s", exc)
         return None
+    finally:
+        _teardown(httpx, addr, params, rule_names)                                  # (d)
 
 
 def _finding_id(module: str, rule_id: str, location: Location) -> str:
@@ -197,9 +282,12 @@ class ZapActiveModule(Module):
         raw_dir.mkdir(parents=True, exist_ok=True)
         out_path = raw_dir / "zap-active.json"
         endpoints = [e.path_template for e in ctx.target_cfg.auth.api_endpoints]
+        sess_headers = dict(sess.headers)
+        if sess.cookies:   # la sessione a cookie NON va più scartata (come idor, Task 13)
+            sess_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in sess.cookies.items())
         try:
             alerts = _run_zap_active(ctx.target_cfg.base_url.rstrip("/"),
-                                     dict(sess.headers), endpoints, str(out_path))
+                                     sess_headers, endpoints, str(out_path))
         except Exception as exc:  # noqa: BLE001
             log.warning("zap_active: invocazione fallita (§4.7): %s", exc)
             return ModuleResult(findings=[], posture_checks=[])

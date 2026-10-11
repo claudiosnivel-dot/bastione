@@ -15,15 +15,18 @@ log = logging.getLogger("bastione.auth.session")
 _HTTP_TIMEOUT = 15.0
 
 
-def _http_request(method: str, url: str, *, json=None, headers=None):
-    """Confine I/O (monkeypatchato nei test). Ritorna la response o None (degrado §4.7)."""
+def _http_request(method: str, url: str, *, json=None, headers=None, cookies=None):
+    """Confine I/O (monkeypatchato nei test). Ritorna la response o None (degrado §4.7).
+
+    `cookies` (§4.6, Task 13): default None = nessun cambiamento per i flussi
+    esistenti; permette al login_post di inviare cookie di sessione se serve."""
     try:
         import httpx
     except ImportError:
         log.warning("httpx non installato: auth non disponibile (M4.0)")
         return None
     try:
-        return httpx.request(method, url, json=json, headers=headers,
+        return httpx.request(method, url, json=json, headers=headers, cookies=cookies,
                              timeout=_HTTP_TIMEOUT, follow_redirects=False)
     except Exception as exc:  # noqa: BLE001 — degrado grazioso
         log.warning("auth %s %s fallita: %s", method, url, exc)
